@@ -1165,6 +1165,7 @@ dependencies = [
  "open-sandbox-controller",
  "open-sandbox-proxy",
  "predicates",
+ "prost-types",
  "sqlx",
  "tokio",
  "tokio-stream",
