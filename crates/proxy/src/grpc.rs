@@ -67,7 +67,10 @@ impl TunnelService for TunnelHandler {
                     tunnel_response::Payload::HttpResponse(resp) => {
                         mux.deliver_response(&msg.stream_id, resp);
                     }
-                    tunnel_response::Payload::Data(_) | tunnel_response::Payload::Close(_) => {}
+                    tunnel_response::Payload::Close(_) => {
+                        mux.fail_stream(&msg.stream_id);
+                    }
+                    tunnel_response::Payload::Data(_) => {}
                 }
             }
 

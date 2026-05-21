@@ -103,6 +103,16 @@ impl StreamMux {
         }
     }
 
+    pub fn fail_stream(&self, stream_id: &str) {
+        if let Some(pending) = self.pending.lock().unwrap().remove(stream_id) {
+            let _ = pending.response_tx.send(HttpResponse {
+                status_code: 502,
+                headers: Default::default(),
+                body: Vec::new(),
+            });
+        }
+    }
+
     pub fn cancel_stream(&self, stream_id: &str) {
         self.pending.lock().unwrap().remove(stream_id);
     }
@@ -281,5 +291,37 @@ mod tests {
 
         let result = handle.await.unwrap();
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fail_stream_delivers_502_response() {
+        let pool = Arc::new(TunnelPool::new());
+        let agent_id = AgentId::new();
+        let (tx, mut rx) = mpsc::channel::<TunnelRequest>(32);
+
+        pool.register(agent_id.clone(), tx);
+        let mux = Arc::new(StreamMux::new(pool));
+
+        let mux_clone = mux.clone();
+        let agent_id_clone = agent_id.clone();
+        let handle = tokio::spawn(async move {
+            mux_clone
+                .send_request(
+                    &agent_id_clone,
+                    "sandbox-1",
+                    "GET".into(),
+                    "/".into(),
+                    Default::default(),
+                    vec![],
+                )
+                .await
+        });
+
+        let req = rx.recv().await.unwrap();
+        mux.fail_stream(&req.stream_id);
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.status_code, 502);
+        assert!(result.body.is_empty());
     }
 }

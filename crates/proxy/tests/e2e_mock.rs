@@ -4,8 +4,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 
 use open_sandbox_contracts::proxy::{
-    tunnel_response, tunnel_service_client::TunnelServiceClient, HttpResponse, TunnelReady,
-    TunnelResponse,
+    tunnel_response, tunnel_service_client::TunnelServiceClient, HttpResponse, StreamClose,
+    TunnelReady, TunnelResponse,
 };
 use open_sandbox_contracts::proxy::tunnel_request;
 use open_sandbox_contracts::types::{AgentId, SandboxId};
@@ -376,6 +376,71 @@ async fn http_ingress_routes_through_grpc_tunnel_to_mock_agent() {
 
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "echoed: GET /test-path");
+
+    server_handle.abort();
+    agent_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_close_returns_502_immediately() {
+    let store = InMemoryRoutingStore::new();
+    let sandbox_id = SandboxId::new();
+    let agent_id = AgentId::new();
+    store.add_entry(sandbox_id.clone(), agent_id.clone());
+
+    let cache = Arc::new(RoutingCache::new(store));
+    cache.refresh().await.unwrap();
+
+    let pool = Arc::new(TunnelPool::new());
+    let mux = Arc::new(StreamMux::new(pool.clone()));
+
+    let grpc_addr = start_proxy(pool.clone(), mux.clone()).await;
+
+    let (agent_tx, mut agent_rx) = connect_agent(&grpc_addr, &agent_id).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let router = Arc::new(Router::new(cache, mux));
+    let http_server = HttpServer::new(router);
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        http_server.run(http_listener).await
+    });
+
+    let agent_handle = tokio::spawn(async move {
+        if let Ok(Some(req)) = agent_rx.message().await {
+            let close = TunnelResponse {
+                stream_id: req.stream_id.clone(),
+                payload: Some(tunnel_response::Payload::Close(StreamClose {
+                    reason: "container not ready".into(),
+                })),
+            };
+            let _ = agent_tx.send(close).await;
+        }
+    });
+
+    let host = format!("{}.sandbox.example.com", sandbox_id.subdomain());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let t = std::time::Instant::now();
+    let resp = client
+        .get(format!("http://{http_addr}/"))
+        .header("host", &host)
+        .send()
+        .await
+        .unwrap();
+    let elapsed = t.elapsed();
+
+    assert_eq!(resp.status(), 502);
+    assert!(
+        elapsed.as_millis() < 1000,
+        "should return 502 fast, not wait for timeout; took {}ms",
+        elapsed.as_millis()
+    );
 
     server_handle.abort();
     agent_handle.abort();
