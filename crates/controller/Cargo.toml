@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 open-sandbox-contracts = { path = "../contracts" }
 prost-types = "0.13"
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "uuid"] }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tokio-stream = "0.1"
 tonic = "0.12"
