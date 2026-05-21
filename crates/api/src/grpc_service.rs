@@ -96,6 +96,7 @@ impl SandboxService for GrpcSandboxService {
             .exec_sandbox(ProtoExec {
                 sandbox_id: sandbox_id.to_string(),
                 command: request.command,
+                stdin: vec![],
             })
             .await
             .map_err(grpc_to_api)?

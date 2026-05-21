@@ -44,6 +44,7 @@ message DeleteSandboxResponse {
 message ExecSandboxRequest {
   string sandbox_id = 1;
   repeated string command = 2;
+  bytes stdin = 3;
 }
 
 message ExecSandboxResponse {

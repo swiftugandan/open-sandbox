@@ -106,6 +106,7 @@ message ExecCommand {
   string sandbox_id = 1;
   repeated string command = 2;
   string exec_id = 3;
+  bytes stdin = 4;
 }
 
 message FetchLogsCommand {
