@@ -22,6 +22,7 @@ use open_sandbox_controller::scheduler::SandboxRequirements;
 use open_sandbox_controller::token::TokenValidator;
 
 use open_sandbox_proxy::grpc::tunnel_service;
+use open_sandbox_proxy::http_server::HttpServer;
 use open_sandbox_proxy::pg_store::PgRoutingStore;
 use open_sandbox_proxy::routing_cache::RoutingCache;
 use open_sandbox_proxy::router::Router;
@@ -370,4 +371,85 @@ async fn live_routing_miss_for_unknown_sandbox() {
         ),
         "unknown sandbox should get routing miss"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_http_ingress_end_to_end() {
+    let pg = TestPg::start().await;
+    let (controller, controller_addr) = start_live_controller(&pg).await;
+    let (pool, mux, cache, proxy_addr) = start_live_proxy(&pg).await;
+
+    let runtime = Arc::new(LiveMockRuntime::new());
+    let manager = Arc::new(SandboxManager::new(runtime));
+    let agent_id = AgentId::new();
+
+    let controller_conn = ControllerConnection::new(
+        agent_id.clone(),
+        JoinToken::new(TEST_TOKEN.into()),
+        manager.clone(),
+        test_resources(),
+    );
+    let ctrl_handle = tokio::spawn({
+        let addr = controller_addr.clone();
+        async move { controller_conn.run(&addr).await }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let http_client = Arc::new(LiveMockHttpClient);
+    let forwarder = Arc::new(TunnelForwarder::new(manager, http_client));
+    let proxy_conn = ProxyConnection::new(agent_id.clone(), forwarder);
+    let tunnel_handle = tokio::spawn({
+        let addr = proxy_addr.clone();
+        async move { proxy_conn.run(&addr).await }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let sandbox_id = SandboxId::new();
+    controller
+        .create_sandbox(CreateSandboxRequest {
+            sandbox_id: sandbox_id.clone(),
+            image: "nginx:latest".into(),
+            requirements: SandboxRequirements {
+                cpu_millicores: 1000,
+                memory_bytes: 512_000_000,
+            },
+        })
+        .await
+        .expect("sandbox creation should succeed");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cache.refresh().await.expect("cache refresh should succeed");
+
+    assert!(pool.contains(&agent_id), "agent should be in tunnel pool");
+
+    let router = Arc::new(Router::new(cache, mux));
+    let http_server = HttpServer::new(router);
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        http_server.run(http_listener).await
+    });
+
+    let host = format!("{}.sandbox.example.com", sandbox_id.subdomain());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let resp = client
+        .get(format!("http://{http_addr}/live-path"))
+        .header("host", &host)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"live-response");
+
+    server_handle.abort();
+    ctrl_handle.abort();
+    tunnel_handle.abort();
 }
