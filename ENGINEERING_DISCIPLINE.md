@@ -102,6 +102,10 @@ Known gaps:
 
 Vague confidence ("seems fine", "should work") is not a confidence assessment — it is the absence of one. If confidence is medium or low, name the gaps concretely and resolve them in the current phase before proceeding. The point is to make uncertainty legible so it can be acted on, not to ritually declare readiness.
 
+## Autonomous progression
+
+Proceed through TDD phases (red → green → refactor → e2e-mock → live-e2e) without waiting for confirmation between phases. Only stop and ask when hitting an actual blocker: an ambiguous contract, a design decision with no clear answer, a dependency that isn't available, or a failing test whose root cause is unclear. "Should I continue?" is not a blocker — it is wasted round-trips.
+
 ## What this discipline is for
 
 These rules are not aesthetics. Each one prevents a specific failure mode that compounds over time:

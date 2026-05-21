@@ -7,9 +7,9 @@ use crate::store::{AgentCapacity, AgentRecord, AgentState, AvailableResources, C
 use crate::token::TokenValidator;
 
 #[derive(Debug)]
-pub struct RegistrationResult {
-    pub accepted: bool,
-    pub rejection_reason: Option<String>,
+pub enum RegistrationResult {
+    Accepted,
+    Rejected { reason: String },
 }
 
 pub struct AgentRegistry<S: ControllerStore> {
@@ -32,9 +32,8 @@ impl<S: ControllerStore> AgentRegistry<S> {
         capacity: AgentCapacity,
     ) -> Result<RegistrationResult, ControllerError> {
         if !self.validator.validate(token.as_str()) {
-            return Ok(RegistrationResult {
-                accepted: false,
-                rejection_reason: Some("invalid join token".into()),
+            return Ok(RegistrationResult::Rejected {
+                reason: "invalid join token".into(),
             });
         }
 
@@ -50,10 +49,7 @@ impl<S: ControllerStore> AgentRegistry<S> {
         };
         self.store.save_agent(record).await?;
 
-        Ok(RegistrationResult {
-            accepted: true,
-            rejection_reason: None,
-        })
+        Ok(RegistrationResult::Accepted)
     }
 
     pub async fn heartbeat(&self, agent_id: &AgentId) -> Result<(), ControllerError> {
@@ -102,7 +98,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.accepted);
+        assert!(matches!(result, RegistrationResult::Accepted));
     }
 
     #[tokio::test]
@@ -119,8 +115,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!result.accepted);
-        assert!(result.rejection_reason.is_some());
+        assert!(matches!(result, RegistrationResult::Rejected { .. }));
     }
 
     #[tokio::test]
