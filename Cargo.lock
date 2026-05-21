@@ -532,7 +532,11 @@ name = "open-sandbox-controller"
 version = "0.1.0"
 dependencies = [
  "open-sandbox-contracts",
+ "prost-types",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "uuid",
 ]
 
 [[package]]
