@@ -2,13 +2,13 @@ use open_sandbox_agent::tunnel::{ForwardRequest, ForwardResponse, HttpClient};
 use open_sandbox_contracts::error::AgentError;
 
 pub struct ReqwestHttpClient {
-    _client: reqwest::Client,
+    client: reqwest::Client,
 }
 
 impl ReqwestHttpClient {
     pub fn new() -> Self {
         Self {
-            _client: reqwest::Client::new(),
+            client: reqwest::Client::new(),
         }
     }
 }
@@ -16,11 +16,46 @@ impl ReqwestHttpClient {
 impl HttpClient for ReqwestHttpClient {
     async fn send(
         &self,
-        _port: u16,
-        _request: ForwardRequest,
+        port: u16,
+        request: ForwardRequest,
     ) -> Result<ForwardResponse, AgentError> {
-        Err(AgentError::Internal {
-            detail: "HTTP client not yet implemented".to_string(),
+        let url = format!("http://127.0.0.1:{port}{}", request.uri);
+
+        let method: reqwest::Method = request
+            .method
+            .parse()
+            .map_err(|e: http::method::InvalidMethod| AgentError::Internal {
+                detail: e.to_string(),
+            })?;
+
+        let mut builder = self.client.request(method, &url);
+        for (key, value) in &request.headers {
+            builder = builder.header(key.as_str(), value.as_str());
+        }
+        builder = builder.body(request.body);
+
+        let response = builder.send().await.map_err(|e| AgentError::Internal {
+            detail: e.to_string(),
+        })?;
+
+        let status_code = response.status().as_u16() as u32;
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| AgentError::Internal {
+                detail: e.to_string(),
+            })?
+            .to_vec();
+
+        Ok(ForwardResponse {
+            status_code,
+            headers,
+            body,
         })
     }
 }
@@ -122,7 +157,7 @@ mod tests {
         let client = ReqwestHttpClient::new();
         let result = client
             .send(
-                1, // port 1 should be unreachable
+                1,
                 ForwardRequest {
                     method: "GET".into(),
                     uri: "/".into(),
@@ -153,6 +188,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.headers.get("x-test").map(|s| s.as_str()), Some("sandbox"));
+        assert_eq!(
+            response.headers.get("x-test").map(|s| s.as_str()),
+            Some("sandbox")
+        );
     }
 }

@@ -1,53 +1,229 @@
+use std::collections::HashMap;
 use std::time::Duration;
+
+use bollard::container::{
+    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+    StopContainerOptions,
+};
+use bollard::models::{HostConfig, PortBinding};
 
 use open_sandbox_agent::container::{ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime};
 use open_sandbox_contracts::error::AgentError;
+use open_sandbox_contracts::types::SandboxId;
+
+const LABEL_MANAGED_BY: &str = "open-sandbox.managed-by";
+const LABEL_MANAGED_BY_VALUE: &str = "open-sandbox-agent";
+const LABEL_SANDBOX_ID: &str = "open-sandbox.sandbox-id";
 
 pub struct DockerRuntime {
-    _client: bollard::Docker,
+    client: bollard::Docker,
 }
 
 impl DockerRuntime {
     pub fn connect() -> Result<Self, AgentError> {
-        let client = bollard::Docker::connect_with_local_defaults().map_err(|e| AgentError::Docker {
-            detail: e.to_string(),
-        })?;
-        Ok(Self { _client: client })
+        let client =
+            bollard::Docker::connect_with_local_defaults().map_err(|e| AgentError::Docker {
+                detail: e.to_string(),
+            })?;
+        Ok(Self { client })
     }
 }
 
 impl ContainerRuntime for DockerRuntime {
     async fn create_and_start(
         &self,
-        _config: ContainerConfig,
+        config: ContainerConfig,
     ) -> Result<ContainerInfo, AgentError> {
-        Err(AgentError::Docker {
-            detail: "Docker runtime not yet implemented".to_string(),
+        let sandbox_id_str = config.sandbox_id.to_string();
+        let container_port = format!("{}/tcp", config.exposed_port);
+
+        let nano_cpus = (config.cpu_limit_millicores as i64) * 1_000_000;
+
+        let host_config = HostConfig {
+            memory: Some(config.memory_limit_bytes as i64),
+            nano_cpus: Some(nano_cpus),
+            publish_all_ports: Some(true),
+            ..Default::default()
+        };
+
+        let mut env_vec: Vec<String> = config
+            .env_vars
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        env_vec.sort();
+
+        let labels = HashMap::from([
+            (LABEL_MANAGED_BY.to_string(), LABEL_MANAGED_BY_VALUE.to_string()),
+            (LABEL_SANDBOX_ID.to_string(), sandbox_id_str.clone()),
+        ]);
+
+        let container_config = Config::<String> {
+            image: Some(config.image.clone()),
+            labels: Some(labels),
+            exposed_ports: Some(HashMap::from([(container_port.clone(), HashMap::new())])),
+            host_config: Some(host_config),
+            env: Some(env_vec),
+            ..Default::default()
+        };
+
+        let name = format!("sandbox-{sandbox_id_str}");
+        let options = CreateContainerOptions {
+            name: name.as_str(),
+            platform: None,
+        };
+
+        let create_response = self
+            .client
+            .create_container(Some(options), container_config)
+            .await
+            .map_err(|e| AgentError::Docker {
+                detail: e.to_string(),
+            })?;
+
+        self.client
+            .start_container::<String>(&create_response.id, None)
+            .await
+            .map_err(|e| AgentError::Docker {
+                detail: e.to_string(),
+            })?;
+
+        let inspect = self
+            .client
+            .inspect_container(&create_response.id, None)
+            .await
+            .map_err(|e| AgentError::Docker {
+                detail: e.to_string(),
+            })?;
+
+        let host_port = extract_host_port(&inspect, &container_port)?;
+
+        Ok(ContainerInfo {
+            id: ContainerId(create_response.id),
+            sandbox_id: config.sandbox_id,
+            host_port,
+            running: true,
         })
     }
 
     async fn stop_and_remove(
         &self,
-        _id: &ContainerId,
-        _timeout: Duration,
+        id: &ContainerId,
+        timeout: Duration,
     ) -> Result<(), AgentError> {
-        Err(AgentError::Docker {
-            detail: "Docker runtime not yet implemented".to_string(),
-        })
+        let stop_opts = StopContainerOptions {
+            t: timeout.as_secs() as i64,
+        };
+
+        // Stop may fail if already stopped — that's fine
+        let _ = self.client.stop_container(&id.0, Some(stop_opts)).await;
+
+        let remove_opts = RemoveContainerOptions {
+            force: true,
+            v: true,
+            ..Default::default()
+        };
+
+        self.client
+            .remove_container(&id.0, Some(remove_opts))
+            .await
+            .map_err(|e| AgentError::Docker {
+                detail: e.to_string(),
+            })?;
+
+        Ok(())
     }
 
     async fn list_sandbox_containers(&self) -> Result<Vec<ContainerInfo>, AgentError> {
-        Err(AgentError::Docker {
-            detail: "Docker runtime not yet implemented".to_string(),
-        })
+        let filter = format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}");
+        let options = ListContainersOptions {
+            all: true,
+            filters: HashMap::from([("label".to_string(), vec![filter])]),
+            ..Default::default()
+        };
+
+        let containers = self
+            .client
+            .list_containers(Some(options))
+            .await
+            .map_err(|e| AgentError::Docker {
+                detail: e.to_string(),
+            })?;
+
+        let mut result = Vec::with_capacity(containers.len());
+        for container in containers {
+            let id = match container.id {
+                Some(ref id) => id.clone(),
+                None => continue,
+            };
+
+            let labels = container.labels.unwrap_or_default();
+            let sandbox_id_str = match labels.get(LABEL_SANDBOX_ID) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let sandbox_id = uuid::Uuid::parse_str(sandbox_id_str)
+                .map(SandboxId::from)
+                .map_err(|e| AgentError::Internal {
+                    detail: e.to_string(),
+                })?;
+
+            let running = container
+                .state
+                .as_deref()
+                .is_some_and(|s| s == "running");
+
+            let host_port = container
+                .ports
+                .unwrap_or_default()
+                .iter()
+                .find_map(|p| p.public_port)
+                .unwrap_or(0) as u16;
+
+            result.push(ContainerInfo {
+                id: ContainerId(id),
+                sandbox_id,
+                host_port,
+                running,
+            });
+        }
+
+        Ok(result)
     }
+}
+
+fn extract_host_port(
+    inspect: &bollard::models::ContainerInspectResponse,
+    container_port: &str,
+) -> Result<u16, AgentError> {
+    let ports = inspect
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.ports.as_ref())
+        .ok_or_else(|| AgentError::Docker {
+            detail: "no port mappings found".into(),
+        })?;
+
+    let bindings: &Vec<PortBinding> = ports
+        .get(container_port)
+        .and_then(|b| b.as_ref())
+        .ok_or_else(|| AgentError::Docker {
+            detail: format!("no binding for {container_port}"),
+        })?;
+
+    bindings
+        .first()
+        .and_then(|b| b.host_port.as_ref())
+        .and_then(|p| p.parse::<u16>().ok())
+        .ok_or_else(|| AgentError::Docker {
+            detail: "could not parse host port".into(),
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use open_sandbox_contracts::types::SandboxId;
-    use std::collections::HashMap;
 
     fn test_config(sandbox_id: SandboxId) -> ContainerConfig {
         ContainerConfig {
@@ -129,12 +305,8 @@ mod tests {
 
         let info = runtime.create_and_start(config).await.unwrap();
 
-        // Verify via bollard inspect that limits were applied
         let client = bollard::Docker::connect_with_local_defaults().unwrap();
-        let inspect = client
-            .inspect_container(&info.id.0, None)
-            .await
-            .unwrap();
+        let inspect = client.inspect_container(&info.id.0, None).await.unwrap();
 
         let host_config = inspect.host_config.unwrap();
         assert_eq!(host_config.memory, Some(256 * 1024 * 1024));
