@@ -161,6 +161,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
                 sandbox_id: sandbox_id.to_string(),
                 command: req.command,
                 exec_id: exec_id.clone(),
+                stdin: req.stdin,
             })),
         };
         self.controller
