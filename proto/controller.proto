@@ -1,0 +1,113 @@
+syntax = "proto3";
+package open_sandbox.controller;
+
+import "google/protobuf/timestamp.proto";
+
+service ControllerService {
+  rpc AgentStream(stream AgentMessage) returns (stream ControllerCommand);
+}
+
+message AgentMessage {
+  oneof payload {
+    RegisterRequest register = 1;
+    Heartbeat heartbeat = 2;
+    SandboxStatus sandbox_status = 3;
+    ResourceReport resource_report = 4;
+  }
+}
+
+message ControllerCommand {
+  oneof payload {
+    RegisterResponse register_response = 1;
+    HeartbeatAck heartbeat_ack = 2;
+    StartSandbox start_sandbox = 3;
+    StopSandbox stop_sandbox = 4;
+    ExecCommand exec = 5;
+    FetchLogsCommand fetch_logs = 6;
+  }
+}
+
+message RegisterRequest {
+  string agent_id = 1;
+  string join_token = 2;
+  AgentResources resources = 3;
+}
+
+message RegisterResponse {
+  bool accepted = 1;
+  string rejection_reason = 2;
+  string agent_certificate = 3;
+}
+
+message Heartbeat {
+  string agent_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+}
+
+message HeartbeatAck {
+  google.protobuf.Timestamp timestamp = 1;
+}
+
+message AgentResources {
+  uint32 cpu_cores = 1;
+  uint64 memory_bytes = 2;
+  Architecture arch = 3;
+  string os = 4;
+}
+
+enum Architecture {
+  ARCHITECTURE_UNSPECIFIED = 0;
+  ARCHITECTURE_X86_64 = 1;
+  ARCHITECTURE_AARCH64 = 2;
+}
+
+message SandboxStatus {
+  string sandbox_id = 1;
+  SandboxState state = 2;
+  string error_message = 3;
+}
+
+enum SandboxState {
+  SANDBOX_STATE_UNSPECIFIED = 0;
+  SANDBOX_STATE_CREATING = 1;
+  SANDBOX_STATE_RUNNING = 2;
+  SANDBOX_STATE_STOPPING = 3;
+  SANDBOX_STATE_STOPPED = 4;
+  SANDBOX_STATE_FAILED = 5;
+}
+
+message ResourceReport {
+  string agent_id = 1;
+  uint32 available_cpu_millicores = 2;
+  uint64 available_memory_bytes = 3;
+  uint32 running_sandboxes = 4;
+}
+
+message StartSandbox {
+  string sandbox_id = 1;
+  string image = 2;
+  SandboxConfig config = 3;
+}
+
+message SandboxConfig {
+  uint32 cpu_limit_millicores = 1;
+  uint64 memory_limit_bytes = 2;
+  map<string, string> env_vars = 3;
+  uint32 exposed_port = 4;
+}
+
+message StopSandbox {
+  string sandbox_id = 1;
+  uint32 timeout_seconds = 2;
+}
+
+message ExecCommand {
+  string sandbox_id = 1;
+  repeated string command = 2;
+}
+
+message FetchLogsCommand {
+  string sandbox_id = 1;
+  uint32 tail_lines = 2;
+  bool follow = 3;
+}

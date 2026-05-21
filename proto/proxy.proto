@@ -1,0 +1,52 @@
+syntax = "proto3";
+package open_sandbox.proxy;
+
+service TunnelService {
+  rpc OpenTunnel(stream TunnelResponse) returns (stream TunnelRequest);
+}
+
+message TunnelRequest {
+  string stream_id = 1;
+  oneof payload {
+    HttpRequest http_request = 2;
+    DataChunk data = 3;
+    StreamClose close = 4;
+  }
+}
+
+message TunnelResponse {
+  string stream_id = 1;
+  oneof payload {
+    HttpResponse http_response = 2;
+    DataChunk data = 3;
+    StreamClose close = 4;
+    TunnelReady ready = 5;
+  }
+}
+
+message TunnelReady {
+  string agent_id = 1;
+}
+
+message HttpRequest {
+  string method = 1;
+  string uri = 2;
+  map<string, string> headers = 3;
+  bytes body = 4;
+  string sandbox_id = 5;
+}
+
+message HttpResponse {
+  uint32 status_code = 1;
+  map<string, string> headers = 2;
+  bytes body = 3;
+}
+
+message DataChunk {
+  bytes data = 1;
+  bool is_final = 2;
+}
+
+message StreamClose {
+  string reason = 1;
+}

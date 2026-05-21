@@ -1,0 +1,148 @@
+# Contracts
+
+> This document is the prose companion to the contracts crate at `crates/contracts/`. The crate is the source of truth — types compile, prose does not. This document explains the *why* and the cross-cutting policies that the types themselves cannot express.
+
+## Status
+
+Current frozen version: **not yet frozen**
+
+Once frozen, this section reads: *Frozen at `contracts/v0.1.0-frozen` on `<date>`. Changes require a `contracts/amendment-<desc>` branch and a version bump.*
+
+## Cross-cutting policies
+
+### Serialization
+
+- Format: Protocol Buffers for gRPC wire messages (defined in `proto/controller.proto` and `proto/proxy.proto`). JSON via `serde` for API responses, Postgres JSONB columns, and debugging.
+- Field naming: Proto messages use `snake_case` per proto3 convention. Serde-serialized Rust types use `#[serde(rename_all = "camelCase")]` for API-facing JSON only; internal types use Rust's default `snake_case`.
+- Unknown field handling: Proto3 preserves unknown fields by default. Serde types are `#[serde(deny_unknown_fields)]` at API boundaries, permissive internally.
+
+### Versioning
+
+- The contracts crate is versioned independently from any consumer.
+- Semver applies: breaking changes require a major bump; additive changes require a minor bump.
+- Public enums are marked `#[non_exhaustive]` so adding variants is a minor change, not a breaking one.
+- Proto messages evolve via proto3's additive field rules: new fields get new field numbers, old fields are never reused.
+
+### Error types
+
+- Library errors use `thiserror`.
+- Errors that cross the contract boundary carry a stable kind (an enum variant) plus an unstable detail message.
+- Consumers match on the kind; they do not parse the detail message.
+- All error enums are `#[non_exhaustive]` to allow adding variants without a major version bump.
+
+### Newtypes over primitives
+
+Every domain identifier is wrapped:
+
+```rust
+pub struct AgentId(pub Uuid);
+pub struct SandboxId(pub Uuid);
+pub struct JoinToken(pub String);  // Display redacts the value
+pub struct ApiKey(pub String);     // Display redacts the value
+```
+
+This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `Uuid` or `String` in function signatures where a domain type exists is a code smell.
+
+## Contracts inventory
+
+### Controller service (`controller.proto`)
+
+- **Producer:** Controller
+- **Consumers:** Agent
+- **Purpose:** Bidirectional gRPC stream for agent registration, heartbeats, sandbox lifecycle commands, and status reporting.
+- **Shape:** see `proto/controller.proto`
+- **Key messages:**
+  - `RegisterRequest` / `RegisterResponse` — agent joins the fleet
+  - `Heartbeat` / `HeartbeatAck` — liveness signal (interval: 5s per `constants::HEARTBEAT_INTERVAL`)
+  - `StartSandbox` / `StopSandbox` — sandbox lifecycle commands from controller
+  - `SandboxStatus` — agent reports sandbox state changes
+  - `ResourceReport` — agent reports available capacity
+  - `ExecCommand` / `FetchLogsCommand` — operator-initiated sandbox operations
+- **Invariants:** `agent_id` in `Heartbeat` and `ResourceReport` must match the `agent_id` from the initial `RegisterRequest` on the same stream. `SandboxStatus` may only be sent for sandboxes that the controller has assigned to this agent via `StartSandbox`.
+- **Compatibility:** Adding new `oneof` variants to `AgentMessage` or `ControllerCommand` is additive (minor bump). Changing existing message fields is breaking (major bump).
+
+### Tunnel service (`proxy.proto`)
+
+- **Producer:** Proxy (sends `TunnelRequest` to agents)
+- **Consumers:** Agent (sends `TunnelResponse` back)
+- **Purpose:** Reverse tunnel for forwarding public HTTP requests through the agent's outbound connection to local sandbox containers.
+- **Shape:** see `proto/proxy.proto`
+- **Key messages:**
+  - `TunnelReady` — agent sends on stream open to identify itself
+  - `HttpRequest` / `HttpResponse` — encapsulated HTTP request/response
+  - `DataChunk` — streaming body data for large payloads
+  - `StreamClose` — signals end of a virtual stream
+- **Invariants:** `stream_id` correlates request and response messages within a single tunnel. Each `stream_id` is unique within the lifetime of a tunnel connection. The proxy assigns `stream_id` values; the agent echoes them.
+- **Compatibility:** Same rules as controller service.
+
+### Domain types (`types.rs`)
+
+- **Producer:** Contracts crate
+- **Consumers:** Controller, Proxy, Agent
+- **Purpose:** Typed domain identifiers and shared data structures.
+- **Key types:**
+  - `AgentId` — wraps `Uuid`, identifies an agent across reconnections
+  - `SandboxId` — wraps `Uuid`, provides `subdomain()` for the first 12 hex chars
+  - `JoinToken` — wraps `String`, `Display` implementation redacts value for safe logging
+  - `ApiKey` — wraps `String`, `Display` implementation redacts value for safe logging
+  - `RoutingEntry` — `(sandbox_id, agent_id)` tuple used by controller and proxy
+- **Invariants:** `SandboxId::subdomain()` must produce a valid DNS label (lowercase alphanumeric, max 63 chars). The 12-char hex prefix from UUIDv4 satisfies this.
+
+### Error types (`error.rs`)
+
+- **Raised by:** Controller (`ControllerError`), Proxy (`ProxyError`), Agent (`AgentError`)
+- **Observed by:** Callers of each component's public API
+- **Kinds:**
+  - `ControllerError`: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `NoAvailableAgents`, `Database`, `Internal`
+  - `ProxyError`: `RoutingMiss`, `TunnelUnavailable`, `UpstreamTimeout`, `Internal`
+  - `AgentError`: `ControllerDisconnected`, `TunnelDisconnected`, `Docker`, `SandboxNotFound`, `Internal`
+- **Retry guidance:**
+  - Retryable: `Database` (transient), `TunnelUnavailable` (agent may reconnect), `UpstreamTimeout` (sandbox may be slow)
+  - Terminal: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `RoutingMiss`, `NoAvailableAgents`
+  - Ambiguous: `Internal`, `Docker` (may be transient or persistent depending on cause)
+
+### Constants (`constants.rs`)
+
+- **Producer:** Contracts crate
+- **Consumers:** All binaries
+- **Purpose:** Shared timing and resource constants that must be consistent across components.
+- **Key values:**
+  - `HEARTBEAT_INTERVAL`: 5 seconds
+  - `DEAD_AGENT_THRESHOLD`: 3 missed heartbeats
+  - `UPSTREAM_TIMEOUT`: 30 seconds
+  - `ROUTING_CACHE_REFRESH_INTERVAL`: 60 seconds (fallback for LISTEN/NOTIFY)
+  - `RECONNECT_BASE_DELAY`: 1 second (exponential backoff start)
+  - `RECONNECT_MAX_DELAY`: 30 seconds (backoff ceiling)
+  - `DEFAULT_SANDBOX_CPU_MILLICORES`: 1000 (1 core)
+  - `DEFAULT_SANDBOX_MEMORY_BYTES`: 512 MB
+
+## Component-to-contract matrix
+
+| Component  | Produces                                          | Consumes                                           |
+|------------|---------------------------------------------------|----------------------------------------------------|
+| Controller | `ControllerCommand`, `RegisterResponse`, `RoutingEntry` | `AgentMessage`, `RegisterRequest`                  |
+| Proxy      | `TunnelRequest`, HTTP responses                   | `TunnelResponse`, `RoutingEntry` (via PG)          |
+| Agent      | `AgentMessage`, `RegisterRequest`, `TunnelResponse` | `ControllerCommand`, `TunnelRequest`               |
+
+---
+
+## Freeze gate
+
+Before tagging `contracts/v0.1.0-frozen`:
+
+- [x] Confidence self-assessment is "high" with gaps resolved
+- [x] `crates/contracts/` compiles cleanly with `cargo check`
+- [x] Every component in `SAD.md` has its produced and consumed contracts represented in the crate
+- [x] The component-to-contract matrix above matches the crate
+- [ ] `cargo test -p open-sandbox-contracts` passes (even if only doctests)
+
+```
+Confidence: high
+Residual risks:
+  - Proto message design is based on anticipated usage patterns; actual usage during implementation may reveal missing fields or awkward ergonomics. The #[non_exhaustive] and proto3 additive-field policies mitigate this — amendments are minor bumps, not major.
+  - The TunnelService uses encapsulated HTTP (HttpRequest/HttpResponse messages) rather than raw byte forwarding. This adds parsing overhead but gives the proxy visibility into request metadata for routing and observability. If performance is insufficient, a raw-bytes mode can be added as a new oneof variant (minor bump).
+Known gaps:
+  - None blocking. All components' contract surfaces are represented in the crate.
+```
+
+Once all boxes are checked and confidence is high, commit with `docs: contracts` and tag `contracts/v0.1.0-frozen`.

@@ -1,0 +1,11 @@
+pub mod types;
+pub mod error;
+pub mod constants;
+
+pub mod controller {
+    tonic::include_proto!("open_sandbox.controller");
+}
+
+pub mod proxy {
+    tonic::include_proto!("open_sandbox.proxy");
+}
