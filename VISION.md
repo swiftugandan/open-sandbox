@@ -1,0 +1,3 @@
+# Vision
+
+Open Sandbox is a platform that gives developers isolated, publicly-accessible Docker sandbox environments by routing traffic through a central proxy to agents that dial out over TLS — meaning any machine with outbound internet (a cloud VM, a developer's laptop, a Raspberry Pi) can join the worker fleet with a single command. Done means: a developer can run `curl ... | sh` on any internet-connected machine, have it register as a worker, and serve sandboxes at `<id>.sandbox.example.com` within seconds — with the entire infrastructure deployable to any cloud from a single Pulumi stack costing under $20/month at the default scale.
