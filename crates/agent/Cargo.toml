@@ -1,0 +1,15 @@
+[package]
+name = "open-sandbox-agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+open-sandbox-contracts = { path = "../contracts" }
+prost-types = "0.13"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio-stream = "0.1"
+tonic = "0.12"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "test-util"] }
