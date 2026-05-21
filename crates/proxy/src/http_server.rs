@@ -76,26 +76,25 @@ async fn handle_request<S: RoutingStore + 'static>(
 
     match router.route_request(&host, method, uri, headers, body).await {
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status_code as u16)
+            let status = u16::try_from(resp.status_code)
+                .ok()
+                .and_then(|code| StatusCode::from_u16(code).ok())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let mut builder = Response::builder().status(status);
             for (k, v) in &resp.headers {
                 builder = builder.header(k.as_str(), v.as_str());
             }
-            Ok(builder
-                .body(Full::new(Bytes::from(resp.body)))
-                .unwrap_or_else(|_| {
-                    Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Full::new(Bytes::new()))
-                        .unwrap()
-                }))
+            Ok(builder.body(Full::new(Bytes::from(resp.body))).expect("fresh builder"))
         }
-        Err(_) => Ok(Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Full::new(Bytes::new()))
-            .unwrap()),
+        Err(_) => Ok(bad_gateway()),
     }
+}
+
+fn bad_gateway() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(Full::new(Bytes::new()))
+        .expect("fresh builder")
 }
 
 #[cfg(test)]
