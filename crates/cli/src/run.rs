@@ -7,11 +7,10 @@ use tokio_stream::wrappers::TcpListenerStream;
 use open_sandbox_contracts::controller::{AgentResources, Architecture};
 use open_sandbox_contracts::types::{AgentId, JoinToken};
 
-use open_sandbox_agent::container::{ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime};
 use open_sandbox_agent::controller_client::ControllerConnection;
 use open_sandbox_agent::proxy_client::ProxyConnection;
 use open_sandbox_agent::sandbox::SandboxManager;
-use open_sandbox_agent::tunnel::{ForwardRequest, ForwardResponse, HttpClient, TunnelForwarder};
+use open_sandbox_agent::tunnel::TunnelForwarder;
 
 use open_sandbox_controller::grpc::Controller;
 use open_sandbox_controller::pg_store::PgStore;
@@ -22,6 +21,8 @@ use open_sandbox_proxy::stream_mux::StreamMux;
 use open_sandbox_proxy::tunnel_pool::TunnelPool;
 
 use crate::cli::{AgentArgs, ControllerArgs, ProxyArgs};
+use crate::docker_runtime::DockerRuntime;
+use crate::http_client::ReqwestHttpClient;
 
 struct StaticTokenValidator {
     expected: String,
@@ -89,54 +90,11 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-struct DockerRuntime;
-
-impl ContainerRuntime for DockerRuntime {
-    async fn create_and_start(
-        &self,
-        _config: ContainerConfig,
-    ) -> Result<ContainerInfo, open_sandbox_contracts::error::AgentError> {
-        Err(open_sandbox_contracts::error::AgentError::Docker {
-            detail: "Docker runtime not yet implemented in CLI".to_string(),
-        })
-    }
-
-    async fn stop_and_remove(
-        &self,
-        _id: &ContainerId,
-        _timeout: Duration,
-    ) -> Result<(), open_sandbox_contracts::error::AgentError> {
-        Err(open_sandbox_contracts::error::AgentError::Docker {
-            detail: "Docker runtime not yet implemented in CLI".to_string(),
-        })
-    }
-
-    async fn list_sandbox_containers(
-        &self,
-    ) -> Result<Vec<ContainerInfo>, open_sandbox_contracts::error::AgentError> {
-        Ok(vec![])
-    }
-}
-
-struct LocalHttpClient;
-
-impl HttpClient for LocalHttpClient {
-    async fn send(
-        &self,
-        _port: u16,
-        _request: ForwardRequest,
-    ) -> Result<ForwardResponse, open_sandbox_contracts::error::AgentError> {
-        Err(open_sandbox_contracts::error::AgentError::Internal {
-            detail: "HTTP client not yet implemented in CLI".to_string(),
-        })
-    }
-}
-
 pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
     let agent_id = AgentId::new();
     let join_token = JoinToken::new(args.token);
 
-    let runtime = Arc::new(DockerRuntime);
+    let runtime = Arc::new(DockerRuntime::connect()?);
     let sandbox_manager = Arc::new(SandboxManager::new(runtime));
 
     let resources = AgentResources {
@@ -149,7 +107,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
     let controller_conn =
         ControllerConnection::new(agent_id.clone(), join_token, sandbox_manager.clone(), resources);
 
-    let http_client = Arc::new(LocalHttpClient);
+    let http_client = Arc::new(ReqwestHttpClient::new());
     let forwarder = Arc::new(TunnelForwarder::new(sandbox_manager, http_client));
     let proxy_conn = ProxyConnection::new(agent_id, forwarder);
 
