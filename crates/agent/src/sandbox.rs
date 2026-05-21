@@ -161,7 +161,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(state, SandboxState::Running.into());
+        assert_eq!(state, SandboxState::Running);
         assert_eq!(runtime.created_count(), 1);
     }
 
@@ -180,7 +180,7 @@ mod tests {
         assert!(entry.is_some());
         let entry = entry.unwrap();
         assert_eq!(entry.sandbox_id, sandbox_id);
-        assert_eq!(entry.state, SandboxState::Running.into());
+        assert_eq!(entry.state, SandboxState::Running);
     }
 
     #[tokio::test]
@@ -194,7 +194,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(state, SandboxState::Failed.into());
+        assert_eq!(state, SandboxState::Failed);
     }
 
     #[tokio::test]
@@ -213,7 +213,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(state, SandboxState::Stopped.into());
+        assert_eq!(state, SandboxState::Stopped);
         assert_eq!(runtime.stopped_count(), 1);
     }
 

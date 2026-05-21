@@ -55,7 +55,6 @@ impl<R: ContainerRuntime, H: HttpClient> TunnelForwarder<R, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::ContainerRuntime;
     use crate::testutil::*;
 
     #[tokio::test]
