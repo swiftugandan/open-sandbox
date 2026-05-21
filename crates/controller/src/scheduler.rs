@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use open_sandbox_contracts::error::ControllerError;
-use open_sandbox_contracts::types::{AgentId, SandboxId};
+use open_sandbox_contracts::types::{AgentId, RoutingEntry, SandboxId};
 
 use crate::store::ControllerStore;
 
@@ -26,10 +26,34 @@ impl<S: ControllerStore> Scheduler<S> {
 
     pub async fn assign_sandbox(
         &self,
-        _sandbox_id: SandboxId,
-        _requirements: &SandboxRequirements,
+        sandbox_id: SandboxId,
+        requirements: &SandboxRequirements,
     ) -> Result<SandboxAssignment, ControllerError> {
-        todo!()
+        let agents = self.store.list_active_agents().await?;
+
+        let best = agents
+            .into_iter()
+            .filter(|a| {
+                a.available.cpu_millicores >= requirements.cpu_millicores
+                    && a.available.memory_bytes >= requirements.memory_bytes
+            })
+            .max_by_key(|a| a.available.cpu_millicores);
+
+        match best {
+            Some(agent) => {
+                let entry = RoutingEntry {
+                    sandbox_id: sandbox_id.clone(),
+                    agent_id: agent.agent_id.clone(),
+                };
+                self.store.insert_routing_entry(entry).await?;
+
+                Ok(SandboxAssignment {
+                    agent_id: agent.agent_id,
+                    sandbox_id,
+                })
+            }
+            None => Err(ControllerError::NoAvailableAgents),
+        }
     }
 }
 

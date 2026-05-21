@@ -3,7 +3,7 @@ use std::sync::Arc;
 use open_sandbox_contracts::error::ControllerError;
 use open_sandbox_contracts::types::{AgentId, JoinToken};
 
-use crate::store::{AgentCapacity, ControllerStore};
+use crate::store::{AgentCapacity, AgentRecord, AgentState, AvailableResources, ControllerStore};
 use crate::token::TokenValidator;
 
 #[derive(Debug)]
@@ -27,19 +27,50 @@ impl<S: ControllerStore> AgentRegistry<S> {
 
     pub async fn register(
         &self,
-        _agent_id: AgentId,
-        _token: &JoinToken,
-        _capacity: AgentCapacity,
+        agent_id: AgentId,
+        token: &JoinToken,
+        capacity: AgentCapacity,
     ) -> Result<RegistrationResult, ControllerError> {
-        todo!()
+        if !self.validator.validate(token.as_str()) {
+            return Ok(RegistrationResult {
+                accepted: false,
+                rejection_reason: Some("invalid join token".into()),
+            });
+        }
+
+        let record = AgentRecord {
+            agent_id,
+            available: AvailableResources {
+                cpu_millicores: capacity.cpu_cores * 1000,
+                memory_bytes: capacity.memory_bytes,
+                running_sandboxes: 0,
+            },
+            capacity,
+            state: AgentState::Active,
+        };
+        self.store.save_agent(record).await?;
+
+        Ok(RegistrationResult {
+            accepted: true,
+            rejection_reason: None,
+        })
     }
 
-    pub async fn heartbeat(&self, _agent_id: &AgentId) -> Result<(), ControllerError> {
-        todo!()
+    pub async fn heartbeat(&self, agent_id: &AgentId) -> Result<(), ControllerError> {
+        match self.store.get_agent(agent_id).await? {
+            Some(_) => Ok(()),
+            None => Err(ControllerError::AgentNotFound {
+                agent_id: agent_id.to_string(),
+            }),
+        }
     }
 
-    pub async fn mark_agent_dead(&self, _agent_id: &AgentId) -> Result<(), ControllerError> {
-        todo!()
+    pub async fn mark_agent_dead(&self, agent_id: &AgentId) -> Result<(), ControllerError> {
+        self.store
+            .update_agent_state(agent_id, AgentState::Dead)
+            .await?;
+        self.store.remove_routing_entries_for_agent(agent_id).await?;
+        Ok(())
     }
 }
 

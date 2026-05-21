@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use open_sandbox_contracts::constants::DEAD_AGENT_TIMEOUT;
 use open_sandbox_contracts::types::AgentId;
 
 pub struct HeartbeatMonitor {
@@ -14,16 +15,26 @@ impl HeartbeatMonitor {
         }
     }
 
-    pub fn record_heartbeat(&self, _agent_id: AgentId) {
-        todo!()
+    pub fn record_heartbeat(&self, agent_id: AgentId) {
+        self.heartbeats
+            .lock()
+            .unwrap()
+            .insert(agent_id, tokio::time::Instant::now());
     }
 
-    pub fn remove(&self, _agent_id: &AgentId) {
-        todo!()
+    pub fn remove(&self, agent_id: &AgentId) {
+        self.heartbeats.lock().unwrap().remove(agent_id);
     }
 
     pub fn dead_agents(&self) -> Vec<AgentId> {
-        todo!()
+        let now = tokio::time::Instant::now();
+        self.heartbeats
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, last)| now.duration_since(**last) > DEAD_AGENT_TIMEOUT)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 }
 
