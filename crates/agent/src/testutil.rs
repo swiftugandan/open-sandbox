@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use open_sandbox_contracts::controller::{SandboxConfig, StartSandbox};
@@ -46,10 +46,7 @@ impl MockContainerRuntime {
 }
 
 impl ContainerRuntime for MockContainerRuntime {
-    async fn create_and_start(
-        &self,
-        config: ContainerConfig,
-    ) -> Result<ContainerInfo, AgentError> {
+    async fn create_and_start(&self, config: ContainerConfig) -> Result<ContainerInfo, AgentError> {
         self.created.fetch_add(1, Ordering::SeqCst);
         let port = self.port_counter.fetch_add(1, Ordering::SeqCst) as u16;
         Ok(ContainerInfo {

@@ -7,6 +7,14 @@ use open_sandbox_contracts::types::SandboxId;
 
 use crate::container::{ContainerConfig, ContainerId, ContainerRuntime};
 
+fn parse_sandbox_id(raw: &str) -> Result<SandboxId, AgentError> {
+    uuid::Uuid::parse_str(raw)
+        .map(SandboxId::from)
+        .map_err(|e| AgentError::Internal {
+            detail: e.to_string(),
+        })
+}
+
 #[derive(Debug, Clone)]
 pub struct SandboxEntry {
     pub sandbox_id: SandboxId,
@@ -28,14 +36,8 @@ impl<R: ContainerRuntime> SandboxManager<R> {
         }
     }
 
-    pub async fn start_sandbox(
-        &self,
-        cmd: StartSandbox,
-    ) -> Result<SandboxState, AgentError> {
-        let sandbox_id = SandboxId::from(
-            uuid::Uuid::parse_str(&cmd.sandbox_id)
-                .map_err(|e| AgentError::Internal { detail: e.to_string() })?,
-        );
+    pub async fn start_sandbox(&self, cmd: StartSandbox) -> Result<SandboxState, AgentError> {
+        let sandbox_id = parse_sandbox_id(&cmd.sandbox_id)?;
 
         let config = cmd.config.unwrap_or_default();
         let container_config = ContainerConfig {
@@ -71,14 +73,8 @@ impl<R: ContainerRuntime> SandboxManager<R> {
         }
     }
 
-    pub async fn stop_sandbox(
-        &self,
-        cmd: StopSandbox,
-    ) -> Result<SandboxState, AgentError> {
-        let sandbox_id = SandboxId::from(
-            uuid::Uuid::parse_str(&cmd.sandbox_id)
-                .map_err(|e| AgentError::Internal { detail: e.to_string() })?,
-        );
+    pub async fn stop_sandbox(&self, cmd: StopSandbox) -> Result<SandboxState, AgentError> {
+        let sandbox_id = parse_sandbox_id(&cmd.sandbox_id)?;
 
         let entry = self
             .sandboxes
@@ -91,7 +87,9 @@ impl<R: ContainerRuntime> SandboxManager<R> {
             })?;
 
         let timeout = std::time::Duration::from_secs(cmd.timeout_seconds as u64);
-        self.runtime.stop_and_remove(&entry.container_id, timeout).await?;
+        self.runtime
+            .stop_and_remove(&entry.container_id, timeout)
+            .await?;
         self.sandboxes.lock().unwrap().remove(&sandbox_id);
         Ok(SandboxState::Stopped)
     }
@@ -144,20 +142,6 @@ impl<R: ContainerRuntime> SandboxManager<R> {
 mod tests {
     use super::*;
     use crate::testutil::*;
-
-    fn start_cmd(sandbox_id: &SandboxId, image: &str) -> StartSandbox {
-        use open_sandbox_contracts::controller::SandboxConfig;
-        StartSandbox {
-            sandbox_id: sandbox_id.to_string(),
-            image: image.into(),
-            config: Some(SandboxConfig {
-                cpu_limit_millicores: 1000,
-                memory_limit_bytes: 512_000_000,
-                env_vars: HashMap::new(),
-                exposed_port: 8080,
-            }),
-        }
-    }
 
     fn stop_cmd(sandbox_id: &SandboxId, timeout_secs: u32) -> StopSandbox {
         StopSandbox {
@@ -224,7 +208,10 @@ mod tests {
             .await
             .unwrap();
 
-        let state = manager.stop_sandbox(stop_cmd(&sandbox_id, 10)).await.unwrap();
+        let state = manager
+            .stop_sandbox(stop_cmd(&sandbox_id, 10))
+            .await
+            .unwrap();
 
         assert_eq!(state, SandboxState::Stopped.into());
         assert_eq!(runtime.stopped_count(), 1);
@@ -241,7 +228,10 @@ mod tests {
             .await
             .unwrap();
 
-        manager.stop_sandbox(stop_cmd(&sandbox_id, 10)).await.unwrap();
+        manager
+            .stop_sandbox(stop_cmd(&sandbox_id, 10))
+            .await
+            .unwrap();
 
         assert!(manager.get_sandbox(&sandbox_id).is_none());
     }
@@ -251,9 +241,7 @@ mod tests {
         let runtime = Arc::new(MockContainerRuntime::new());
         let manager = SandboxManager::new(runtime);
 
-        let result = manager
-            .stop_sandbox(stop_cmd(&SandboxId::new(), 10))
-            .await;
+        let result = manager.stop_sandbox(stop_cmd(&SandboxId::new(), 10)).await;
 
         assert!(matches!(result, Err(AgentError::SandboxNotFound { .. })));
     }

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
-use crate::sandbox::SandboxManager;
 use crate::container::ContainerRuntime;
+use crate::sandbox::SandboxManager;
 
 pub trait HttpClient: Send + Sync {
     fn send(
