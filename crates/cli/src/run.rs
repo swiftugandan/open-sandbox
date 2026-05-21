@@ -17,6 +17,10 @@ use open_sandbox_controller::pg_store::PgStore;
 use open_sandbox_controller::token::TokenValidator;
 
 use open_sandbox_proxy::grpc::tunnel_service;
+use open_sandbox_proxy::http_server::HttpServer;
+use open_sandbox_proxy::pg_store::PgRoutingStore;
+use open_sandbox_proxy::router::Router;
+use open_sandbox_proxy::routing_cache::RoutingCache;
 use open_sandbox_proxy::stream_mux::StreamMux;
 use open_sandbox_proxy::tunnel_pool::TunnelPool;
 
@@ -69,23 +73,53 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
 }
 
 pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let _pool = sqlx::PgPool::connect(&args.database_url).await?;
+    let pg_pool = sqlx::PgPool::connect(&args.database_url).await?;
+    let routing_store = PgRoutingStore::new(pg_pool);
+    let cache = Arc::new(RoutingCache::new(routing_store));
+
+    cache.refresh().await.map_err(|e| e.to_string())?;
 
     let tunnel_pool = Arc::new(TunnelPool::new());
-
     let mux = Arc::new(StreamMux::new(tunnel_pool.clone()));
+    let router = Arc::new(Router::new(cache.clone(), mux.clone()));
+
     let grpc_service = tunnel_service(mux, tunnel_pool);
 
     let grpc_addr = format!("0.0.0.0:{}", args.grpc_port);
     let grpc_listener = TcpListener::bind(&grpc_addr).await?;
 
-    tonic::transport::Server::builder()
-        .add_service(grpc_service)
-        .serve_with_incoming_shutdown(
-            TcpListenerStream::new(grpc_listener),
-            shutdown_signal(),
-        )
-        .await?;
+    let http_addr = format!("0.0.0.0:{}", args.http_port);
+    let http_listener = TcpListener::bind(&http_addr).await?;
+
+    let http_server = HttpServer::new(router);
+
+    let cache_refresh = cache.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let _ = cache_refresh.refresh().await;
+        }
+    });
+
+    let grpc_handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(grpc_service)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(grpc_listener),
+                shutdown_signal(),
+            )
+            .await
+    });
+
+    let http_handle = tokio::spawn(async move {
+        http_server.run(http_listener).await
+    });
+
+    tokio::select! {
+        result = grpc_handle => { result??; }
+        result = http_handle => { result?.map_err(|e| e.to_string())?; }
+        () = shutdown_signal() => {}
+    }
 
     Ok(())
 }
