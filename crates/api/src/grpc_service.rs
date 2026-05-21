@@ -152,7 +152,11 @@ impl SandboxService for GrpcSandboxService {
         request: ReadFileRequest,
     ) -> Result<Vec<u8>, ApiError> {
         let path = match &request.cwd {
-            Some(cwd) => format!("{}/{}", cwd.trim_end_matches('/'), request.path.trim_start_matches('/')),
+            Some(cwd) => format!(
+                "{}/{}",
+                cwd.trim_end_matches('/'),
+                request.path.trim_start_matches('/')
+            ),
             None => request.path.clone(),
         };
         let mut client = self.client.clone();

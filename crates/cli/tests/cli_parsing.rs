@@ -3,7 +3,12 @@ use open_sandbox::cli::{Cli, Command};
 
 #[test]
 fn controller_subcommand_parses_with_required_args() {
-    let cli = Cli::parse_from(["open-sandbox", "controller", "--database-url", "postgres://localhost/test"]);
+    let cli = Cli::parse_from([
+        "open-sandbox",
+        "controller",
+        "--database-url",
+        "postgres://localhost/test",
+    ]);
     match cli.command {
         Command::Controller(args) => {
             assert_eq!(args.database_url, "postgres://localhost/test");
@@ -17,10 +22,14 @@ fn controller_subcommand_parses_with_required_args() {
 #[test]
 fn controller_subcommand_overrides_defaults() {
     let cli = Cli::parse_from([
-        "open-sandbox", "controller",
-        "--database-url", "postgres://db/prod",
-        "--grpc-port", "9000",
-        "--sweep-interval", "30",
+        "open-sandbox",
+        "controller",
+        "--database-url",
+        "postgres://db/prod",
+        "--grpc-port",
+        "9000",
+        "--sweep-interval",
+        "30",
     ]);
     match cli.command {
         Command::Controller(args) => {
@@ -33,7 +42,12 @@ fn controller_subcommand_overrides_defaults() {
 
 #[test]
 fn proxy_subcommand_parses_with_required_args() {
-    let cli = Cli::parse_from(["open-sandbox", "proxy", "--database-url", "postgres://localhost/test"]);
+    let cli = Cli::parse_from([
+        "open-sandbox",
+        "proxy",
+        "--database-url",
+        "postgres://localhost/test",
+    ]);
     match cli.command {
         Command::Proxy(args) => {
             assert_eq!(args.database_url, "postgres://localhost/test");
@@ -47,10 +61,14 @@ fn proxy_subcommand_parses_with_required_args() {
 #[test]
 fn proxy_subcommand_overrides_defaults() {
     let cli = Cli::parse_from([
-        "open-sandbox", "proxy",
-        "--database-url", "postgres://db/prod",
-        "--http-port", "443",
-        "--grpc-port", "9001",
+        "open-sandbox",
+        "proxy",
+        "--database-url",
+        "postgres://db/prod",
+        "--http-port",
+        "443",
+        "--grpc-port",
+        "9001",
     ]);
     match cli.command {
         Command::Proxy(args) => {
@@ -77,10 +95,14 @@ fn agent_subcommand_parses_with_required_token() {
 #[test]
 fn agent_subcommand_overrides_defaults() {
     let cli = Cli::parse_from([
-        "open-sandbox", "agent",
-        "--token", "my-token",
-        "--controller-url", "http://ctrl:50051",
-        "--proxy-url", "http://prx:50052",
+        "open-sandbox",
+        "agent",
+        "--token",
+        "my-token",
+        "--controller-url",
+        "http://ctrl:50051",
+        "--proxy-url",
+        "http://prx:50052",
     ]);
     match cli.command {
         Command::Agent(args) => {
@@ -100,13 +122,19 @@ fn agent_subcommand_fails_without_token() {
 #[test]
 fn controller_subcommand_fails_without_database_url() {
     let result = Cli::try_parse_from(["open-sandbox", "controller"]);
-    assert!(result.is_err(), "controller subcommand should require --database-url");
+    assert!(
+        result.is_err(),
+        "controller subcommand should require --database-url"
+    );
 }
 
 #[test]
 fn proxy_subcommand_fails_without_database_url() {
     let result = Cli::try_parse_from(["open-sandbox", "proxy"]);
-    assert!(result.is_err(), "proxy subcommand should require --database-url");
+    assert!(
+        result.is_err(),
+        "proxy subcommand should require --database-url"
+    );
 }
 
 #[test]

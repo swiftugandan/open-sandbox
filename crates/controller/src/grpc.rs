@@ -6,10 +6,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use open_sandbox_contracts::controller::{
-    agent_message, controller_command,
-    controller_service_server::{ControllerService, ControllerServiceServer},
     AgentMessage, ControllerCommand, HeartbeatAck, RegisterResponse,
-    SandboxConfig as ProtoSandboxConfig, StartSandbox,
+    SandboxConfig as ProtoSandboxConfig, StartSandbox, agent_message, controller_command,
+    controller_service_server::{ControllerService, ControllerServiceServer},
 };
 use open_sandbox_contracts::error::ControllerError;
 use open_sandbox_contracts::types::{AgentId, JoinToken, SandboxId};
@@ -269,7 +268,10 @@ impl<S: ControllerStore + 'static> Controller<S> {
         &self,
         sandbox_id: &SandboxId,
     ) -> Result<(), ControllerError> {
-        self.scheduler.store().remove_routing_entry(sandbox_id).await
+        self.scheduler
+            .store()
+            .remove_routing_entry(sandbox_id)
+            .await
     }
 
     pub async fn sweep_dead_agents(&self) -> Vec<AgentId> {
@@ -290,8 +292,8 @@ mod tests {
     use crate::testutil::*;
     use open_sandbox_contracts::constants::DEAD_AGENT_TIMEOUT;
     use open_sandbox_contracts::controller::{
-        controller_service_client::ControllerServiceClient, AgentResources, Heartbeat,
-        RegisterRequest,
+        AgentResources, Heartbeat, RegisterRequest,
+        controller_service_client::ControllerServiceClient,
     };
     use open_sandbox_contracts::types::RoutingEntry;
     use std::time::Duration;
@@ -401,9 +403,7 @@ mod tests {
         let (tx, mut inbound) = connect_agent(&addr).await;
         let agent_id = AgentId::new();
 
-        tx.send(register_message(&agent_id, "token"))
-            .await
-            .unwrap();
+        tx.send(register_message(&agent_id, "token")).await.unwrap();
         let _ = inbound.message().await.unwrap().unwrap();
 
         tx.send(heartbeat_message(&agent_id)).await.unwrap();
@@ -423,9 +423,7 @@ mod tests {
         let (tx, mut inbound) = connect_agent(&addr).await;
         let agent_id = AgentId::new();
 
-        tx.send(register_message(&agent_id, "token"))
-            .await
-            .unwrap();
+        tx.send(register_message(&agent_id, "token")).await.unwrap();
         let _ = inbound.message().await.unwrap().unwrap();
 
         let sandbox_id = SandboxId::new();

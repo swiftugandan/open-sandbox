@@ -1,6 +1,6 @@
-pub mod types;
-pub mod error;
 pub mod constants;
+pub mod error;
+pub mod types;
 
 pub mod controller {
     tonic::include_proto!("open_sandbox.controller");

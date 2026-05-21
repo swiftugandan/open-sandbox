@@ -1,16 +1,16 @@
 use std::sync::{Arc, LazyLock};
 
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 
 static DB_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
-use open_sandbox_contracts::controller::{
-    agent_message, controller_command, AgentMessage, AgentResources, ControllerCommand,
-    HeartbeatAck, RegisterRequest,
-};
 use open_sandbox_contracts::controller::controller_service_client::ControllerServiceClient;
+use open_sandbox_contracts::controller::{
+    AgentMessage, AgentResources, ControllerCommand, HeartbeatAck, RegisterRequest, agent_message,
+    controller_command,
+};
 use open_sandbox_contracts::types::{AgentId, SandboxId};
 
 use open_sandbox_api::grpc_service::GrpcSandboxService;
@@ -28,7 +28,13 @@ impl TokenValidator for AcceptAllTokens {
     }
 }
 
-async fn setup() -> (String, String, AgentId, SandboxId, tokio::sync::MutexGuard<'static, ()>) {
+async fn setup() -> (
+    String,
+    String,
+    AgentId,
+    SandboxId,
+    tokio::sync::MutexGuard<'static, ()>,
+) {
     let guard = DB_LOCK.lock().await;
     let db_url = "postgres://postgres:test@127.0.0.1:5433/open_sandbox";
     let pool = sqlx::PgPool::connect(db_url)

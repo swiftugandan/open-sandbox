@@ -5,9 +5,8 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::Streaming;
 
 use open_sandbox_contracts::controller::{
-    agent_message, controller_command,
-    controller_service_client::ControllerServiceClient,
-    AgentMessage, AgentResources, ControllerCommand, Heartbeat, RegisterRequest,
+    AgentMessage, AgentResources, ControllerCommand, Heartbeat, RegisterRequest, agent_message,
+    controller_command, controller_service_client::ControllerServiceClient,
 };
 use open_sandbox_contracts::types::{AgentId, SandboxId};
 
@@ -135,12 +134,7 @@ async fn start_controller_with_pg(
     (controller, addr)
 }
 
-async fn connect_agent(
-    addr: &str,
-) -> (
-    mpsc::Sender<AgentMessage>,
-    Streaming<ControllerCommand>,
-) {
+async fn connect_agent(addr: &str) -> (mpsc::Sender<AgentMessage>, Streaming<ControllerCommand>) {
     let channel = tonic::transport::Channel::from_shared(addr.to_string())
         .unwrap()
         .connect()

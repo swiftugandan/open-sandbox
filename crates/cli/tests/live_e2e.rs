@@ -7,7 +7,9 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use open_sandbox_contracts::controller::agent_message;
 use open_sandbox_contracts::controller::controller_command;
 use open_sandbox_contracts::controller::controller_service_client::ControllerServiceClient;
-use open_sandbox_contracts::controller::{AgentMessage, AgentResources, Heartbeat, RegisterRequest};
+use open_sandbox_contracts::controller::{
+    AgentMessage, AgentResources, Heartbeat, RegisterRequest,
+};
 use open_sandbox_contracts::types::AgentId;
 
 use open_sandbox_controller::grpc::Controller;

@@ -110,7 +110,10 @@ async fn controller_triggers_sandbox_creation_on_real_agent() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let entry = sandbox_manager.get_sandbox(&sandbox_id);
-    assert!(entry.is_some(), "sandbox should exist in manager after creation");
+    assert!(
+        entry.is_some(),
+        "sandbox should exist in manager after creation"
+    );
     let entry = entry.unwrap();
     assert_eq!(entry.state, SandboxState::Running);
     assert!(entry.host_port > 0);

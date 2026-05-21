@@ -5,9 +5,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
 use open_sandbox_contracts::api::{
-    sandbox_management_service_server::{SandboxManagementService, SandboxManagementServiceServer},
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     ExecSandboxRequest, ExecSandboxResponse, GetSandboxRequest, GetSandboxResponse,
+    sandbox_management_service_server::{SandboxManagementService, SandboxManagementServiceServer},
 };
 use open_sandbox_contracts::types::SandboxId;
 

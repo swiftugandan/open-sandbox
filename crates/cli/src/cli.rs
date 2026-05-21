@@ -26,7 +26,11 @@ pub enum Command {
 #[derive(Parser, Debug, Clone)]
 pub struct ControllerArgs {
     /// gRPC listen port for agent connections
-    #[arg(long, default_value_t = 50051, env = "OPEN_SANDBOX_CONTROLLER_GRPC_PORT")]
+    #[arg(
+        long,
+        default_value_t = 50051,
+        env = "OPEN_SANDBOX_CONTROLLER_GRPC_PORT"
+    )]
     pub grpc_port: u16,
 
     /// PostgreSQL connection URL
@@ -60,11 +64,19 @@ pub struct AgentArgs {
     pub token: String,
 
     /// Controller gRPC address
-    #[arg(long, default_value = "http://127.0.0.1:50051", env = "OPEN_SANDBOX_CONTROLLER_URL")]
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:50051",
+        env = "OPEN_SANDBOX_CONTROLLER_URL"
+    )]
     pub controller_url: String,
 
     /// Proxy gRPC address for tunnel connections
-    #[arg(long, default_value = "http://127.0.0.1:50052", env = "OPEN_SANDBOX_PROXY_URL")]
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:50052",
+        env = "OPEN_SANDBOX_PROXY_URL"
+    )]
     pub proxy_url: String,
 }
 
@@ -75,6 +87,10 @@ pub struct ApiArgs {
     pub port: u16,
 
     /// Controller gRPC address
-    #[arg(long, default_value = "http://127.0.0.1:50051", env = "OPEN_SANDBOX_CONTROLLER_URL")]
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:50051",
+        env = "OPEN_SANDBOX_CONTROLLER_URL"
+    )]
     pub controller_url: String,
 }

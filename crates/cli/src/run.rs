@@ -110,16 +110,11 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
     let grpc_handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(grpc_service)
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(grpc_listener),
-                shutdown_signal(),
-            )
+            .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), shutdown_signal())
             .await
     });
 
-    let http_handle = tokio::spawn(async move {
-        http_server.run(http_listener).await
-    });
+    let http_handle = tokio::spawn(async move { http_server.run(http_listener).await });
 
     tokio::select! {
         result = grpc_handle => { result??; }
@@ -144,8 +139,12 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
         os: std::env::consts::OS.to_string(),
     };
 
-    let controller_conn =
-        ControllerConnection::new(agent_id.clone(), join_token, sandbox_manager.clone(), resources);
+    let controller_conn = ControllerConnection::new(
+        agent_id.clone(),
+        join_token,
+        sandbox_manager.clone(),
+        resources,
+    );
 
     let http_client = Arc::new(ReqwestHttpClient::new());
     let forwarder = Arc::new(TunnelForwarder::new(sandbox_manager, http_client));

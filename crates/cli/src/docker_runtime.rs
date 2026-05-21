@@ -10,7 +10,9 @@ use bollard::models::HostConfig;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use futures::StreamExt;
 
-use open_sandbox_agent::container::{ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOutput};
+use open_sandbox_agent::container::{
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOutput,
+};
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
@@ -31,10 +33,7 @@ impl DockerRuntime {
 }
 
 impl ContainerRuntime for DockerRuntime {
-    async fn create_and_start(
-        &self,
-        config: ContainerConfig,
-    ) -> Result<ContainerInfo, AgentError> {
+    async fn create_and_start(&self, config: ContainerConfig) -> Result<ContainerInfo, AgentError> {
         let sandbox_id_str = config.sandbox_id.to_string();
         let name = format!("sandbox-{sandbox_id_str}");
 
@@ -77,11 +76,7 @@ impl ContainerRuntime for DockerRuntime {
         })
     }
 
-    async fn stop_and_remove(
-        &self,
-        id: &ContainerId,
-        timeout: Duration,
-    ) -> Result<(), AgentError> {
+    async fn stop_and_remove(&self, id: &ContainerId, timeout: Duration) -> Result<(), AgentError> {
         let stop_opts = StopContainerOptions {
             t: timeout.as_secs() as i64,
         };
@@ -132,10 +127,7 @@ impl ContainerRuntime for DockerRuntime {
                     detail: e.to_string(),
                 })?;
 
-            let running = container
-                .state
-                .as_deref()
-                .is_some_and(|s| s == "running");
+            let running = container.state.as_deref().is_some_and(|s| s == "running");
 
             let host_port = container
                 .ports
@@ -190,12 +182,19 @@ impl ContainerRuntime for DockerRuntime {
         let mut stdout_buf = Vec::new();
         let mut stderr_buf = Vec::new();
 
-        if let StartExecResults::Attached { mut output, mut input } = result {
+        if let StartExecResults::Attached {
+            mut output,
+            mut input,
+        } = result
+        {
             if !stdin.is_empty() {
                 use tokio::io::AsyncWriteExt;
-                input.write_all(&stdin).await.map_err(|e| AgentError::Docker {
-                    detail: e.to_string(),
-                })?;
+                input
+                    .write_all(&stdin)
+                    .await
+                    .map_err(|e| AgentError::Docker {
+                        detail: e.to_string(),
+                    })?;
                 input.shutdown().await.map_err(|e| AgentError::Docker {
                     detail: e.to_string(),
                 })?;
@@ -231,10 +230,7 @@ impl ContainerRuntime for DockerRuntime {
     }
 }
 
-fn build_docker_config(
-    config: &ContainerConfig,
-    sandbox_id_str: &str,
-) -> Config<String> {
+fn build_docker_config(config: &ContainerConfig, sandbox_id_str: &str) -> Config<String> {
     let nano_cpus = (config.cpu_limit_millicores as i64) * NANOCPUS_PER_MILLICPU;
 
     let host_config = HostConfig {
@@ -252,7 +248,10 @@ fn build_docker_config(
     env_vec.sort();
 
     let labels = HashMap::from([
-        (LABEL_MANAGED_BY.to_string(), LABEL_MANAGED_BY_VALUE.to_string()),
+        (
+            LABEL_MANAGED_BY.to_string(),
+            LABEL_MANAGED_BY_VALUE.to_string(),
+        ),
         (LABEL_SANDBOX_ID.to_string(), sandbox_id_str.to_string()),
     ]);
 

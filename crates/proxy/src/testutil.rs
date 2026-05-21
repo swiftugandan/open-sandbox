@@ -25,10 +25,7 @@ impl InMemoryRoutingStore {
     }
 
     pub fn add_entry(&self, sandbox_id: SandboxId, agent_id: AgentId) {
-        self.entries
-            .lock()
-            .unwrap()
-            .insert(sandbox_id, agent_id);
+        self.entries.lock().unwrap().insert(sandbox_id, agent_id);
     }
 
     pub fn clear(&self) {

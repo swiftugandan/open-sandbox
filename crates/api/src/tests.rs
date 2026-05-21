@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -281,11 +280,7 @@ async fn create_sandbox_uses_defaults_for_omitted_fields() {
             unreachable!()
         }
 
-        async fn read_file(
-            &self,
-            _: &SandboxId,
-            _: ReadFileRequest,
-        ) -> Result<Vec<u8>, ApiError> {
+        async fn read_file(&self, _: &SandboxId, _: ReadFileRequest) -> Result<Vec<u8>, ApiError> {
             unreachable!()
         }
     }

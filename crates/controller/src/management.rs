@@ -3,12 +3,12 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use open_sandbox_contracts::api::{
-    sandbox_management_service_server::{SandboxManagementService, SandboxManagementServiceServer},
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     ExecSandboxRequest, ExecSandboxResponse, GetSandboxRequest, GetSandboxResponse,
+    sandbox_management_service_server::{SandboxManagementService, SandboxManagementServiceServer},
 };
 use open_sandbox_contracts::controller::{
-    controller_command, ControllerCommand, ExecCommand, StopSandbox,
+    ControllerCommand, ExecCommand, StopSandbox, controller_command,
 };
 use open_sandbox_contracts::types::SandboxId;
 
@@ -111,15 +111,14 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let entry = entry.ok_or_else(|| {
-            Status::not_found(format!("sandbox {} not found", req.sandbox_id))
-        })?;
+        let entry = entry
+            .ok_or_else(|| Status::not_found(format!("sandbox {} not found", req.sandbox_id)))?;
 
         let command = ControllerCommand {
             payload: Some(controller_command::Payload::StopSandbox(StopSandbox {
                 sandbox_id: sandbox_id.to_string(),
-                timeout_seconds: open_sandbox_contracts::constants::SANDBOX_STOP_TIMEOUT
-                    .as_secs() as u32,
+                timeout_seconds: open_sandbox_contracts::constants::SANDBOX_STOP_TIMEOUT.as_secs()
+                    as u32,
             })),
         };
         self.controller
@@ -149,9 +148,8 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let entry = entry.ok_or_else(|| {
-            Status::not_found(format!("sandbox {} not found", req.sandbox_id))
-        })?;
+        let entry = entry
+            .ok_or_else(|| Status::not_found(format!("sandbox {} not found", req.sandbox_id)))?;
 
         let exec_id = uuid::Uuid::new_v4().to_string();
         let rx = self.exec_broker.register(exec_id.clone());
@@ -173,18 +171,13 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
                 Status::internal(e.to_string())
             })?;
 
-        let result = tokio::time::timeout(
-            open_sandbox_contracts::constants::EXEC_TIMEOUT,
-            rx,
-        )
-        .await
-        .map_err(|_| {
-            self.exec_broker.cancel(&exec_id);
-            Status::deadline_exceeded("exec timeout")
-        })?
-        .map_err(|_| {
-            Status::internal("exec result channel closed")
-        })?;
+        let result = tokio::time::timeout(open_sandbox_contracts::constants::EXEC_TIMEOUT, rx)
+            .await
+            .map_err(|_| {
+                self.exec_broker.cancel(&exec_id);
+                Status::deadline_exceeded("exec timeout")
+            })?
+            .map_err(|_| Status::internal("exec result channel closed"))?;
 
         Ok(Response::new(ExecSandboxResponse {
             exit_code: result.exit_code,

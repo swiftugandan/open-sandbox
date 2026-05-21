@@ -75,10 +75,7 @@ pub trait SandboxService: Send + Sync + 'static {
         sandbox_id: &SandboxId,
     ) -> impl Future<Output = Result<SandboxInfo, ApiError>> + Send;
 
-    fn delete(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> impl Future<Output = Result<(), ApiError>> + Send;
+    fn delete(&self, sandbox_id: &SandboxId) -> impl Future<Output = Result<(), ApiError>> + Send;
 
     fn exec(
         &self,

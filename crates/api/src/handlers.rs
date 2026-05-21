@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
 use open_sandbox_contracts::types::SandboxId;
 
-use crate::service::{CreateRequest, ExecRequest, ReadFileRequest, SandboxService, WriteFilesRequest};
+use crate::service::{
+    CreateRequest, ExecRequest, ReadFileRequest, SandboxService, WriteFilesRequest,
+};
 
 pub type AppState<S> = Arc<S>;
 
@@ -112,15 +114,13 @@ pub async fn read_file<S: SandboxService>(
 // axum handlers require Response as the error type; boxing adds allocation for no benefit
 #[allow(clippy::result_large_err)]
 fn parse_sandbox_id(id: &str) -> Result<SandboxId, Response> {
-    uuid::Uuid::parse_str(id)
-        .map(SandboxId::from)
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "invalid sandbox_id"})),
-            )
-                .into_response()
-        })
+    uuid::Uuid::parse_str(id).map(SandboxId::from).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid sandbox_id"})),
+        )
+            .into_response()
+    })
 }
 
 fn api_error_response(err: open_sandbox_contracts::error::ApiError) -> Response {

@@ -129,12 +129,18 @@ mod tests {
         store.add_entry(sandbox_id.clone(), old_agent.clone());
         let cache = RoutingCache::new(store.clone());
         cache.refresh().await.unwrap();
-        assert_eq!(cache.lookup(&sandbox_id.subdomain()).unwrap().agent_id, old_agent);
+        assert_eq!(
+            cache.lookup(&sandbox_id.subdomain()).unwrap().agent_id,
+            old_agent
+        );
 
         store.clear();
         store.add_entry(sandbox_id.clone(), new_agent.clone());
         cache.refresh().await.unwrap();
-        assert_eq!(cache.lookup(&sandbox_id.subdomain()).unwrap().agent_id, new_agent);
+        assert_eq!(
+            cache.lookup(&sandbox_id.subdomain()).unwrap().agent_id,
+            new_agent
+        );
     }
 
     #[tokio::test]

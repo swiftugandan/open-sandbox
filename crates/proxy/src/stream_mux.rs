@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 
 use open_sandbox_contracts::constants::UPSTREAM_TIMEOUT;
 use open_sandbox_contracts::error::ProxyError;
-use open_sandbox_contracts::proxy::{tunnel_request, HttpRequest, HttpResponse, TunnelRequest};
+use open_sandbox_contracts::proxy::{HttpRequest, HttpResponse, TunnelRequest, tunnel_request};
 use open_sandbox_contracts::types::AgentId;
 
 use crate::tunnel_pool::TunnelPool;
@@ -45,11 +45,12 @@ impl StreamMux {
         headers: HashMap<String, String>,
         body: Vec<u8>,
     ) -> Result<HttpResponse, ProxyError> {
-        let sender = self.pool.get_sender(agent_id).ok_or_else(|| {
-            ProxyError::TunnelUnavailable {
-                agent_id: agent_id.to_string(),
-            }
-        })?;
+        let sender =
+            self.pool
+                .get_sender(agent_id)
+                .ok_or_else(|| ProxyError::TunnelUnavailable {
+                    agent_id: agent_id.to_string(),
+                })?;
 
         let stream_id = self.next_stream_id();
         let (response_tx, response_rx) = oneshot::channel();

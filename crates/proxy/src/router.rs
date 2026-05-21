@@ -35,21 +35,26 @@ impl<S: RoutingStore> Router<S> {
         headers: std::collections::HashMap<String, String>,
         body: Vec<u8>,
     ) -> Result<HttpResponse, ProxyError> {
-        let subdomain = Self::extract_sandbox_id(host).ok_or_else(|| {
-            ProxyError::RoutingMiss {
-                sandbox_id: host.to_string(),
-            }
+        let subdomain = Self::extract_sandbox_id(host).ok_or_else(|| ProxyError::RoutingMiss {
+            sandbox_id: host.to_string(),
         })?;
 
-        let route =
-            self.cache.lookup(&subdomain).ok_or_else(|| {
-                ProxyError::RoutingMiss {
-                    sandbox_id: subdomain.clone(),
-                }
+        let route = self
+            .cache
+            .lookup(&subdomain)
+            .ok_or_else(|| ProxyError::RoutingMiss {
+                sandbox_id: subdomain.clone(),
             })?;
 
         self.mux
-            .send_request(&route.agent_id, &route.sandbox_id.to_string(), method, uri, headers, body)
+            .send_request(
+                &route.agent_id,
+                &route.sandbox_id.to_string(),
+                method,
+                uri,
+                headers,
+                body,
+            )
             .await
     }
 }
@@ -64,16 +69,14 @@ mod tests {
 
     #[test]
     fn extract_sandbox_id_from_valid_host() {
-        let id = Router::<InMemoryRoutingStore>::extract_sandbox_id(
-            "abc123def456.sandbox.example.com",
-        );
+        let id =
+            Router::<InMemoryRoutingStore>::extract_sandbox_id("abc123def456.sandbox.example.com");
         assert_eq!(id, Some("abc123def456".to_string()));
     }
 
     #[test]
     fn extract_sandbox_id_returns_none_for_bare_domain() {
-        let id =
-            Router::<InMemoryRoutingStore>::extract_sandbox_id("sandbox.example.com");
+        let id = Router::<InMemoryRoutingStore>::extract_sandbox_id("sandbox.example.com");
         assert!(id.is_none());
     }
 
@@ -131,10 +134,7 @@ mod tests {
             .route_request(&host, "GET".into(), "/".into(), Default::default(), vec![])
             .await;
 
-        assert!(matches!(
-            result,
-            Err(ProxyError::TunnelUnavailable { .. })
-        ));
+        assert!(matches!(result, Err(ProxyError::TunnelUnavailable { .. })));
     }
 
     #[tokio::test]
@@ -159,7 +159,13 @@ mod tests {
             let host = host.clone();
             tokio::spawn(async move {
                 router
-                    .route_request(&host, "GET".into(), "/index.html".into(), Default::default(), vec![])
+                    .route_request(
+                        &host,
+                        "GET".into(),
+                        "/index.html".into(),
+                        Default::default(),
+                        vec![],
+                    )
                     .await
             })
         };

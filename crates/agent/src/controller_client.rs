@@ -164,12 +164,12 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                         let sandbox_id = uuid::Uuid::parse_str(&exec.sandbox_id)
                             .map(open_sandbox_contracts::types::SandboxId::from);
                         let result = match sandbox_id {
-                            Ok(sid) => mgr
-                                .exec_sandbox(&sid, exec.command, exec.stdin)
-                                .await,
-                            Err(_) => Err(open_sandbox_contracts::error::AgentError::SandboxNotFound {
-                                sandbox_id: exec.sandbox_id.clone(),
-                            }),
+                            Ok(sid) => mgr.exec_sandbox(&sid, exec.command, exec.stdin).await,
+                            Err(_) => {
+                                Err(open_sandbox_contracts::error::AgentError::SandboxNotFound {
+                                    sandbox_id: exec.sandbox_id.clone(),
+                                })
+                            }
                         };
                         let exec_result = match result {
                             Ok(output) => ExecResult {

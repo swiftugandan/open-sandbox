@@ -59,7 +59,10 @@ async fn handle_request<S: RoutingStore + 'static>(
         .to_string();
 
     let method = req.method().to_string();
-    let uri = req.uri().path_and_query().map_or("/".to_string(), |pq| pq.to_string());
+    let uri = req
+        .uri()
+        .path_and_query()
+        .map_or("/".to_string(), |pq| pq.to_string());
 
     let mut headers = HashMap::new();
     for (name, value) in req.headers() {
@@ -74,7 +77,10 @@ async fn handle_request<S: RoutingStore + 'static>(
         .map(|collected| collected.to_bytes().to_vec())
         .unwrap_or_default();
 
-    match router.route_request(&host, method, uri, headers, body).await {
+    match router
+        .route_request(&host, method, uri, headers, body)
+        .await
+    {
         Ok(resp) => {
             let status = u16::try_from(resp.status_code)
                 .ok()
@@ -84,7 +90,9 @@ async fn handle_request<S: RoutingStore + 'static>(
             for (k, v) in &resp.headers {
                 builder = builder.header(k.as_str(), v.as_str());
             }
-            Ok(builder.body(Full::new(Bytes::from(resp.body))).expect("fresh builder"))
+            Ok(builder
+                .body(Full::new(Bytes::from(resp.body)))
+                .expect("fresh builder"))
         }
         Err(_) => Ok(bad_gateway()),
     }
@@ -104,7 +112,7 @@ mod tests {
     use crate::stream_mux::StreamMux;
     use crate::testutil::InMemoryRoutingStore;
     use crate::tunnel_pool::TunnelPool;
-    use open_sandbox_contracts::proxy::{tunnel_request, HttpResponse, TunnelRequest};
+    use open_sandbox_contracts::proxy::{HttpResponse, TunnelRequest, tunnel_request};
     use open_sandbox_contracts::types::{AgentId, SandboxId};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -143,9 +151,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let server_handle = tokio::spawn(async move {
-            server.run(listener).await
-        });
+        let server_handle = tokio::spawn(async move { server.run(listener).await });
 
         let mux_clone = mux.clone();
         let agent_handle = tokio::spawn(async move {
@@ -192,9 +198,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let server_handle = tokio::spawn(async move {
-            server.run(listener).await
-        });
+        let server_handle = tokio::spawn(async move { server.run(listener).await });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -224,9 +228,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let server_handle = tokio::spawn(async move {
-            server.run(listener).await
-        });
+        let server_handle = tokio::spawn(async move { server.run(listener).await });
 
         let mux_clone = mux.clone();
         let agent_handle = tokio::spawn(async move {

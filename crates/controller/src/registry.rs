@@ -65,7 +65,9 @@ impl<S: ControllerStore> AgentRegistry<S> {
         self.store
             .update_agent_state(agent_id, AgentState::Dead)
             .await?;
-        self.store.remove_routing_entries_for_agent(agent_id).await?;
+        self.store
+            .remove_routing_entries_for_agent(agent_id)
+            .await?;
         Ok(())
     }
 }
