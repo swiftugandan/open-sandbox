@@ -48,9 +48,20 @@ const byType = (type: string) => resources.filter((r) => r.type === type);
 const byNameAndType = (nameSubstr: string, type: string) =>
   resources.filter((r) => r.type === type && r.name.includes(nameSubstr));
 
+function promiseOf<T>(output: pulumi.Output<T>): Promise<T> {
+  return new Promise((resolve) => output.apply(resolve));
+}
+
 describe("open-sandbox infrastructure", () => {
   beforeAll(async () => {
-    await import("../index");
+    const infra = await import("../index");
+    await promiseOf(
+      pulumi.all([
+        infra.controllerServer.id,
+        ...infra.workerServers.map((s) => s.id),
+        infra.wildcardDns.id,
+      ]),
+    );
   });
 
   // ── Controller VM ──────────────────────────────────────────────
