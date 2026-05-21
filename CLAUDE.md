@@ -8,7 +8,7 @@ A Rust-based sandbox platform where agents dial out to a controller/proxy over T
 
 ## Current phase
 
-Phase 5 complete: implementation plan tagged at `plan/v0.1.0`. Ready for Phase 6 (per-binary implementation).
+Phase 6 in progress: per-binary implementation. Controller module complete (`module/controller/done`). Next: agent module.
 
 ## Quick status
 
