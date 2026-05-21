@@ -34,19 +34,15 @@ impl TunnelService for TunnelHandler {
         request: Request<Streaming<TunnelResponse>>,
     ) -> Result<Response<Self::OpenTunnelStream>, Status> {
         let mut inbound = request.into_inner();
-        let (outbound_tx, outbound_rx) = mpsc::channel::<Result<TunnelRequest, Status>>(32);
-        let request_tx = {
-            let outbound_tx = outbound_tx.clone();
-            let (tx, mut rx) = mpsc::channel::<TunnelRequest>(32);
-            tokio::spawn(async move {
-                while let Some(req) = rx.recv().await {
-                    if outbound_tx.send(Ok(req)).await.is_err() {
-                        break;
-                    }
+        let (result_tx, outbound_rx) = mpsc::channel::<Result<TunnelRequest, Status>>(32);
+        let (request_tx, mut request_rx) = mpsc::channel::<TunnelRequest>(32);
+        tokio::spawn(async move {
+            while let Some(req) = request_rx.recv().await {
+                if result_tx.send(Ok(req)).await.is_err() {
+                    break;
                 }
-            });
-            tx
-        };
+            }
+        });
 
         let pool = self.pool.clone();
         let mux = self.mux.clone();

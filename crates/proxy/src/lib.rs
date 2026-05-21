@@ -6,4 +6,5 @@ pub mod router;
 pub mod grpc;
 pub mod pg_store;
 
+#[doc(hidden)]
 pub mod testutil;
