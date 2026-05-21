@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::time::Duration;
 
 use tokio_stream::wrappers::TcpListenerStream;
 
-use open_sandbox_contracts::controller::{AgentResources, SandboxState};
+use open_sandbox_contracts::controller::AgentResources;
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::{AgentId, JoinToken, SandboxId};
 
