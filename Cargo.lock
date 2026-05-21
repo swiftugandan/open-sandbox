@@ -1040,6 +1040,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "open-sandbox-proxy"
+version = "0.1.0"
+dependencies = [
+ "open-sandbox-agent",
+ "open-sandbox-contracts",
+ "open-sandbox-controller",
+ "prost-types",
+ "sqlx",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "uuid",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
