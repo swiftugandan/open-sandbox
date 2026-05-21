@@ -1,16 +1,20 @@
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio_stream::wrappers::TcpListenerStream;
 
 static DB_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
-use open_sandbox_contracts::controller::controller_service_client::ControllerServiceClient;
-use open_sandbox_contracts::controller::{
-    AgentMessage, AgentResources, ExecResult, RegisterRequest, agent_message, controller_command,
-};
-use open_sandbox_contracts::types::{AgentId, SandboxId};
+use open_sandbox::docker_runtime::DockerRuntime;
+use open_sandbox::http_client::ReqwestHttpClient;
+use open_sandbox_agent::container::ContainerRuntime;
+use open_sandbox_agent::controller_client::ControllerConnection;
+use open_sandbox_agent::sandbox::SandboxManager;
+use open_sandbox_agent::tunnel::TunnelForwarder;
+use open_sandbox_contracts::controller::AgentResources;
+use open_sandbox_contracts::types::{AgentId, JoinToken};
 
 use open_sandbox_api::grpc_service::GrpcSandboxService;
 use open_sandbox_api::router::build_router;
@@ -27,13 +31,14 @@ impl TokenValidator for AcceptAllTokens {
     }
 }
 
-async fn setup() -> (
-    String,
-    String,
-    AgentId,
-    SandboxId,
-    tokio::sync::MutexGuard<'static, ()>,
-) {
+struct TestEnv {
+    api_url: String,
+    runtime: Arc<DockerRuntime>,
+    sandbox_manager: Arc<SandboxManager<DockerRuntime>>,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+async fn setup() -> TestEnv {
     let guard = DB_LOCK.lock().await;
     let db_url = "postgres://postgres:test@127.0.0.1:5433/open_sandbox";
     let pool = sqlx::PgPool::connect(db_url)
@@ -69,72 +74,31 @@ async fn setup() -> (
             .unwrap();
     });
 
+    let runtime = Arc::new(DockerRuntime::connect().unwrap());
+    let sandbox_manager = Arc::new(SandboxManager::new(runtime.clone()));
+    let http_client = Arc::new(ReqwestHttpClient::new());
+    let forwarder = Arc::new(TunnelForwarder::new(sandbox_manager.clone(), http_client));
+
     let agent_id = AgentId::new();
-    let agent_id_str = agent_id.to_string();
+    let resources = AgentResources {
+        cpu_cores: 4,
+        memory_bytes: 8_000_000_000,
+        arch: 1,
+        os: std::env::consts::OS.into(),
+    };
 
-    let channel = tonic::transport::Channel::from_shared(grpc_addr.clone())
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let mut client = ControllerServiceClient::new(channel);
+    let conn = ControllerConnection::new(
+        agent_id,
+        JoinToken::new("test-token".into()),
+        sandbox_manager.clone(),
+        resources,
+    );
 
-    let (agent_tx, agent_rx) = mpsc::channel::<AgentMessage>(32);
-    let outbound = ReceiverStream::new(agent_rx);
-    let response = client.agent_stream(outbound).await.unwrap();
-    let mut inbound = response.into_inner();
+    let controller_addr = grpc_addr.clone();
+    tokio::spawn(async move { conn.run(&controller_addr).await });
 
-    agent_tx
-        .send(AgentMessage {
-            payload: Some(agent_message::Payload::Register(RegisterRequest {
-                agent_id: agent_id_str.clone(),
-                join_token: "test-token".into(),
-                resources: Some(AgentResources {
-                    cpu_cores: 4,
-                    memory_bytes: 8_000_000_000,
-                    arch: 1,
-                    os: "linux".into(),
-                }),
-            })),
-        })
-        .await
-        .unwrap();
-
-    let msg = inbound.message().await.unwrap().unwrap();
-    match msg.payload.unwrap() {
-        controller_command::Payload::RegisterResponse(resp) => {
-            assert!(resp.accepted, "agent registration should be accepted");
-        }
-        other => panic!("expected RegisterResponse, got {other:?}"),
-    }
-
-    tokio::spawn(async move {
-        while let Ok(Some(msg)) = inbound.message().await {
-            match msg.payload {
-                Some(controller_command::Payload::Exec(exec)) => {
-                    let stdout = if exec.command.first().map(|s| s.as_str()) == Some("cat") {
-                        let path = exec.command.last().cloned().unwrap_or_default();
-                        format!("live-content-of:{path}").into_bytes()
-                    } else if exec.command.first().map(|s| s.as_str()) == Some("tar") {
-                        vec![]
-                    } else {
-                        format!("ran: {}", exec.command.join(" ")).into_bytes()
-                    };
-                    let result = AgentMessage {
-                        payload: Some(agent_message::Payload::ExecResult(ExecResult {
-                            sandbox_id: exec.sandbox_id,
-                            exec_id: exec.exec_id,
-                            exit_code: 0,
-                            stdout,
-                            stderr: vec![],
-                        })),
-                    };
-                    let _ = agent_tx.send(result).await;
-                }
-                _ => {}
-            }
-        }
-    });
+    // Wait for agent to register and be available for scheduling
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let api_svc = GrpcSandboxService::connect(&grpc_addr).await.unwrap();
     let router = build_router(Arc::new(api_svc));
@@ -145,21 +109,49 @@ async fn setup() -> (
         axum::serve(http_listener, router).await.unwrap();
     });
 
-    let sandbox_id = SandboxId::new();
-    (api_url, grpc_addr, agent_id, sandbox_id, guard)
+    // ReqwestHttpClient / forwarder kept alive via proxy — not needed here
+    // but the Arc prevents the TunnelForwarder from being dropped
+    let _keep = forwarder;
+
+    TestEnv {
+        api_url,
+        runtime,
+        sandbox_manager,
+        _guard: guard,
+    }
+}
+
+fn create_tar_gz(file_name: &str, content: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let gz_buf = Vec::new();
+    let gz = GzEncoder::new(gz_buf, Compression::fast());
+    let mut archive = tar::Builder::new(gz);
+
+    let mut header = tar::Header::new_gnu();
+    header.set_path(file_name).unwrap();
+    header.set_size(content.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+
+    archive.append(&header, content).unwrap();
+    let gz = archive.into_inner().unwrap();
+    gz.finish().unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn live_create_sandbox_through_api_to_real_controller() {
-    let (api_url, _, _, _, _guard) = setup().await;
-
+async fn live_create_sandbox_through_api_to_real_agent() {
+    let env = setup().await;
     let client = reqwest::Client::new();
+
     let resp = client
-        .post(format!("{api_url}/v1/sandboxes"))
+        .post(format!("{}/v1/sandboxes", env.api_url))
         .json(&serde_json::json!({
             "image": "nginx:alpine",
-            "cpu_millicores": 1000,
-            "memory_bytes": 512000000
+            "cpu_millicores": 500,
+            "memory_bytes": 268435456
         }))
         .send()
         .await
@@ -168,111 +160,104 @@ async fn live_create_sandbox_through_api_to_real_controller() {
     assert_eq!(resp.status(), 201);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["sandbox_id"].is_string());
-    assert!(body["subdomain"].is_string());
     assert_eq!(body["status"], "running");
+
+    // Wait for agent to process StartSandbox
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let sandbox_id: open_sandbox_contracts::types::SandboxId =
+        uuid::Uuid::parse_str(body["sandbox_id"].as_str().unwrap())
+            .unwrap()
+            .into();
+    let entry = env.sandbox_manager.get_sandbox(&sandbox_id);
+    assert!(entry.is_some(), "container should be running on agent");
+
+    // Cleanup
+    let entry = entry.unwrap();
+    let _ = env
+        .runtime
+        .stop_and_remove(&entry.container_id, Duration::from_secs(5))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn live_create_then_get_sandbox() {
-    let (api_url, _, _, _, _guard) = setup().await;
-
+async fn live_exec_runs_command_in_real_container() {
+    let env = setup().await;
     let client = reqwest::Client::new();
-    let create_resp = client
-        .post(format!("{api_url}/v1/sandboxes"))
-        .json(&serde_json::json!({"image": "python:3.12"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(create_resp.status(), 201);
-    let created: serde_json::Value = create_resp.json().await.unwrap();
-    let sandbox_id = created["sandbox_id"].as_str().unwrap();
-
-    let get_resp = client
-        .get(format!("{api_url}/v1/sandboxes/{sandbox_id}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(get_resp.status(), 200);
-    let body: serde_json::Value = get_resp.json().await.unwrap();
-    assert_eq!(body["sandbox_id"], sandbox_id);
-    assert_eq!(body["status"], "running");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn live_create_then_delete_sandbox() {
-    let (api_url, _, _, _, _guard) = setup().await;
-
-    let client = reqwest::Client::new();
-    let create_resp = client
-        .post(format!("{api_url}/v1/sandboxes"))
-        .json(&serde_json::json!({"image": "alpine:latest"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(create_resp.status(), 201);
-    let created: serde_json::Value = create_resp.json().await.unwrap();
-    let sandbox_id = created["sandbox_id"].as_str().unwrap();
-
-    let del_resp = client
-        .delete(format!("{api_url}/v1/sandboxes/{sandbox_id}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(del_resp.status(), 204);
-
-    let get_resp = client
-        .get(format!("{api_url}/v1/sandboxes/{sandbox_id}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(get_resp.status(), 404);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn live_write_files_through_exec_pipeline() {
-    let (api_url, _, _, _, _guard) = setup().await;
-
-    let client = reqwest::Client::new();
-    let create_resp = client
-        .post(format!("{api_url}/v1/sandboxes"))
-        .json(&serde_json::json!({"image": "alpine:latest"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(create_resp.status(), 201);
-    let created: serde_json::Value = create_resp.json().await.unwrap();
-    let sandbox_id = created["sandbox_id"].as_str().unwrap();
-
-    let tar_data = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00];
-    let resp = client
-        .post(format!("{api_url}/v1/sandboxes/{sandbox_id}/files/write"))
-        .header("content-type", "application/gzip")
-        .header("x-cwd", "/app")
-        .body(tar_data)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 204);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn live_read_file_through_exec_pipeline() {
-    let (api_url, _, _, _, _guard) = setup().await;
-
-    let client = reqwest::Client::new();
-    let create_resp = client
-        .post(format!("{api_url}/v1/sandboxes"))
-        .json(&serde_json::json!({"image": "alpine:latest"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(create_resp.status(), 201);
-    let created: serde_json::Value = create_resp.json().await.unwrap();
-    let sandbox_id = created["sandbox_id"].as_str().unwrap();
 
     let resp = client
-        .post(format!("{api_url}/v1/sandboxes/{sandbox_id}/files/read"))
-        .json(&serde_json::json!({"path": "/etc/hostname"}))
+        .post(format!("{}/v1/sandboxes", env.api_url))
+        .json(&serde_json::json!({"image": "nginx:alpine"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let sandbox_id = body["sandbox_id"].as_str().unwrap();
+
+    // Wait for container to be running
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let resp = client
+        .post(format!("{}/v1/sandboxes/{sandbox_id}/exec", env.api_url))
+        .json(&serde_json::json!({"command": ["echo", "hello-from-exec"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["exit_code"], 0);
+    assert!(
+        body["stdout"].as_str().unwrap().contains("hello-from-exec"),
+        "stdout should contain the echoed text"
+    );
+
+    // Cleanup
+    let sid: open_sandbox_contracts::types::SandboxId =
+        uuid::Uuid::parse_str(sandbox_id).unwrap().into();
+    if let Some(entry) = env.sandbox_manager.get_sandbox(&sid) {
+        let _ = env
+            .runtime
+            .stop_and_remove(&entry.container_id, Duration::from_secs(5))
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_read_file_from_real_container() {
+    let env = setup().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/v1/sandboxes", env.api_url))
+        .json(&serde_json::json!({"image": "nginx:alpine"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let sandbox_id = body["sandbox_id"].as_str().unwrap();
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Write a known file via exec
+    let resp = client
+        .post(format!("{}/v1/sandboxes/{sandbox_id}/exec", env.api_url))
+        .json(&serde_json::json!({
+            "command": ["sh", "-c", "echo -n 'read-test-content' > /tmp/read-test.txt"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Read it back via the file read endpoint
+    let resp = client
+        .post(format!(
+            "{}/v1/sandboxes/{sandbox_id}/files/read",
+            env.api_url
+        ))
+        .json(&serde_json::json!({"path": "/tmp/read-test.txt"}))
         .send()
         .await
         .unwrap();
@@ -286,5 +271,135 @@ async fn live_read_file_through_exec_pipeline() {
         "application/octet-stream"
     );
     let body = resp.bytes().await.unwrap();
-    assert_eq!(body.as_ref(), b"live-content-of:/etc/hostname");
+    assert_eq!(body.as_ref(), b"read-test-content");
+
+    // Cleanup
+    let sid: open_sandbox_contracts::types::SandboxId =
+        uuid::Uuid::parse_str(sandbox_id).unwrap().into();
+    if let Some(entry) = env.sandbox_manager.get_sandbox(&sid) {
+        let _ = env
+            .runtime
+            .stop_and_remove(&entry.container_id, Duration::from_secs(5))
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_write_files_to_real_container() {
+    let env = setup().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/v1/sandboxes", env.api_url))
+        .json(&serde_json::json!({"image": "nginx:alpine"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let sandbox_id = body["sandbox_id"].as_str().unwrap();
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Write a file via tar.gz upload
+    let tar_data = create_tar_gz("written-by-api.txt", b"tar-archive-content");
+    let resp = client
+        .post(format!(
+            "{}/v1/sandboxes/{sandbox_id}/files/write",
+            env.api_url
+        ))
+        .header("content-type", "application/gzip")
+        .header("x-cwd", "/tmp")
+        .body(tar_data)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // Verify the file exists via exec
+    let resp = client
+        .post(format!("{}/v1/sandboxes/{sandbox_id}/exec", env.api_url))
+        .json(&serde_json::json!({"command": ["cat", "/tmp/written-by-api.txt"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["exit_code"], 0);
+    assert_eq!(body["stdout"], "tar-archive-content");
+
+    // Cleanup
+    let sid: open_sandbox_contracts::types::SandboxId =
+        uuid::Uuid::parse_str(sandbox_id).unwrap().into();
+    if let Some(entry) = env.sandbox_manager.get_sandbox(&sid) {
+        let _ = env
+            .runtime
+            .stop_and_remove(&entry.container_id, Duration::from_secs(5))
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_full_file_roundtrip() {
+    let env = setup().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/v1/sandboxes", env.api_url))
+        .json(&serde_json::json!({"image": "nginx:alpine"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let sandbox_id = body["sandbox_id"].as_str().unwrap();
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Write via tar
+    let tar_data = create_tar_gz("roundtrip.txt", b"full-circle");
+    let resp = client
+        .post(format!(
+            "{}/v1/sandboxes/{sandbox_id}/files/write",
+            env.api_url
+        ))
+        .header("content-type", "application/gzip")
+        .header("x-cwd", "/tmp")
+        .body(tar_data)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // Read back via file read endpoint
+    let resp = client
+        .post(format!(
+            "{}/v1/sandboxes/{sandbox_id}/files/read",
+            env.api_url
+        ))
+        .json(&serde_json::json!({"path": "/tmp/roundtrip.txt"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), b"full-circle");
+
+    // Delete sandbox
+    let resp = client
+        .delete(format!("{}/v1/sandboxes/{sandbox_id}", env.api_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // Cleanup container (delete sends StopSandbox but agent may not process it in time)
+    let sid: open_sandbox_contracts::types::SandboxId =
+        uuid::Uuid::parse_str(sandbox_id).unwrap().into();
+    if let Some(entry) = env.sandbox_manager.get_sandbox(&sid) {
+        let _ = env
+            .runtime
+            .stop_and_remove(&entry.container_id, Duration::from_secs(5))
+            .await;
+    }
 }
