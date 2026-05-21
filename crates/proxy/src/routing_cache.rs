@@ -6,9 +6,15 @@ use open_sandbox_contracts::types::{AgentId, SandboxId};
 
 use crate::routing_store::RoutingStore;
 
+#[derive(Clone, Debug)]
+pub struct CachedRoute {
+    pub agent_id: AgentId,
+    pub sandbox_id: SandboxId,
+}
+
 pub struct RoutingCache<S: RoutingStore> {
     store: S,
-    cache: Mutex<HashMap<String, AgentId>>,
+    cache: Mutex<HashMap<String, CachedRoute>>,
 }
 
 impl<S: RoutingStore> RoutingCache<S> {
@@ -19,7 +25,7 @@ impl<S: RoutingStore> RoutingCache<S> {
         }
     }
 
-    pub fn lookup(&self, subdomain: &str) -> Option<AgentId> {
+    pub fn lookup(&self, subdomain: &str) -> Option<CachedRoute> {
         self.cache.lock().unwrap().get(subdomain).cloned()
     }
 
@@ -28,16 +34,25 @@ impl<S: RoutingStore> RoutingCache<S> {
         let mut cache = self.cache.lock().unwrap();
         cache.clear();
         for entry in entries {
-            cache.insert(entry.sandbox_id.subdomain(), entry.agent_id);
+            cache.insert(
+                entry.sandbox_id.subdomain(),
+                CachedRoute {
+                    agent_id: entry.agent_id,
+                    sandbox_id: entry.sandbox_id,
+                },
+            );
         }
         Ok(())
     }
 
     pub fn insert(&self, sandbox_id: SandboxId, agent_id: AgentId) {
-        self.cache
-            .lock()
-            .unwrap()
-            .insert(sandbox_id.subdomain(), agent_id);
+        self.cache.lock().unwrap().insert(
+            sandbox_id.subdomain(),
+            CachedRoute {
+                agent_id,
+                sandbox_id,
+            },
+        );
     }
 
     pub fn remove_by_subdomain(&self, subdomain: &str) {
@@ -46,6 +61,10 @@ impl<S: RoutingStore> RoutingCache<S> {
 
     pub fn len(&self) -> usize {
         self.cache.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cache.lock().unwrap().is_empty()
     }
 }
 
@@ -69,7 +88,9 @@ mod tests {
         let agent_id = AgentId::new();
 
         cache.insert(sandbox_id.clone(), agent_id.clone());
-        assert_eq!(cache.lookup(&sandbox_id.subdomain()), Some(agent_id));
+        let route = cache.lookup(&sandbox_id.subdomain()).unwrap();
+        assert_eq!(route.agent_id, agent_id);
+        assert_eq!(route.sandbox_id, sandbox_id);
     }
 
     #[tokio::test]
@@ -94,7 +115,8 @@ mod tests {
         assert!(cache.lookup(&sandbox_id.subdomain()).is_none());
 
         cache.refresh().await.unwrap();
-        assert_eq!(cache.lookup(&sandbox_id.subdomain()), Some(agent_id));
+        let route = cache.lookup(&sandbox_id.subdomain()).unwrap();
+        assert_eq!(route.agent_id, agent_id);
     }
 
     #[tokio::test]
@@ -107,12 +129,12 @@ mod tests {
         store.add_entry(sandbox_id.clone(), old_agent.clone());
         let cache = RoutingCache::new(store.clone());
         cache.refresh().await.unwrap();
-        assert_eq!(cache.lookup(&sandbox_id.subdomain()), Some(old_agent));
+        assert_eq!(cache.lookup(&sandbox_id.subdomain()).unwrap().agent_id, old_agent);
 
         store.clear();
         store.add_entry(sandbox_id.clone(), new_agent.clone());
         cache.refresh().await.unwrap();
-        assert_eq!(cache.lookup(&sandbox_id.subdomain()), Some(new_agent));
+        assert_eq!(cache.lookup(&sandbox_id.subdomain()).unwrap().agent_id, new_agent);
     }
 
     #[tokio::test]

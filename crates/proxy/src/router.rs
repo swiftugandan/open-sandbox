@@ -41,7 +41,7 @@ impl<S: RoutingStore> Router<S> {
             }
         })?;
 
-        let agent_id =
+        let route =
             self.cache.lookup(&subdomain).ok_or_else(|| {
                 ProxyError::RoutingMiss {
                     sandbox_id: subdomain.clone(),
@@ -49,7 +49,7 @@ impl<S: RoutingStore> Router<S> {
             })?;
 
         self.mux
-            .send_request(&agent_id, &subdomain, method, uri, headers, body)
+            .send_request(&route.agent_id, &route.sandbox_id.to_string(), method, uri, headers, body)
             .await
     }
 }
