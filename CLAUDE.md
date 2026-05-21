@@ -8,7 +8,7 @@ A Rust-based sandbox platform where agents dial out to a controller/proxy over T
 
 ## Current phase
 
-Phase 6 complete: all modules implemented. Controller, agent, proxy, CLI shell, infra, agent-docker, and proxy-http modules done. The `proxy-http` module (`module/proxy-http/done`) closes the HTTP ingress gap — hyper-based `HttpServer` accepts requests, routes via `Router` → `StreamMux` → agent tunnel, and `run_proxy` now wires `PgRoutingStore`, `RoutingCache`, `Router`, `HttpServer`, and periodic cache refresh. Infra live e2e (`pulumi up` against real Hetzner/Cloudflare) deferred until cloud credentials are configured.
+Phase 6 complete: all modules implemented including the API gateway. Controller, agent, proxy, CLI shell, infra, agent-docker, proxy-http, and api modules done. The `api` module (`module/api/done`) adds the REST API gateway — axum HTTP server at port 8081, connects to the controller's SandboxManagementService via gRPC. Six REST endpoints at `/v1/sandboxes`: create, get, delete, exec. ExecBroker correlates exec results via oneshot channels. `open-sandbox api` CLI subcommand wires it all together. Infra live e2e (`pulumi up` against real Hetzner/Cloudflare) deferred until cloud credentials are configured.
 
 ## Quick status
 
