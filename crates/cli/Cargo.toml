@@ -1,0 +1,31 @@
+[package]
+name = "open-sandbox"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "open-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+open-sandbox-contracts = { path = "../contracts" }
+open-sandbox-controller = { path = "../controller" }
+open-sandbox-agent = { path = "../agent" }
+open-sandbox-proxy = { path = "../proxy" }
+clap = { version = "4", features = ["derive", "env"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio-stream = "0.1"
+tonic = "0.12"
+
+[dev-dependencies]
+assert_cmd = "2"
+open-sandbox-contracts = { path = "../contracts" }
+open-sandbox-controller = { path = "../controller" }
+open-sandbox-proxy = { path = "../proxy" }
+prost-types = "0.13"
+predicates = "3"
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tokio-stream = "0.1"
+tonic = "0.12"
