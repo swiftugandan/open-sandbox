@@ -18,11 +18,13 @@ impl ExponentialBackoff {
     }
 
     pub fn next_delay(&mut self) -> Duration {
-        todo!()
+        let delay = self.current;
+        self.current = (self.current * 2).min(self.max);
+        delay
     }
 
     pub fn reset(&mut self) {
-        todo!()
+        self.current = self.base;
     }
 }
 

@@ -47,8 +47,8 @@ impl<R: ContainerRuntime, H: HttpClient> TunnelForwarder<R, H> {
         sandbox_id: &SandboxId,
         request: ForwardRequest,
     ) -> Result<ForwardResponse, AgentError> {
-        let _ = (sandbox_id, request);
-        todo!()
+        let port = self.sandbox_manager.host_port_for(sandbox_id)?;
+        self.http_client.send(port, request).await
     }
 }
 

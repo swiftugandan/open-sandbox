@@ -5,7 +5,7 @@ use open_sandbox_contracts::controller::{SandboxState, StartSandbox, StopSandbox
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
-use crate::container::{ContainerId, ContainerRuntime};
+use crate::container::{ContainerConfig, ContainerId, ContainerRuntime};
 
 #[derive(Debug, Clone)]
 pub struct SandboxEntry {
@@ -32,16 +32,68 @@ impl<R: ContainerRuntime> SandboxManager<R> {
         &self,
         cmd: StartSandbox,
     ) -> Result<SandboxState, AgentError> {
-        let _ = cmd;
-        todo!()
+        let sandbox_id = SandboxId::from(
+            uuid::Uuid::parse_str(&cmd.sandbox_id)
+                .map_err(|e| AgentError::Internal { detail: e.to_string() })?,
+        );
+
+        let config = cmd.config.unwrap_or_default();
+        let container_config = ContainerConfig {
+            sandbox_id: sandbox_id.clone(),
+            image: cmd.image,
+            cpu_limit_millicores: config.cpu_limit_millicores,
+            memory_limit_bytes: config.memory_limit_bytes,
+            env_vars: config.env_vars,
+            exposed_port: config.exposed_port,
+        };
+
+        match self.runtime.create_and_start(container_config).await {
+            Ok(info) => {
+                let entry = SandboxEntry {
+                    sandbox_id: sandbox_id.clone(),
+                    container_id: info.id,
+                    host_port: info.host_port,
+                    state: SandboxState::Running,
+                };
+                self.sandboxes.lock().unwrap().insert(sandbox_id, entry);
+                Ok(SandboxState::Running)
+            }
+            Err(_) => {
+                let entry = SandboxEntry {
+                    sandbox_id: sandbox_id.clone(),
+                    container_id: ContainerId(String::new()),
+                    host_port: 0,
+                    state: SandboxState::Failed,
+                };
+                self.sandboxes.lock().unwrap().insert(sandbox_id, entry);
+                Ok(SandboxState::Failed)
+            }
+        }
     }
 
     pub async fn stop_sandbox(
         &self,
         cmd: StopSandbox,
     ) -> Result<SandboxState, AgentError> {
-        let _ = cmd;
-        todo!()
+        let sandbox_id = SandboxId::from(
+            uuid::Uuid::parse_str(&cmd.sandbox_id)
+                .map_err(|e| AgentError::Internal { detail: e.to_string() })?,
+        );
+
+        let entry = self
+            .sandboxes
+            .lock()
+            .unwrap()
+            .get(&sandbox_id)
+            .cloned()
+            .ok_or_else(|| AgentError::SandboxNotFound {
+                sandbox_id: sandbox_id.to_string(),
+            })?;
+
+        let timeout = std::time::Duration::from_secs(cmd.timeout_seconds as u64);
+        self.runtime.stop_and_remove(&entry.container_id, timeout).await?;
+        self.sandboxes.lock().unwrap().remove(&sandbox_id);
+        Ok(SandboxState::Stopped)
     }
 
     pub fn get_sandbox(&self, sandbox_id: &SandboxId) -> Option<SandboxEntry> {
@@ -53,12 +105,38 @@ impl<R: ContainerRuntime> SandboxManager<R> {
     }
 
     pub fn host_port_for(&self, sandbox_id: &SandboxId) -> Result<u16, AgentError> {
-        let _ = sandbox_id;
-        todo!()
+        self.sandboxes
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .map(|e| e.host_port)
+            .ok_or_else(|| AgentError::SandboxNotFound {
+                sandbox_id: sandbox_id.to_string(),
+            })
     }
 
     pub async fn reconcile(&self) -> Result<Vec<SandboxEntry>, AgentError> {
-        todo!()
+        let containers = self.runtime.list_sandbox_containers().await?;
+        let mut entries = Vec::with_capacity(containers.len());
+        let mut sandboxes = self.sandboxes.lock().unwrap();
+
+        for info in containers {
+            let state = if info.running {
+                SandboxState::Running
+            } else {
+                SandboxState::Stopped
+            };
+            let entry = SandboxEntry {
+                sandbox_id: info.sandbox_id.clone(),
+                container_id: info.id,
+                host_port: info.host_port,
+                state,
+            };
+            sandboxes.insert(info.sandbox_id, entry.clone());
+            entries.push(entry);
+        }
+
+        Ok(entries)
     }
 }
 
