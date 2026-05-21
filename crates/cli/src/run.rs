@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
-use open_sandbox_contracts::controller::AgentResources;
+use open_sandbox_contracts::controller::{AgentResources, Architecture};
 use open_sandbox_contracts::types::{AgentId, JoinToken};
 
 use open_sandbox_agent::container::{ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime};
@@ -18,8 +18,6 @@ use open_sandbox_controller::pg_store::PgStore;
 use open_sandbox_controller::token::TokenValidator;
 
 use open_sandbox_proxy::grpc::tunnel_service;
-use open_sandbox_proxy::pg_store::PgRoutingStore;
-use open_sandbox_proxy::routing_cache::RoutingCache;
 use open_sandbox_proxy::stream_mux::StreamMux;
 use open_sandbox_proxy::tunnel_pool::TunnelPool;
 
@@ -40,8 +38,9 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
     let pg_store = Arc::new(PgStore::new(pool));
     pg_store.migrate().await?;
 
-    let join_token =
-        std::env::var("OPEN_SANDBOX_JOIN_TOKEN").unwrap_or_else(|_| "changeme".to_string());
+    let join_token = std::env::var("OPEN_SANDBOX_JOIN_TOKEN").map_err(|_| {
+        "OPEN_SANDBOX_JOIN_TOKEN must be set for the controller to validate agent registrations"
+    })?;
     let validator = StaticTokenValidator {
         expected: join_token,
     };
@@ -69,12 +68,9 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
 }
 
 pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let pool = sqlx::PgPool::connect(&args.database_url).await?;
-    let pg_routing = PgRoutingStore::new(pool);
+    let _pool = sqlx::PgPool::connect(&args.database_url).await?;
 
     let tunnel_pool = Arc::new(TunnelPool::new());
-    let cache = Arc::new(RoutingCache::new(pg_routing));
-    cache.refresh().await?;
 
     let mux = Arc::new(StreamMux::new(tunnel_pool.clone()));
     let grpc_service = tunnel_service(mux, tunnel_pool);
@@ -141,12 +137,12 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
     let join_token = JoinToken::new(args.token);
 
     let runtime = Arc::new(DockerRuntime);
-    let sandbox_manager = Arc::new(SandboxManager::new(runtime.clone()));
+    let sandbox_manager = Arc::new(SandboxManager::new(runtime));
 
     let resources = AgentResources {
-        cpu_cores: 4,
-        memory_bytes: 8_000_000_000,
-        arch: 1,
+        cpu_cores: num_cpus() as u32,
+        memory_bytes: total_memory_bytes(),
+        arch: host_architecture() as i32,
         os: std::env::consts::OS.to_string(),
     };
 
@@ -177,7 +173,25 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C signal handler");
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+fn total_memory_bytes() -> u64 {
+    // Conservative default; real detection requires platform-specific APIs
+    // or a crate like sysinfo. 4 GiB is a safe lower bound.
+    4 * 1024 * 1024 * 1024
+}
+
+fn host_architecture() -> Architecture {
+    match std::env::consts::ARCH {
+        "x86_64" => Architecture::X8664,
+        "aarch64" => Architecture::Aarch64,
+        _ => Architecture::Unspecified,
+    }
 }
