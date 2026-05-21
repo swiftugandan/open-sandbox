@@ -8,7 +8,7 @@ A Rust-based sandbox platform where agents dial out to a controller/proxy over T
 
 ## Current phase
 
-Phase 6 complete: all modules implemented including the API gateway. Controller, agent, proxy, CLI shell, infra, agent-docker, proxy-http, and api modules done. The `api` module (`module/api/done`) adds the REST API gateway — axum HTTP server at port 8081, connects to the controller's SandboxManagementService via gRPC. Six REST endpoints at `/v1/sandboxes`: create, get, delete, exec. ExecBroker correlates exec results via oneshot channels. `open-sandbox api` CLI subcommand wires it all together. Infra live e2e (`pulumi up` against real Hetzner/Cloudflare) deferred until cloud credentials are configured.
+Phase 6 complete: all modules implemented including the API gateway and file operations. Controller, agent, proxy, CLI shell, infra, agent-docker, proxy-http, api, and api-files modules done. The `api-files` module (`module/api-files/done`) adds exec-backed file read/write matching the Vercel Sandbox SDK shape: `POST /v1/sandboxes/{id}/files/write` (gzip tar body, `x-cwd` header) and `POST /v1/sandboxes/{id}/files/read` (JSON `{path, cwd}` → octet-stream). Contract amendment added `stdin: bytes` to ExecCommand and ExecSandboxRequest. Agent now handles ExecCommand dispatch (was previously ignored). ContainerRuntime trait extended with `exec` method. Infra live e2e (`pulumi up` against real Hetzner/Cloudflare) deferred until cloud credentials are configured.
 
 ## Quick status
 
