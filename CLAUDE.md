@@ -8,7 +8,7 @@ A Rust-based sandbox platform where agents dial out to a controller/proxy over T
 
 ## Current phase
 
-Phase 6 in progress: per-binary implementation. Controller, agent, and proxy modules complete (`module/controller/done`, `module/agent/done`, `module/proxy/done`). Next: `open-sandbox` CLI shell.
+Phase 6 in progress: per-binary implementation. Controller, agent, proxy, and CLI shell modules complete (`module/controller/done`, `module/agent/done`, `module/proxy/done`, `module/open-sandbox/done`). Next: `infra` (Pulumi stack).
 
 ## Quick status
 
