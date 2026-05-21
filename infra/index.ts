@@ -3,6 +3,8 @@ import { createSshKey, createControllerServer, createWorkerServers, createVolume
 import { controllerUserData, workerUserData } from "./src/cloud-init";
 import { createNetwork, createFloatingIp, assignFloatingIp, attachToNetwork, createControllerFirewall, createWorkerFirewall } from "./src/networking";
 import { createWildcardDns } from "./src/dns";
+import { CONTROLLER_GRPC_PORT, PROXY_HTTP_PORT, PROXY_GRPC_PORT, DATABASE_URL, CONTROLLER_PRIVATE_IP, VOLUME_DEVICE_PREFIX } from "./src/constants";
+import { idAsNumber } from "./src/util";
 
 const config = new pulumi.Config();
 
@@ -28,42 +30,37 @@ const workerFirewall = createWorkerFirewall();
 
 const floatingIp = createFloatingIp({ location });
 
-const databaseUrl = "postgres://postgres@127.0.0.1:5432/open_sandbox";
-const controllerGrpcPort = 50051;
-const proxyHttpPort = 443;
-const proxyGrpcPort = 50052;
-
+const volumeName = "postgres-data";
 const volume = createVolume({ sizeGb: volumeSizeGb, location });
 
 const controllerServer = createControllerServer({
   serverType: controllerServerType,
   location,
   userData: controllerUserData({
-    databaseUrl,
-    grpcPort: controllerGrpcPort,
-    proxyHttpPort,
-    proxyGrpcPort,
-    volumeDevice: "/dev/disk/by-id/scsi-0HC_Volume_postgres-data",
+    databaseUrl: DATABASE_URL,
+    grpcPort: CONTROLLER_GRPC_PORT,
+    proxyHttpPort: PROXY_HTTP_PORT,
+    proxyGrpcPort: PROXY_GRPC_PORT,
+    volumeDevice: `${VOLUME_DEVICE_PREFIX}${volumeName}`,
   }),
-  sshKeyIds: [sshKey.id.apply((id) => parseInt(id, 10))],
-  firewallIds: [controllerFirewall.id.apply((id) => parseInt(id, 10))],
+  sshKeyIds: [idAsNumber(sshKey.id)],
+  firewallIds: [idAsNumber(controllerFirewall.id)],
 });
 
 const volumeAttachment = attachVolume({
-  volumeId: volume.id.apply((id) => parseInt(id, 10)),
-  serverId: controllerServer.id.apply((id) => parseInt(id, 10)),
+  volumeId: idAsNumber(volume.id),
+  serverId: idAsNumber(controllerServer.id),
 });
 
 const floatingIpAssignment = assignFloatingIp({
-  floatingIpId: floatingIp.id.apply((id) => parseInt(id, 10)),
-  serverId: controllerServer.id.apply((id) => parseInt(id, 10)),
+  floatingIpId: idAsNumber(floatingIp.id),
+  serverId: idAsNumber(controllerServer.id),
 });
 
-const controllerPrivateIp = "10.0.0.2";
 const controllerNetAttachment = attachToNetwork("controller-net", {
-  serverId: controllerServer.id.apply((id) => parseInt(id, 10)),
-  networkId: network.id.apply((id) => parseInt(id, 10)),
-  ip: controllerPrivateIp,
+  serverId: idAsNumber(controllerServer.id),
+  networkId: idAsNumber(network.id),
+  ip: CONTROLLER_PRIVATE_IP,
 });
 
 const workerServers = createWorkerServers({
@@ -71,18 +68,18 @@ const workerServers = createWorkerServers({
   serverType: workerServerType,
   location,
   userData: workerUserData({
-    controllerUrl: `http://${controllerPrivateIp}:${controllerGrpcPort}`,
-    proxyUrl: `http://${controllerPrivateIp}:${proxyGrpcPort}`,
+    controllerUrl: `http://${CONTROLLER_PRIVATE_IP}:${CONTROLLER_GRPC_PORT}`,
+    proxyUrl: `http://${CONTROLLER_PRIVATE_IP}:${PROXY_GRPC_PORT}`,
     joinToken,
   }),
-  sshKeyIds: [sshKey.id.apply((id) => parseInt(id, 10))],
-  firewallIds: [workerFirewall.id.apply((id) => parseInt(id, 10))],
+  sshKeyIds: [idAsNumber(sshKey.id)],
+  firewallIds: [idAsNumber(workerFirewall.id)],
 });
 
 const workerNetAttachments = workerServers.map((server, i) =>
   attachToNetwork(`worker-${i}-net`, {
-    serverId: server.id.apply((id) => parseInt(id, 10)),
-    networkId: network.id.apply((id) => parseInt(id, 10)),
+    serverId: idAsNumber(server.id),
+    networkId: idAsNumber(network.id),
   }),
 );
 

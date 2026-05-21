@@ -82,12 +82,6 @@ export function createWorkerFirewall() {
 }
 
 function locationToZone(location: string): string {
-  if (location.startsWith("fsn") || location.startsWith("nbg")) {
-    return "eu-central";
-  }
-  if (location.startsWith("hel")) {
-    return "eu-central";
-  }
   if (location.startsWith("ash") || location.startsWith("hil")) {
     return "us-east";
   }

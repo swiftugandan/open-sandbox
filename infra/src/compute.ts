@@ -1,5 +1,6 @@
 import * as hcloud from "@pulumi/hcloud";
 import * as pulumi from "@pulumi/pulumi";
+import { UBUNTU_IMAGE } from "./constants";
 
 export function createSshKey(args: { publicKey: string }) {
   return new hcloud.SshKey("operator-key", {
@@ -17,7 +18,7 @@ export function createControllerServer(args: {
   return new hcloud.Server("controller", {
     serverType: args.serverType,
     location: args.location,
-    image: "ubuntu-24.04",
+    image: UBUNTU_IMAGE,
     userData: args.userData,
     sshKeys: args.sshKeyIds.map((id) => id.apply((n) => n.toString())),
     firewallIds: args.firewallIds,
@@ -38,7 +39,7 @@ export function createWorkerServers(args: {
       new hcloud.Server(`worker-${i}`, {
         serverType: args.serverType,
         location: args.location,
-        image: "ubuntu-24.04",
+        image: UBUNTU_IMAGE,
         userData: args.userData,
         sshKeys: args.sshKeyIds.map((id) => id.apply((n) => n.toString())),
         firewallIds: args.firewallIds,
