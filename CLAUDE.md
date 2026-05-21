@@ -8,7 +8,7 @@ A Rust-based sandbox platform where agents dial out to a controller/proxy over T
 
 ## Current phase
 
-Phase 6 in progress: per-binary implementation. Controller and agent modules complete (`module/controller/done`, `module/agent/done`). Next: proxy module.
+Phase 6 in progress: per-binary implementation. Controller, agent, and proxy modules complete (`module/controller/done`, `module/agent/done`, `module/proxy/done`). Next: `open-sandbox` CLI shell.
 
 ## Quick status
 
