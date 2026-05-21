@@ -1,0 +1,3 @@
+name: open-sandbox
+runtime: nodejs
+description: Infrastructure for the open-sandbox platform
