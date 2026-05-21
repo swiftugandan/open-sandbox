@@ -24,6 +24,10 @@ impl<S: ControllerStore> Scheduler<S> {
         Self { store }
     }
 
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
     pub async fn assign_sandbox(
         &self,
         sandbox_id: SandboxId,

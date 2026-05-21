@@ -1,7 +1,7 @@
 use sqlx::PgPool;
 
 use open_sandbox_contracts::error::ControllerError;
-use open_sandbox_contracts::types::{AgentId, RoutingEntry};
+use open_sandbox_contracts::types::{AgentId, RoutingEntry, SandboxId};
 
 use crate::store::*;
 
@@ -163,6 +163,39 @@ impl ControllerStore for PgStore {
             })?;
         Ok(())
     }
+
+    async fn find_routing_entry(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<RoutingEntry>, ControllerError> {
+        let row = sqlx::query_as::<_, RoutingRow>(
+            "SELECT sandbox_id, agent_id FROM routing_entries WHERE sandbox_id = $1",
+        )
+        .bind(sandbox_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        Ok(row.map(|r| RoutingEntry {
+            sandbox_id: SandboxId(r.sandbox_id),
+            agent_id: AgentId(r.agent_id),
+        }))
+    }
+
+    async fn remove_routing_entry(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<(), ControllerError> {
+        sqlx::query("DELETE FROM routing_entries WHERE sandbox_id = $1")
+            .bind(sandbox_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ControllerError::Database {
+                detail: e.to_string(),
+            })?;
+        Ok(())
+    }
 }
 
 fn state_to_str(state: &AgentState) -> &'static str {
@@ -177,6 +210,12 @@ fn state_from_str(s: &str) -> AgentState {
         "dead" => AgentState::Dead,
         _ => AgentState::Active,
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct RoutingRow {
+    sandbox_id: uuid::Uuid,
+    agent_id: uuid::Uuid,
 }
 
 #[derive(sqlx::FromRow)]

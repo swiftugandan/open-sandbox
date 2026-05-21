@@ -10,5 +10,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Controller(args) => run::run_controller(args).await,
         Command::Proxy(args) => run::run_proxy(args).await,
         Command::Agent(args) => run::run_agent(args).await,
+        Command::Api(args) => run::run_api(args).await,
     }
 }

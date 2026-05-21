@@ -1,5 +1,5 @@
 use open_sandbox_contracts::error::ControllerError;
-use open_sandbox_contracts::types::{AgentId, RoutingEntry};
+use open_sandbox_contracts::types::{AgentId, RoutingEntry, SandboxId};
 
 #[derive(Debug, Clone)]
 pub struct AgentCapacity {
@@ -36,4 +36,6 @@ pub trait ControllerStore: Send + Sync {
     fn update_agent_state(&self, id: &AgentId, state: AgentState) -> impl Future<Output = Result<(), ControllerError>> + Send;
     fn insert_routing_entry(&self, entry: RoutingEntry) -> impl Future<Output = Result<(), ControllerError>> + Send;
     fn remove_routing_entries_for_agent(&self, agent_id: &AgentId) -> impl Future<Output = Result<(), ControllerError>> + Send;
+    fn find_routing_entry(&self, sandbox_id: &SandboxId) -> impl Future<Output = Result<Option<RoutingEntry>, ControllerError>> + Send;
+    fn remove_routing_entry(&self, sandbox_id: &SandboxId) -> impl Future<Output = Result<(), ControllerError>> + Send;
 }
