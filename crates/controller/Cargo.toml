@@ -1,0 +1,11 @@
+[package]
+name = "open-sandbox-controller"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+open-sandbox-contracts = { path = "../contracts" }
+tokio = { version = "1", features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }
