@@ -12,7 +12,9 @@ open-sandbox-contracts = { path = "../contracts" }
 open-sandbox-controller = { path = "../controller" }
 open-sandbox-agent = { path = "../agent" }
 open-sandbox-proxy = { path = "../proxy" }
+bollard = "0.18"
 clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tokio-stream = "0.1"
