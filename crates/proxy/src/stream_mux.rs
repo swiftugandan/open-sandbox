@@ -12,7 +12,7 @@ use open_sandbox_contracts::types::AgentId;
 use crate::tunnel_pool::TunnelPool;
 
 pub struct PendingStream {
-    pub response_tx: oneshot::Sender<HttpResponse>,
+    pub response_tx: oneshot::Sender<Result<HttpResponse, ProxyError>>,
     pub agent_id: AgentId,
 }
 
@@ -81,7 +81,7 @@ impl StreamMux {
         })?;
 
         match tokio::time::timeout(UPSTREAM_TIMEOUT, response_rx).await {
-            Ok(Ok(resp)) => Ok(resp),
+            Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ProxyError::TunnelUnavailable {
                 agent_id: agent_id.to_string(),
             }),
@@ -98,18 +98,17 @@ impl StreamMux {
     pub fn deliver_response(&self, stream_id: &str, response: HttpResponse) -> bool {
         let pending = self.pending.lock().unwrap().remove(stream_id);
         match pending {
-            Some(p) => p.response_tx.send(response).is_ok(),
+            Some(p) => p.response_tx.send(Ok(response)).is_ok(),
             None => false,
         }
     }
 
-    pub fn fail_stream(&self, stream_id: &str) {
+    pub fn fail_stream(&self, stream_id: &str, reason: String) {
         if let Some(pending) = self.pending.lock().unwrap().remove(stream_id) {
-            let _ = pending.response_tx.send(HttpResponse {
-                status_code: 502,
-                headers: Default::default(),
-                body: Vec::new(),
-            });
+            let _ = pending.response_tx.send(Err(ProxyError::UpstreamRejected {
+                stream_id: stream_id.to_string(),
+                reason,
+            }));
         }
     }
 
@@ -294,7 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_stream_delivers_502_response() {
+    async fn fail_stream_returns_upstream_rejected_error() {
         let pool = Arc::new(TunnelPool::new());
         let agent_id = AgentId::new();
         let (tx, mut rx) = mpsc::channel::<TunnelRequest>(32);
@@ -318,10 +317,9 @@ mod tests {
         });
 
         let req = rx.recv().await.unwrap();
-        mux.fail_stream(&req.stream_id);
+        mux.fail_stream(&req.stream_id, "container not ready".into());
 
-        let result = handle.await.unwrap().unwrap();
-        assert_eq!(result.status_code, 502);
-        assert!(result.body.is_empty());
+        let result = handle.await.unwrap();
+        assert!(matches!(result, Err(ProxyError::UpstreamRejected { .. })));
     }
 }

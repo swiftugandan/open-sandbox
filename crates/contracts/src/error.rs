@@ -34,6 +34,9 @@ pub enum ProxyError {
     #[error("upstream timeout after {timeout_ms}ms for sandbox {sandbox_id}")]
     UpstreamTimeout { sandbox_id: String, timeout_ms: u64 },
 
+    #[error("upstream rejected request for stream {stream_id}: {reason}")]
+    UpstreamRejected { stream_id: String, reason: String },
+
     #[error("internal error: {detail}")]
     Internal { detail: String },
 }
