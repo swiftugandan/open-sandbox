@@ -1004,7 +1004,9 @@ name = "open-sandbox-agent"
 version = "0.1.0"
 dependencies = [
  "open-sandbox-contracts",
+ "open-sandbox-controller",
  "prost-types",
+ "sqlx",
  "tokio",
  "tokio-stream",
  "tonic",
