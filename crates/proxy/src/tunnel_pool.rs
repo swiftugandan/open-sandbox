@@ -3,8 +3,7 @@ use std::sync::Mutex;
 
 use tokio::sync::mpsc;
 
-use open_sandbox_contracts::error::ProxyError;
-use open_sandbox_contracts::proxy::{TunnelRequest, TunnelResponse};
+use open_sandbox_contracts::proxy::TunnelRequest;
 use open_sandbox_contracts::types::AgentId;
 
 pub struct AgentTunnel {
@@ -17,7 +16,9 @@ pub struct TunnelPool {
 
 impl TunnelPool {
     pub fn new() -> Self {
-        todo!()
+        Self {
+            tunnels: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn register(
@@ -25,23 +26,30 @@ impl TunnelPool {
         agent_id: AgentId,
         request_tx: mpsc::Sender<TunnelRequest>,
     ) {
-        todo!()
+        self.tunnels
+            .lock()
+            .unwrap()
+            .insert(agent_id, AgentTunnel { request_tx });
     }
 
     pub fn remove(&self, agent_id: &AgentId) {
-        todo!()
+        self.tunnels.lock().unwrap().remove(agent_id);
     }
 
     pub fn get_sender(&self, agent_id: &AgentId) -> Option<mpsc::Sender<TunnelRequest>> {
-        todo!()
+        self.tunnels
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .map(|t| t.request_tx.clone())
     }
 
     pub fn active_count(&self) -> usize {
-        todo!()
+        self.tunnels.lock().unwrap().len()
     }
 
     pub fn contains(&self, agent_id: &AgentId) -> bool {
-        todo!()
+        self.tunnels.lock().unwrap().contains_key(agent_id)
     }
 }
 

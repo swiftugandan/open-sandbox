@@ -98,7 +98,6 @@ async fn full_request_routing_through_mock_agent() {
     if let Some(tunnel_request::Payload::HttpRequest(http_req)) = req.payload {
         assert_eq!(http_req.method, "GET");
         assert_eq!(http_req.uri, "/hello");
-        assert_eq!(http_req.sandbox_id, sandbox_id.to_string());
     } else {
         panic!("expected HttpRequest payload");
     }

@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use open_sandbox_contracts::error::ProxyError;
 use open_sandbox_contracts::proxy::HttpResponse;
-use open_sandbox_contracts::types::SandboxId;
 
 use crate::routing_cache::RoutingCache;
 use crate::routing_store::RoutingStore;
@@ -15,11 +14,17 @@ pub struct Router<S: RoutingStore> {
 
 impl<S: RoutingStore> Router<S> {
     pub fn new(cache: Arc<RoutingCache<S>>, mux: Arc<StreamMux>) -> Self {
-        todo!()
+        Self { cache, mux }
     }
 
     pub fn extract_sandbox_id(host: &str) -> Option<String> {
-        todo!()
+        let host = host.split(':').next().unwrap_or(host);
+        let first_dot = host.find('.')?;
+        let subdomain = &host[..first_dot];
+        if subdomain.len() != 12 || !subdomain.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(subdomain.to_string())
     }
 
     pub async fn route_request(
@@ -30,7 +35,22 @@ impl<S: RoutingStore> Router<S> {
         headers: std::collections::HashMap<String, String>,
         body: Vec<u8>,
     ) -> Result<HttpResponse, ProxyError> {
-        todo!()
+        let subdomain = Self::extract_sandbox_id(host).ok_or_else(|| {
+            ProxyError::RoutingMiss {
+                sandbox_id: host.to_string(),
+            }
+        })?;
+
+        let agent_id =
+            self.cache.lookup(&subdomain).ok_or_else(|| {
+                ProxyError::RoutingMiss {
+                    sandbox_id: subdomain.clone(),
+                }
+            })?;
+
+        self.mux
+            .send_request(&agent_id, &subdomain, method, uri, headers, body)
+            .await
     }
 }
 
@@ -39,7 +59,7 @@ mod tests {
     use super::*;
     use crate::testutil::*;
     use crate::tunnel_pool::TunnelPool;
-    use open_sandbox_contracts::types::AgentId;
+    use open_sandbox_contracts::types::{AgentId, SandboxId};
     use tokio::sync::mpsc;
 
     #[test]

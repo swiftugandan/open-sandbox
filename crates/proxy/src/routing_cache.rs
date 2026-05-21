@@ -8,32 +8,44 @@ use crate::routing_store::RoutingStore;
 
 pub struct RoutingCache<S: RoutingStore> {
     store: S,
-    cache: Mutex<HashMap<SandboxId, AgentId>>,
+    cache: Mutex<HashMap<String, AgentId>>,
 }
 
 impl<S: RoutingStore> RoutingCache<S> {
     pub fn new(store: S) -> Self {
-        todo!()
+        Self {
+            store,
+            cache: Mutex::new(HashMap::new()),
+        }
     }
 
-    pub fn lookup(&self, sandbox_id: &SandboxId) -> Option<AgentId> {
-        todo!()
+    pub fn lookup(&self, subdomain: &str) -> Option<AgentId> {
+        self.cache.lock().unwrap().get(subdomain).cloned()
     }
 
     pub async fn refresh(&self) -> Result<(), ProxyError> {
-        todo!()
+        let entries = self.store.load_all().await?;
+        let mut cache = self.cache.lock().unwrap();
+        cache.clear();
+        for entry in entries {
+            cache.insert(entry.sandbox_id.subdomain(), entry.agent_id);
+        }
+        Ok(())
     }
 
     pub fn insert(&self, sandbox_id: SandboxId, agent_id: AgentId) {
-        todo!()
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(sandbox_id.subdomain(), agent_id);
     }
 
-    pub fn remove(&self, sandbox_id: &SandboxId) {
-        todo!()
+    pub fn remove_by_subdomain(&self, subdomain: &str) {
+        self.cache.lock().unwrap().remove(subdomain);
     }
 
     pub fn len(&self) -> usize {
-        todo!()
+        self.cache.lock().unwrap().len()
     }
 }
 
@@ -46,7 +58,7 @@ mod tests {
     async fn lookup_returns_none_for_unknown_sandbox() {
         let store = InMemoryRoutingStore::new();
         let cache = RoutingCache::new(store);
-        assert!(cache.lookup(&SandboxId::new()).is_none());
+        assert!(cache.lookup(&SandboxId::new().subdomain()).is_none());
     }
 
     #[tokio::test]
@@ -57,7 +69,7 @@ mod tests {
         let agent_id = AgentId::new();
 
         cache.insert(sandbox_id.clone(), agent_id.clone());
-        assert_eq!(cache.lookup(&sandbox_id), Some(agent_id));
+        assert_eq!(cache.lookup(&sandbox_id.subdomain()), Some(agent_id));
     }
 
     #[tokio::test]
@@ -67,8 +79,8 @@ mod tests {
         let sandbox_id = SandboxId::new();
 
         cache.insert(sandbox_id.clone(), AgentId::new());
-        cache.remove(&sandbox_id);
-        assert!(cache.lookup(&sandbox_id).is_none());
+        cache.remove_by_subdomain(&sandbox_id.subdomain());
+        assert!(cache.lookup(&sandbox_id.subdomain()).is_none());
     }
 
     #[tokio::test]
@@ -79,10 +91,10 @@ mod tests {
         store.add_entry(sandbox_id.clone(), agent_id.clone());
 
         let cache = RoutingCache::new(store);
-        assert!(cache.lookup(&sandbox_id).is_none());
+        assert!(cache.lookup(&sandbox_id.subdomain()).is_none());
 
         cache.refresh().await.unwrap();
-        assert_eq!(cache.lookup(&sandbox_id), Some(agent_id));
+        assert_eq!(cache.lookup(&sandbox_id.subdomain()), Some(agent_id));
     }
 
     #[tokio::test]
@@ -95,12 +107,12 @@ mod tests {
         store.add_entry(sandbox_id.clone(), old_agent.clone());
         let cache = RoutingCache::new(store.clone());
         cache.refresh().await.unwrap();
-        assert_eq!(cache.lookup(&sandbox_id), Some(old_agent));
+        assert_eq!(cache.lookup(&sandbox_id.subdomain()), Some(old_agent));
 
         store.clear();
         store.add_entry(sandbox_id.clone(), new_agent.clone());
         cache.refresh().await.unwrap();
-        assert_eq!(cache.lookup(&sandbox_id), Some(new_agent));
+        assert_eq!(cache.lookup(&sandbox_id.subdomain()), Some(new_agent));
     }
 
     #[tokio::test]

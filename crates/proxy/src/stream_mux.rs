@@ -1,31 +1,39 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 
+use open_sandbox_contracts::constants::UPSTREAM_TIMEOUT;
 use open_sandbox_contracts::error::ProxyError;
-use open_sandbox_contracts::proxy::HttpResponse;
+use open_sandbox_contracts::proxy::{tunnel_request, HttpRequest, HttpResponse, TunnelRequest};
 use open_sandbox_contracts::types::AgentId;
 
 use crate::tunnel_pool::TunnelPool;
 
 pub struct PendingStream {
     pub response_tx: oneshot::Sender<HttpResponse>,
+    pub agent_id: AgentId,
 }
 
 pub struct StreamMux {
     pool: Arc<TunnelPool>,
     pending: Mutex<HashMap<String, PendingStream>>,
-    stream_counter: std::sync::atomic::AtomicU64,
+    stream_counter: AtomicU64,
 }
 
 impl StreamMux {
     pub fn new(pool: Arc<TunnelPool>) -> Self {
-        todo!()
+        Self {
+            pool,
+            pending: Mutex::new(HashMap::new()),
+            stream_counter: AtomicU64::new(0),
+        }
     }
 
     pub fn next_stream_id(&self) -> String {
-        todo!()
+        let id = self.stream_counter.fetch_add(1, Ordering::SeqCst);
+        format!("s-{id}")
     }
 
     pub async fn send_request(
@@ -34,29 +42,86 @@ impl StreamMux {
         sandbox_id: &str,
         method: String,
         uri: String,
-        headers: std::collections::HashMap<String, String>,
+        headers: HashMap<String, String>,
         body: Vec<u8>,
     ) -> Result<HttpResponse, ProxyError> {
-        todo!()
+        let sender = self.pool.get_sender(agent_id).ok_or_else(|| {
+            ProxyError::TunnelUnavailable {
+                agent_id: agent_id.to_string(),
+            }
+        })?;
+
+        let stream_id = self.next_stream_id();
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.pending.lock().unwrap().insert(
+            stream_id.clone(),
+            PendingStream {
+                response_tx,
+                agent_id: agent_id.clone(),
+            },
+        );
+
+        let request = TunnelRequest {
+            stream_id: stream_id.clone(),
+            payload: Some(tunnel_request::Payload::HttpRequest(HttpRequest {
+                method,
+                uri,
+                headers,
+                body,
+                sandbox_id: sandbox_id.to_string(),
+            })),
+        };
+
+        sender.send(request).await.map_err(|_| {
+            self.pending.lock().unwrap().remove(&stream_id);
+            ProxyError::TunnelUnavailable {
+                agent_id: agent_id.to_string(),
+            }
+        })?;
+
+        match tokio::time::timeout(UPSTREAM_TIMEOUT, response_rx).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(_)) => Err(ProxyError::TunnelUnavailable {
+                agent_id: agent_id.to_string(),
+            }),
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&stream_id);
+                Err(ProxyError::UpstreamTimeout {
+                    sandbox_id: sandbox_id.to_string(),
+                    timeout_ms: UPSTREAM_TIMEOUT.as_millis() as u64,
+                })
+            }
+        }
     }
 
     pub fn deliver_response(&self, stream_id: &str, response: HttpResponse) -> bool {
-        todo!()
+        let pending = self.pending.lock().unwrap().remove(stream_id);
+        match pending {
+            Some(p) => p.response_tx.send(response).is_ok(),
+            None => false,
+        }
     }
 
     pub fn cancel_stream(&self, stream_id: &str) {
-        todo!()
+        self.pending.lock().unwrap().remove(stream_id);
+    }
+
+    pub fn cancel_agent_streams(&self, agent_id: &AgentId) {
+        self.pending
+            .lock()
+            .unwrap()
+            .retain(|_, p| p.agent_id != *agent_id);
     }
 
     pub fn pending_count(&self) -> usize {
-        todo!()
+        self.pending.lock().unwrap().len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use open_sandbox_contracts::proxy::tunnel_request;
     use open_sandbox_contracts::proxy::TunnelRequest;
     use tokio::sync::mpsc;
 
@@ -90,19 +155,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_request_and_receive_response() {
+    async fn send_request_emits_tunnel_request() {
         let pool = Arc::new(TunnelPool::new());
         let agent_id = AgentId::new();
         let (tx, mut rx) = mpsc::channel::<TunnelRequest>(32);
 
         pool.register(agent_id.clone(), tx);
-        let mux = StreamMux::new(pool);
+        let mux = Arc::new(StreamMux::new(pool));
 
-        let mux_handle = {
-            let agent_id = agent_id.clone();
-            tokio::spawn(async move {
-                mux.send_request(
-                    &agent_id,
+        let mux_clone = mux.clone();
+        let agent_id_clone = agent_id.clone();
+        let _handle = tokio::spawn(async move {
+            mux_clone
+                .send_request(
+                    &agent_id_clone,
                     "sandbox-1",
                     "GET".into(),
                     "/hello".into(),
@@ -110,18 +176,25 @@ mod tests {
                     vec![],
                 )
                 .await
-            })
-        };
+        });
 
         let req = rx.recv().await.unwrap();
         assert!(matches!(
             req.payload,
             Some(tunnel_request::Payload::HttpRequest(_))
         ));
+        if let Some(tunnel_request::Payload::HttpRequest(http)) = req.payload {
+            assert_eq!(http.method, "GET");
+            assert_eq!(http.uri, "/hello");
+            assert_eq!(http.sandbox_id, "sandbox-1");
+        }
 
-        drop(rx);
-        let result = mux_handle.await.unwrap();
-        assert!(result.is_err());
+        let response = HttpResponse {
+            status_code: 200,
+            headers: Default::default(),
+            body: b"ok".to_vec(),
+        };
+        mux.deliver_response(&req.stream_id, response);
     }
 
     #[tokio::test]
