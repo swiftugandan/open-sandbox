@@ -1,0 +1,10 @@
+config:
+  open-sandbox:domain: example.com
+  open-sandbox:workerCount: "2"
+  open-sandbox:controllerServerType: cax11
+  open-sandbox:workerServerType: cx22
+  open-sandbox:volumeSizeGb: "20"
+  open-sandbox:location: fsn1
+  open-sandbox:networkCidr: 10.0.0.0/16
+  open-sandbox:subnetRange: 10.0.0.0/24
+  open-sandbox:operatorCidrs: '["0.0.0.0/0"]'

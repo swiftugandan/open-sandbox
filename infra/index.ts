@@ -1,0 +1,105 @@
+import * as pulumi from "@pulumi/pulumi";
+import { createSshKey, createControllerServer, createWorkerServers, createVolume, attachVolume } from "./src/compute";
+import { controllerUserData, workerUserData } from "./src/cloud-init";
+import { createNetwork, createFloatingIp, assignFloatingIp, attachToNetwork, createControllerFirewall, createWorkerFirewall } from "./src/networking";
+import { createWildcardDns } from "./src/dns";
+import { CONTROLLER_GRPC_PORT, PROXY_HTTP_PORT, PROXY_GRPC_PORT, DATABASE_URL, CONTROLLER_PRIVATE_IP, VOLUME_DEVICE_PREFIX } from "./src/constants";
+import { idAsNumber } from "./src/util";
+
+const config = new pulumi.Config();
+
+const domain = config.require("domain");
+const workerCount = config.getNumber("workerCount") ?? 2;
+const controllerServerType = config.get("controllerServerType") ?? "cax11";
+const workerServerType = config.get("workerServerType") ?? "cx22";
+const volumeSizeGb = config.getNumber("volumeSizeGb") ?? 20;
+const location = config.get("location") ?? "fsn1";
+const networkCidr = config.get("networkCidr") ?? "10.0.0.0/16";
+const subnetRange = config.get("subnetRange") ?? "10.0.0.0/24";
+const operatorCidrs: string[] = JSON.parse(config.get("operatorCidrs") ?? '["0.0.0.0/0"]');
+const sshPublicKey = config.require("sshPublicKey");
+const cloudflareZoneId = config.get("cloudflareZoneId") ?? "";
+const joinToken = config.getSecret("joinToken") ?? pulumi.output("changeme");
+
+const sshKey = createSshKey({ publicKey: sshPublicKey });
+
+const { network, subnet } = createNetwork({ cidr: networkCidr, subnetRange, location });
+
+const controllerFirewall = createControllerFirewall({ operatorCidrs });
+const workerFirewall = createWorkerFirewall();
+
+const floatingIp = createFloatingIp({ location });
+
+const volumeName = "postgres-data";
+const volume = createVolume({ sizeGb: volumeSizeGb, location });
+
+const controllerServer = createControllerServer({
+  serverType: controllerServerType,
+  location,
+  userData: controllerUserData({
+    databaseUrl: DATABASE_URL,
+    grpcPort: CONTROLLER_GRPC_PORT,
+    proxyHttpPort: PROXY_HTTP_PORT,
+    proxyGrpcPort: PROXY_GRPC_PORT,
+    volumeDevice: `${VOLUME_DEVICE_PREFIX}${volumeName}`,
+  }),
+  sshKeyIds: [idAsNumber(sshKey.id)],
+  firewallIds: [idAsNumber(controllerFirewall.id)],
+});
+
+const volumeAttachment = attachVolume({
+  volumeId: idAsNumber(volume.id),
+  serverId: idAsNumber(controllerServer.id),
+});
+
+const floatingIpAssignment = assignFloatingIp({
+  floatingIpId: idAsNumber(floatingIp.id),
+  serverId: idAsNumber(controllerServer.id),
+});
+
+const controllerNetAttachment = attachToNetwork("controller-net", {
+  serverId: idAsNumber(controllerServer.id),
+  networkId: idAsNumber(network.id),
+  ip: CONTROLLER_PRIVATE_IP,
+});
+
+const workerServers = createWorkerServers({
+  count: workerCount,
+  serverType: workerServerType,
+  location,
+  userData: workerUserData({
+    controllerUrl: `http://${CONTROLLER_PRIVATE_IP}:${CONTROLLER_GRPC_PORT}`,
+    proxyUrl: `http://${CONTROLLER_PRIVATE_IP}:${PROXY_GRPC_PORT}`,
+    joinToken,
+  }),
+  sshKeyIds: [idAsNumber(sshKey.id)],
+  firewallIds: [idAsNumber(workerFirewall.id)],
+});
+
+const workerNetAttachments = workerServers.map((server, i) =>
+  attachToNetwork(`worker-${i}-net`, {
+    serverId: idAsNumber(server.id),
+    networkId: idAsNumber(network.id),
+  }),
+);
+
+const wildcardDns = createWildcardDns({
+  zoneId: cloudflareZoneId,
+  domain,
+  floatingIpAddress: floatingIp.ipAddress,
+});
+
+export {
+  controllerServer,
+  workerServers,
+  floatingIp,
+  floatingIpAssignment,
+  volume,
+  volumeAttachment,
+  network,
+  subnet,
+  controllerFirewall,
+  workerFirewall,
+  sshKey,
+  wildcardDns,
+};
