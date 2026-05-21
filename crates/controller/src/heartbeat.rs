@@ -8,11 +8,17 @@ pub struct HeartbeatMonitor {
     heartbeats: Mutex<HashMap<AgentId, tokio::time::Instant>>,
 }
 
-impl HeartbeatMonitor {
-    pub fn new() -> Self {
+impl Default for HeartbeatMonitor {
+    fn default() -> Self {
         Self {
             heartbeats: Mutex::new(HashMap::new()),
         }
+    }
+}
+
+impl HeartbeatMonitor {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn record_heartbeat(&self, agent_id: AgentId) {

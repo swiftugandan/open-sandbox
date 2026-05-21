@@ -10,11 +10,17 @@ pub struct ExecBroker {
     pending: Mutex<HashMap<String, oneshot::Sender<ExecResult>>>,
 }
 
-impl ExecBroker {
-    pub fn new() -> Self {
+impl Default for ExecBroker {
+    fn default() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
         }
+    }
+}
+
+impl ExecBroker {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn register(&self, exec_id: String) -> oneshot::Receiver<ExecResult> {

@@ -64,6 +64,8 @@ pub async fn exec_sandbox<S: SandboxService>(
     }
 }
 
+// axum handlers require Response as the error type; boxing adds allocation for no benefit
+#[allow(clippy::result_large_err)]
 fn parse_sandbox_id(id: &str) -> Result<SandboxId, Response> {
     uuid::Uuid::parse_str(id)
         .map(SandboxId::from)

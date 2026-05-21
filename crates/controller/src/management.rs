@@ -193,6 +193,8 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
     }
 }
 
+// tonic handlers require Status as the error type
+#[allow(clippy::result_large_err)]
 fn parse_id(id: &str) -> Result<SandboxId, Status> {
     uuid::Uuid::parse_str(id)
         .map(SandboxId::from)
