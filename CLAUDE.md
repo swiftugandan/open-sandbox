@@ -8,7 +8,7 @@ A Rust-based sandbox platform where agents dial out to a controller/proxy over T
 
 ## Current phase
 
-Phase 6 in progress: per-binary implementation. Controller, agent, proxy, and CLI shell modules complete (`module/controller/done`, `module/agent/done`, `module/proxy/done`, `module/open-sandbox/done`). Next: `infra` (Pulumi stack).
+Phase 6 complete: all modules implemented. Controller, agent, proxy, CLI shell, and infra modules done (`module/controller/done`, `module/agent/done`, `module/proxy/done`, `module/open-sandbox/done`, `module/infra/done`). Infra live e2e (`pulumi up` against real Hetzner/Cloudflare) deferred until cloud credentials are configured.
 
 ## Quick status
 
