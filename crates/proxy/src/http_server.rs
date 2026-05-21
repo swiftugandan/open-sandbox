@@ -1,5 +1,13 @@
-use std::net::SocketAddr;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use tokio::net::TcpListener;
 
 use open_sandbox_contracts::error::ProxyError;
 
@@ -7,18 +15,86 @@ use crate::router::Router;
 use crate::routing_store::RoutingStore;
 
 pub struct HttpServer<S: RoutingStore + 'static> {
-    _router: Arc<Router<S>>,
+    router: Arc<Router<S>>,
 }
 
 impl<S: RoutingStore + 'static> HttpServer<S> {
     pub fn new(router: Arc<Router<S>>) -> Self {
-        Self { _router: router }
+        Self { router }
     }
 
-    pub async fn run(&self, _addr: SocketAddr) -> Result<(), ProxyError> {
-        Err(ProxyError::Internal {
-            detail: "HTTP server not yet implemented".into(),
-        })
+    pub async fn run(&self, listener: TcpListener) -> Result<(), ProxyError> {
+        loop {
+            let (stream, _) = listener.accept().await.map_err(|e| ProxyError::Internal {
+                detail: e.to_string(),
+            })?;
+
+            let router = self.router.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let router = router.clone();
+                    async move { handle_request(router, req).await }
+                });
+
+                if let Err(e) = http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await
+                {
+                    eprintln!("http connection error: {e}");
+                }
+            });
+        }
+    }
+}
+
+async fn handle_request<S: RoutingStore + 'static>(
+    router: Arc<Router<S>>,
+    req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let method = req.method().to_string();
+    let uri = req.uri().path_and_query().map_or("/".to_string(), |pq| pq.to_string());
+
+    let mut headers = HashMap::new();
+    for (name, value) in req.headers() {
+        if let Ok(v) = value.to_str() {
+            headers.insert(name.to_string(), v.to_string());
+        }
+    }
+
+    let body = req
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes().to_vec())
+        .unwrap_or_default();
+
+    match router.route_request(&host, method, uri, headers, body).await {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status_code as u16)
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let mut builder = Response::builder().status(status);
+            for (k, v) in &resp.headers {
+                builder = builder.header(k.as_str(), v.as_str());
+            }
+            Ok(builder
+                .body(Full::new(Bytes::from(resp.body)))
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Full::new(Bytes::new()))
+                        .unwrap()
+                }))
+        }
+        Err(_) => Ok(Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Full::new(Bytes::new()))
+            .unwrap()),
     }
 }
 
@@ -65,11 +141,11 @@ mod tests {
         let (router, mux, mut rx) = setup_router_with_agent(&sandbox_id, &agent_id);
 
         let server = HttpServer::new(router);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server_handle = tokio::spawn(async move {
-            server.run(addr).await
+            server.run(listener).await
         });
 
         let mux_clone = mux.clone();
@@ -114,11 +190,11 @@ mod tests {
         let router = Arc::new(Router::new(cache, mux));
 
         let server = HttpServer::new(router);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server_handle = tokio::spawn(async move {
-            server.run(addr).await
+            server.run(listener).await
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -146,11 +222,11 @@ mod tests {
         let (router, mux, mut rx) = setup_router_with_agent(&sandbox_id, &agent_id);
 
         let server = HttpServer::new(router);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server_handle = tokio::spawn(async move {
-            server.run(addr).await
+            server.run(listener).await
         });
 
         let mux_clone = mux.clone();
