@@ -1165,7 +1165,10 @@ dependencies = [
  "open-sandbox-controller",
  "open-sandbox-proxy",
  "predicates",
+ "sqlx",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

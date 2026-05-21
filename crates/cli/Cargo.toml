@@ -13,7 +13,10 @@ open-sandbox-controller = { path = "../controller" }
 open-sandbox-agent = { path = "../agent" }
 open-sandbox-proxy = { path = "../proxy" }
 clap = { version = "4", features = ["derive", "env"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio-stream = "0.1"
+tonic = "0.12"
 
 [dev-dependencies]
 assert_cmd = "2"
