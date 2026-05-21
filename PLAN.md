@@ -13,16 +13,16 @@
 ```
   open-sandbox-contracts (frozen)
        │
-   ┌───┼───────────┐
-   │   │            │
-   │   │            │
-   ▼   ▼            ▼
- agent controller  proxy
-   │       │        │
-   │       │        │
-   └───┬───┘        │
-       │            │
-       └─────┬──────┘
+   ┌───┼───────────┬──────┐
+   │   │            │      │
+   │   │            │      │
+   ▼   ▼            ▼      ▼
+ agent controller  proxy  api
+   │       │        │      │
+   │       │        │      │
+   └───┬───┘        │      │
+       │            │      │
+       └─────┬──────┘──────┘
              │
              ▼
       open-sandbox (CLI binary — subcommand dispatch)
@@ -84,7 +84,23 @@ No cycles. Each component depends only on `contracts`. The final `open-sandbox` 
 - **Estimated complexity:** S
 - **Risks:** Minimal — this is plumbing (clap subcommand dispatch).
 
-### 6. `infra` (Pulumi stack)
+### 6. `api` (API gateway)
+
+- **Depends on:** `contracts` only (communicates with controller via gRPC, not via Rust imports)
+- **Consumes contracts:** `SandboxManagementService` gRPC (from controller via `api.proto`)
+- **Produces contracts:** REST responses (JSON for metadata/exec, octet-stream for file reads)
+- **Implementation scope:**
+  - New crate at `crates/api/` — axum HTTP server, tonic gRPC client
+  - New `open-sandbox api` subcommand in the CLI crate
+  - Controller amendment: implement `SandboxManagementService` server, exec result correlation (pending exec map keyed by `exec_id`)
+  - Agent amendment: handle `ExecCommand` with `exec_id`, send `ExecResult` back through the agent stream
+- **Acceptance criterion (live e2e):** Given a running controller with a connected agent, `POST /v1/sandboxes` creates a Docker container on the agent and returns a sandbox ID. `POST /v1/sandboxes/:id/exec` with `{"command": ["echo", "hello"]}` returns `{"exit_code": 0, "stdout": "hello\n"}`. `DELETE /v1/sandboxes/:id` stops the container. All verified against real controller + agent + Docker.
+- **Estimated complexity:** L
+- **Risks:**
+  - Exec result correlation requires the controller to hold pending requests keyed by `exec_id` and deliver results when `ExecResult` arrives from the agent. Timeout handling is critical — a hung command must not leak a waiting request forever.
+  - File operations via exec depend on `tar` being available in the sandbox container image. Most base images include it but it's not guaranteed.
+
+### 7. `infra` (Pulumi stack)
 
 - **Depends on:** compiled `open-sandbox` binary (uploaded to object storage or built on cloud-init)
 - **Consumes contracts:** none (infrastructure, not Rust)

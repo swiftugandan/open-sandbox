@@ -43,6 +43,25 @@ pub enum ProxyError {
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
+pub enum ApiError {
+    #[error("unauthorized: {detail}")]
+    Unauthorized { detail: String },
+
+    #[error("sandbox {sandbox_id} not found")]
+    SandboxNotFound { sandbox_id: String },
+
+    #[error("controller unavailable: {detail}")]
+    ControllerUnavailable { detail: String },
+
+    #[error("exec failed: {detail}")]
+    ExecFailed { detail: String },
+
+    #[error("internal error: {detail}")]
+    Internal { detail: String },
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AgentError {
     #[error("controller connection lost")]
     ControllerDisconnected,

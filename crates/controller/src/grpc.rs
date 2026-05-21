@@ -165,7 +165,8 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                     }
 
                     agent_message::Payload::SandboxStatus(_)
-                    | agent_message::Payload::ResourceReport(_) => {}
+                    | agent_message::Payload::ResourceReport(_)
+                    | agent_message::Payload::ExecResult(_) => {}
                 }
             }
 

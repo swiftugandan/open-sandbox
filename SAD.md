@@ -16,7 +16,8 @@
                     │  TLS term                  Docker API       │
                     │  Host routing               (local)         │
                     │                                             │
-  Operators ──API───► [Controller] ◄──gRPC──── [Agent]           │
+  AI agents ──REST──► [API Gateway] ──gRPC──► [Controller] ◄──gRPC──── [Agent]           │
+  Operators ──REST──►      │                     │                                     │
                     │     │                          ▲            │
                     │     ▼                          │            │
                     │  [Postgres]              outbound TLS       │
@@ -64,7 +65,8 @@
 
 ### Components
 
-- **Controller:** owns agent lifecycle (registration, heartbeat monitoring, dead-agent detection), sandbox scheduling (assign sandbox to agent), routing-table writes, join-token management, and the operator API. Speaks gRPC to agents, SQL to Postgres.
+- **API Gateway:** owns the external control-plane surface — REST endpoints for sandbox lifecycle (create, get, delete), command execution, and file operations. Translates REST to gRPC unary RPCs against the controller. Authenticates clients via API key. Speaks HTTP to clients, gRPC to the controller.
+- **Controller:** owns agent lifecycle (registration, heartbeat monitoring, dead-agent detection), sandbox scheduling (assign sandbox to agent), routing-table writes, join-token management. Speaks gRPC (bidirectional streams) to agents, gRPC (unary RPCs) to the API gateway, SQL to Postgres.
 - **Proxy:** owns TLS termination, Host-header-based routing, and reverse-tunnel management. Speaks HTTPS to end users, gRPC (reverse tunnel) to agents, SQL (read-only + LISTEN) to Postgres.
 - **Agent:** owns sandbox lifecycle on its host (Docker container create/start/stop/remove), heartbeat emission, resource reporting, and reverse-tunnel data forwarding. Speaks gRPC to controller and proxy, Docker API to local engine.
 - **Postgres:** owns all durable state. Routing-table changes propagated to proxies via LISTEN/NOTIFY.
@@ -264,6 +266,45 @@ Reverse tunnel setup:
 
 ---
 
+### API Gateway
+
+**Responsibility.** The API gateway is the external control plane: it accepts REST requests from AI agents and operators, authenticates them, and translates them into gRPC calls to the controller. It never touches the data plane (sandbox HTTP traffic) — that remains the proxy's domain.
+
+**Internal structure.**
+- `http_server` — axum-based HTTP server handling REST endpoints
+- `auth` — extracts and validates API key from `Authorization: Bearer <key>` header
+- `controller_client` — tonic gRPC client for unary RPCs to the controller's `SandboxManagementService`
+- `handlers` — per-endpoint logic: create sandbox, get status, delete sandbox, exec command, write files, read files
+
+**Endpoints.**
+- `POST /v1/sandboxes` — create a sandbox (image, cpu, memory, env, exposed_port) → returns sandbox_id + subdomain URL
+- `GET /v1/sandboxes/:id` — get sandbox status + metadata
+- `DELETE /v1/sandboxes/:id` — stop and remove a sandbox
+- `POST /v1/sandboxes/:id/exec` — execute a command, returns stdout/stderr/exit_code
+- `POST /v1/sandboxes/:id/files/write` — upload tar.gz, extracted into sandbox filesystem
+- `POST /v1/sandboxes/:id/files/read` — read a file, returns octet-stream
+
+**State.**
+- Persistent: none. The API gateway is stateless — all state lives in Postgres via the controller.
+- Ephemeral: in-flight gRPC requests to the controller.
+
+**Failure modes.**
+- API gateway crash: external clients cannot create or manage sandboxes. Running sandboxes are unaffected (the proxy and agents continue independently).
+- Controller unreachable: all API requests fail with 503. The gateway does not cache or queue requests.
+- Invalid API key: 401 Unauthorized, request rejected before reaching the controller.
+
+**Observability surface.**
+- Prometheus metrics: `api_requests_total` (by endpoint, status), `api_request_duration_seconds` (histogram), `api_auth_failures_total`
+- Structured JSON logs: request log (method, path, status, duration), auth events
+
+**Contracts consumed.**
+- `SandboxManagementService` gRPC (from controller): unary RPCs for sandbox lifecycle and command execution
+
+**Contracts produced.**
+- REST API responses (to clients): JSON for sandbox metadata, exec output; octet-stream for file reads; standard HTTP error codes
+
+---
+
 ## Cross-cutting concerns
 
 ### Authentication and authorization
@@ -335,6 +376,18 @@ Configuration shape per component:
 - **Decision:** Run Postgres on the controller VM with a block volume. Backup via pg_dump to object storage. Pulumi flag `managedPostgres: true` for the upgrade path.
 - **Consequences:** Total cost stays under $20/month. Operator handles backups (automated via cron). Upgrade to managed is a config change, not a migration. Tradeoff: controller VM failure takes down both the control plane and the database.
 
+### ADR-007: Separate API gateway for external control plane
+
+- **Context:** AI agents need a REST API to create sandboxes, execute commands, and transfer files. The controller already exposes gRPC for agents. Two options: add REST endpoints to the proxy (already public-facing) or create a separate API gateway component.
+- **Decision:** Separate API gateway (`open-sandbox api` subcommand) that speaks REST to clients and gRPC (unary RPCs) to the controller. The proxy remains a pure data-plane router.
+- **Consequences:** Clean separation of data plane (proxy), internal control plane (controller), and external control plane (API gateway). Three components can scale independently. The API gateway adds one more process to deploy, but it is stateless and trivial to restart. The controller gains a new gRPC service (`SandboxManagementService`) with unary RPCs, cleanly separated from the bidirectional `AgentStream`.
+
+### ADR-008: File operations via exec, not a dedicated channel
+
+- **Context:** AI agents need to write files into sandboxes and read files out. Options: (a) add file-channel messages to the tunnel protocol, (b) implement as exec commands (`tar xzf` for writes, `cat` for reads).
+- **Decision:** Exec-backed file operations. Writes upload tar.gz to the API, which sends an exec that pipes the archive into `tar xzf`. Reads exec `cat <path>` and return the output.
+- **Consequences:** No changes to the tunnel protocol or agent. File operations ride the existing exec path. Latency is higher than a dedicated channel, but AI agent file operations are infrequent and small. The tar.gz convention matches Vercel's sandbox SDK, making future SDK compatibility easier.
+
 ---
 
 ## Confidence gate
@@ -344,8 +397,9 @@ Confidence: high
 Residual risks:
   - Single-VM default (controller + proxy + Postgres) is a single point of failure for the entire platform. Acceptable for the target scale but the first thing to split when reliability matters.
   - Reverse tunnel multiplexing performance under high concurrent request load is unvalidated. The design assumes HTTP/2 stream multiplexing is sufficient, but pathological workloads (many large concurrent responses) could saturate the single TCP connection per agent.
+  - Exec-backed file operations (ADR-008) may hit shell escaping edge cases with binary file content. The tar.gz approach mitigates this (binary-safe archive format), but the exec response path (stdout capture for large files) needs flow control.
 Known gaps:
-  - None blocking. The per-component zoom covers all contracts surfaces. The contracts phase can proceed.
+  - ExecCommand response flow (agent → controller → API) needs a new proto message type for exec results. The existing proto defines ExecCommand but not an ExecResult. This will be addressed in the contracts amendment.
 ```
 
-Once confidence is high and gaps are resolved, commit with `docs: architecture` and tag `sad/v0.1.0`.
+Amended with API gateway component (ADR-007, ADR-008). Tagged `sad/v0.2.0`.

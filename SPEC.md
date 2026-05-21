@@ -38,6 +38,19 @@ Developers need isolated, publicly-accessible sandbox environments that can run 
 - **FR-10:** Agents reconnect to the controller on disconnection using exponential backoff with jitter, reusing their agent ID. The controller picks up where it left off.
   - *Rationale:* Exponential backoff with jitter is the standard approach for reconnection in distributed systems, preventing thundering-herd reconnection storms.
 
+- **FR-11:** An API gateway exposes a REST interface for external clients (primarily AI agents) to manage the sandbox lifecycle: create a sandbox, stop/delete a sandbox, get sandbox status. The API gateway is a separate component (`open-sandbox api`) that speaks REST to clients and gRPC (unary RPCs) to the controller.
+  - *Rationale:* The controller's bidirectional gRPC stream is designed for persistent agent connections, not request/response client interactions. Unary RPCs for the external control plane keep the agent stream protocol unchanged. Separating the API into its own component preserves the data-plane/control-plane boundary — the proxy routes bytes, the controller orchestrates agents, the API translates external intent.
+
+- **FR-12:** The API gateway supports command execution on running sandboxes: an external client sends an exec request with a command and arguments, and receives stdout, stderr, and exit code in the response. Commands are forwarded from the API to the controller, which dispatches them to the hosting agent over the existing agent stream, using the `ExecCommand` message already defined in the controller proto.
+  - *Rationale:* Command execution is the primary interaction pattern for AI agents using sandboxes. The proto already defines `ExecCommand`; the API gateway provides the external entry point.
+
+- **FR-13:** The API gateway supports file operations on running sandboxes: writing files into a sandbox (as a tar.gz upload) and reading files out of a sandbox (as an octet-stream download). File operations are implemented as `ExecCommand` invocations under the hood: write extracts an uploaded archive via `tar xzf`, read uses `cat` piped back through the tunnel.
+  - *Rationale:* AI agents need to put code into sandboxes and retrieve results. Using exec-backed file operations avoids adding a new data channel to the agent protocol. The tar.gz format handles multiple files, directories, and permissions in a single upload — matching Vercel's sandbox SDK convention [13].
+  - *Source:* Vercel Sandbox REST API uses tar.gz upload for file writes, octet-stream for reads [13].
+
+- **FR-14:** The API gateway authenticates clients via API key in the `Authorization: Bearer <key>` header. API keys are stored hashed in Postgres and validated by the API gateway.
+  - *Rationale:* Bearer token authentication is the standard for REST APIs (RFC 6750 [14]). API keys are simpler than OAuth for programmatic agent access.
+
 ## Non-functional requirements
 
 ### Performance
@@ -134,6 +147,7 @@ Developers need isolated, publicly-accessible sandbox environments that can run 
 - **BYO worker:** A bring-your-own worker — any machine running the agent binary that has been registered with a join token.
 - **Routing table:** The Postgres-backed mapping from sandbox ID to the agent that hosts it, consumed by the proxy for request routing.
 - **Reverse tunnel:** The outbound gRPC connection from agent to proxy, over which inbound sandbox traffic is multiplexed back to the agent.
+- **API gateway:** The external control-plane component that translates REST requests from clients into gRPC calls to the controller. Separate from the proxy (data plane) and controller (internal control plane).
 
 ## References
 
@@ -149,6 +163,8 @@ Developers need isolated, publicly-accessible sandbox environments that can run 
 10. Let's Encrypt — Rate Limits, wildcard certificates, DNS-01 challenge. https://letsencrypt.org/docs/rate-limits/
 11. Let's Encrypt — Decreasing certificate lifetimes to 45 days. https://letsencrypt.org/2025/12/02/from-90-to-45
 12. Hetzner Cloud — ARM and x86 VM pricing, included bandwidth. https://www.hetzner.com/cloud/
+13. Vercel Sandbox REST API — file write via tar.gz upload, file read via octet-stream. https://vercel.com/docs/rest-api/sandboxes/write-files
+14. RFC 6750 — Bearer Token Usage for OAuth 2.0. https://www.rfc-editor.org/rfc/rfc6750
 
 ---
 
@@ -159,9 +175,11 @@ Confidence: high
 Residual risks:
   - Postgres LISTEN/NOTIFY scalability ceiling (~hundreds/sec) is adequate for routing updates but would need replacement (Redis, NATS) if sandbox churn exceeds this rate — unlikely at target scale but worth monitoring
   - Let's Encrypt 45-day certificate lifetime (effective 2026) requires reliable automated renewal; failure means sandbox downtime
+  - File operations via exec (FR-13) add latency compared to a dedicated file channel, but avoid protocol complexity. Acceptable for the AI agent use case where file operations are infrequent relative to exec.
 Known gaps:
   - Agent auto-update strategy (open question) — deferring to v1.1; operator-driven updates are sufficient for initial deployment
   - Default sandbox resource limits not yet specified — will be determined during contracts phase based on target workload profiling
+  - ExecCommand response path (stdout/stderr/exit code back from agent to controller to API) needs implementation — the proto message exists but the response flow is not yet wired
 ```
 
-Once confidence is high and gaps are resolved, commit with `docs: specification` and tag `spec/v0.1.0`.
+Amended with FR-11 through FR-14 (API gateway). Tagged `spec/v0.2.0`.

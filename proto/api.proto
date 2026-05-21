@@ -1,0 +1,53 @@
+syntax = "proto3";
+package open_sandbox.api;
+
+service SandboxManagementService {
+  rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
+  rpc GetSandbox(GetSandboxRequest) returns (GetSandboxResponse);
+  rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
+  rpc ExecSandbox(ExecSandboxRequest) returns (ExecSandboxResponse);
+}
+
+message CreateSandboxRequest {
+  string image = 1;
+  uint32 cpu_millicores = 2;
+  uint64 memory_bytes = 3;
+  map<string, string> env_vars = 4;
+  uint32 exposed_port = 5;
+}
+
+message CreateSandboxResponse {
+  string sandbox_id = 1;
+  string subdomain = 2;
+  string agent_id = 3;
+}
+
+message GetSandboxRequest {
+  string sandbox_id = 1;
+}
+
+message GetSandboxResponse {
+  string sandbox_id = 1;
+  string agent_id = 2;
+  string subdomain = 3;
+  string status = 4;
+}
+
+message DeleteSandboxRequest {
+  string sandbox_id = 1;
+}
+
+message DeleteSandboxResponse {
+  bool deleted = 1;
+}
+
+message ExecSandboxRequest {
+  string sandbox_id = 1;
+  repeated string command = 2;
+}
+
+message ExecSandboxResponse {
+  int32 exit_code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+}

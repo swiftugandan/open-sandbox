@@ -13,6 +13,7 @@ message AgentMessage {
     Heartbeat heartbeat = 2;
     SandboxStatus sandbox_status = 3;
     ResourceReport resource_report = 4;
+    ExecResult exec_result = 5;
   }
 }
 
@@ -104,10 +105,19 @@ message StopSandbox {
 message ExecCommand {
   string sandbox_id = 1;
   repeated string command = 2;
+  string exec_id = 3;
 }
 
 message FetchLogsCommand {
   string sandbox_id = 1;
   uint32 tail_lines = 2;
   bool follow = 3;
+}
+
+message ExecResult {
+  string sandbox_id = 1;
+  string exec_id = 2;
+  int32 exit_code = 3;
+  bytes stdout = 4;
+  bytes stderr = 5;
 }

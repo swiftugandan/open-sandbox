@@ -75,6 +75,28 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
 - **Invariants:** `stream_id` correlates request and response messages within a single tunnel. Each `stream_id` is unique within the lifetime of a tunnel connection. The proxy assigns `stream_id` values; the agent echoes them.
 - **Compatibility:** Same rules as controller service.
 
+### Sandbox management service (`api.proto`)
+
+- **Producer:** Controller (implements the gRPC server)
+- **Consumers:** API gateway (calls via tonic gRPC client)
+- **Purpose:** Unary RPCs for external sandbox lifecycle management. Deliberately separate from the bidirectional `AgentStream` — the agent stream is for persistent agent connections, this service is for request/response client interactions.
+- **Shape:** see `proto/api.proto`
+- **Key messages:**
+  - `CreateSandboxRequest` / `CreateSandboxResponse` — create a sandbox, returns sandbox_id + subdomain
+  - `GetSandboxRequest` / `GetSandboxResponse` — query sandbox status
+  - `DeleteSandboxRequest` / `DeleteSandboxResponse` — stop and remove a sandbox
+  - `ExecSandboxRequest` / `ExecSandboxResponse` — run a command, returns stdout/stderr/exit_code
+- **Invariants:** `sandbox_id` in responses matches the ID from the create or get request. `subdomain` is always the first 12 hex chars of the sandbox UUID. `ExecSandboxResponse` blocks until the command completes or the exec timeout (60s) is reached.
+- **Compatibility:** Adding new RPC methods is additive (minor bump). Changing existing message fields is breaking (major bump).
+
+### Exec result flow (`ExecResult` in `controller.proto`)
+
+- **Producer:** Agent (sends exec output back to controller)
+- **Consumer:** Controller (correlates by `exec_id` and delivers to waiting API request)
+- **Purpose:** Closes the exec loop: API → Controller → Agent (ExecCommand) → Agent executes → Agent → Controller (ExecResult) → API → Client.
+- **Key fields:** `exec_id` correlates the result with the originating `ExecCommand`. `exit_code`, `stdout`, `stderr` carry the command output.
+- **Invariant:** `exec_id` is unique per exec invocation (UUID). The controller holds a pending-exec map keyed by `exec_id`; when `ExecResult` arrives, the waiting API request is unblocked.
+
 ### Domain types (`types.rs`)
 
 - **Producer:** Contracts crate
@@ -94,8 +116,9 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
 - **Observed by:** Callers of each component's public API
 - **Kinds:**
   - `ControllerError`: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `NoAvailableAgents`, `Database`, `Internal`
-  - `ProxyError`: `RoutingMiss`, `TunnelUnavailable`, `UpstreamTimeout`, `Internal`
+  - `ProxyError`: `RoutingMiss`, `TunnelUnavailable`, `UpstreamTimeout`, `UpstreamRejected`, `Internal`
   - `AgentError`: `ControllerDisconnected`, `TunnelDisconnected`, `Docker`, `SandboxNotFound`, `Internal`
+  - `ApiError`: `Unauthorized`, `SandboxNotFound`, `ControllerUnavailable`, `ExecFailed`, `Internal`
 - **Retry guidance:**
   - Retryable: `Database` (transient), `TunnelUnavailable` (agent may reconnect), `UpstreamTimeout` (sandbox may be slow)
   - Terminal: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `RoutingMiss`, `NoAvailableAgents`
@@ -118,11 +141,12 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
 
 ## Component-to-contract matrix
 
-| Component  | Produces                                          | Consumes                                           |
-|------------|---------------------------------------------------|----------------------------------------------------|
-| Controller | `ControllerCommand`, `RegisterResponse`, `RoutingEntry` | `AgentMessage`, `RegisterRequest`                  |
-| Proxy      | `TunnelRequest`, HTTP responses                   | `TunnelResponse`, `RoutingEntry` (via PG)          |
-| Agent      | `AgentMessage`, `RegisterRequest`, `TunnelResponse` | `ControllerCommand`, `TunnelRequest`               |
+| Component     | Produces                                                   | Consumes                                                  |
+|---------------|------------------------------------------------------------|-----------------------------------------------------------|
+| API Gateway   | REST responses, `SandboxManagement` RPCs (as client)       | `SandboxManagement` RPC responses (from controller)       |
+| Controller    | `ControllerCommand`, `RegisterResponse`, `RoutingEntry`, `SandboxManagement` RPC responses | `AgentMessage`, `RegisterRequest`, `SandboxManagement` RPCs, `ExecResult` |
+| Proxy         | `TunnelRequest`, HTTP responses                            | `TunnelResponse`, `RoutingEntry` (via PG)                 |
+| Agent         | `AgentMessage`, `RegisterRequest`, `TunnelResponse`, `ExecResult` | `ControllerCommand`, `TunnelRequest`                      |
 
 ---
 
