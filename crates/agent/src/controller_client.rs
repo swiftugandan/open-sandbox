@@ -7,7 +7,8 @@ use open_sandbox_contracts::constants::HEARTBEAT_INTERVAL;
 use open_sandbox_contracts::controller::controller_command;
 use open_sandbox_contracts::controller::controller_service_client::ControllerServiceClient;
 use open_sandbox_contracts::controller::{
-    AgentMessage, AgentResources, Heartbeat, RegisterRequest, SandboxStatus, agent_message,
+    AgentMessage, AgentResources, ExecResult, Heartbeat, RegisterRequest, SandboxStatus,
+    agent_message,
 };
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::{AgentId, JoinToken};
@@ -156,8 +157,43 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                     let _ = status_tx.send(status).await;
                 }
                 controller_command::Payload::RegisterResponse(_) => {}
-                controller_command::Payload::Exec(_)
-                | controller_command::Payload::FetchLogs(_) => {}
+                controller_command::Payload::Exec(exec) => {
+                    let mgr = sandbox_manager.clone();
+                    let tx = status_tx.clone();
+                    tokio::spawn(async move {
+                        let sandbox_id = uuid::Uuid::parse_str(&exec.sandbox_id)
+                            .map(open_sandbox_contracts::types::SandboxId::from);
+                        let result = match sandbox_id {
+                            Ok(sid) => mgr
+                                .exec_sandbox(&sid, exec.command, exec.stdin)
+                                .await,
+                            Err(_) => Err(open_sandbox_contracts::error::AgentError::SandboxNotFound {
+                                sandbox_id: exec.sandbox_id.clone(),
+                            }),
+                        };
+                        let exec_result = match result {
+                            Ok(output) => ExecResult {
+                                sandbox_id: exec.sandbox_id,
+                                exec_id: exec.exec_id,
+                                exit_code: output.exit_code,
+                                stdout: output.stdout,
+                                stderr: output.stderr,
+                            },
+                            Err(e) => ExecResult {
+                                sandbox_id: exec.sandbox_id,
+                                exec_id: exec.exec_id,
+                                exit_code: -1,
+                                stdout: vec![],
+                                stderr: e.to_string().into_bytes(),
+                            },
+                        };
+                        let msg = AgentMessage {
+                            payload: Some(agent_message::Payload::ExecResult(exec_result)),
+                        };
+                        let _ = tx.send(msg).await;
+                    });
+                }
+                controller_command::Payload::FetchLogs(_) => {}
             }
         }
 

@@ -7,7 +7,10 @@ use bollard::container::{
 };
 use bollard::models::HostConfig;
 
-use open_sandbox_agent::container::{ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime};
+use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+use futures::StreamExt;
+
+use open_sandbox_agent::container::{ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOutput};
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
@@ -150,6 +153,81 @@ impl ContainerRuntime for DockerRuntime {
         }
 
         Ok(result)
+    }
+
+    async fn exec(
+        &self,
+        id: &ContainerId,
+        command: Vec<String>,
+        stdin: Vec<u8>,
+    ) -> Result<ExecOutput, AgentError> {
+        let attach_stdin = !stdin.is_empty();
+        let exec_opts = CreateExecOptions {
+            cmd: Some(command),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            attach_stdin: Some(attach_stdin),
+            ..Default::default()
+        };
+
+        let exec_created = self
+            .client
+            .create_exec(&id.0, exec_opts)
+            .await
+            .map_err(docker_err)?;
+
+        let start_opts = StartExecOptions {
+            detach: false,
+            ..Default::default()
+        };
+
+        let result = self
+            .client
+            .start_exec(&exec_created.id, Some(start_opts))
+            .await
+            .map_err(docker_err)?;
+
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+
+        if let StartExecResults::Attached { mut output, mut input } = result {
+            if !stdin.is_empty() {
+                use tokio::io::AsyncWriteExt;
+                input.write_all(&stdin).await.map_err(|e| AgentError::Docker {
+                    detail: e.to_string(),
+                })?;
+                input.shutdown().await.map_err(|e| AgentError::Docker {
+                    detail: e.to_string(),
+                })?;
+            }
+
+            while let Some(chunk) = output.next().await {
+                let chunk = chunk.map_err(docker_err)?;
+                match chunk {
+                    bollard::container::LogOutput::StdOut { message } => {
+                        stdout_buf.extend_from_slice(&message);
+                    }
+                    bollard::container::LogOutput::StdErr { message } => {
+                        stderr_buf.extend_from_slice(&message);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let inspect = self
+            .client
+            .inspect_exec(&exec_created.id)
+            .await
+            .map_err(docker_err)?;
+
+        let exit_code = inspect.exit_code.unwrap_or(-1) as i32;
+
+        Ok(ExecOutput {
+            exit_code,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+        })
     }
 }
 

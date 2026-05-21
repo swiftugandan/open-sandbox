@@ -73,6 +73,19 @@ impl ContainerRuntime for MockRuntime {
     async fn list_sandbox_containers(&self) -> Result<Vec<ContainerInfo>, AgentError> {
         Ok(Vec::new())
     }
+
+    async fn exec(
+        &self,
+        _id: &ContainerId,
+        command: Vec<String>,
+        _stdin: Vec<u8>,
+    ) -> Result<open_sandbox_agent::container::ExecOutput, AgentError> {
+        Ok(open_sandbox_agent::container::ExecOutput {
+            exit_code: 0,
+            stdout: command.join(" ").into_bytes(),
+            stderr: vec![],
+        })
+    }
 }
 
 // --- Mock HTTP Client ---

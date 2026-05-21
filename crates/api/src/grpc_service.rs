@@ -7,7 +7,10 @@ use open_sandbox_contracts::error::ApiError;
 use open_sandbox_contracts::types::SandboxId;
 use tonic::transport::Channel;
 
-use crate::service::{CreateRequest, ExecOutput, ExecRequest, SandboxInfo, SandboxService};
+use crate::service::{
+    CreateRequest, ExecOutput, ExecRequest, ReadFileRequest, SandboxInfo, SandboxService,
+    WriteFilesRequest,
+};
 
 pub struct GrpcSandboxService {
     client: SandboxManagementServiceClient<Channel>,
@@ -107,6 +110,68 @@ impl SandboxService for GrpcSandboxService {
             stdout: resp.stdout,
             stderr: resp.stderr,
         })
+    }
+
+    async fn write_files(
+        &self,
+        sandbox_id: &SandboxId,
+        request: WriteFilesRequest,
+    ) -> Result<(), ApiError> {
+        let cwd = request.cwd.as_deref().unwrap_or("/");
+        let exec_req = ExecRequest {
+            command: vec![
+                "tar".into(),
+                "xzf".into(),
+                "-".into(),
+                "-C".into(),
+                cwd.into(),
+            ],
+        };
+        let mut client = self.client.clone();
+        let resp = client
+            .exec_sandbox(ProtoExec {
+                sandbox_id: sandbox_id.to_string(),
+                command: exec_req.command,
+                stdin: request.content,
+            })
+            .await
+            .map_err(grpc_to_api)?
+            .into_inner();
+
+        if resp.exit_code != 0 {
+            return Err(ApiError::ExecFailed {
+                detail: String::from_utf8_lossy(&resp.stderr).into_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn read_file(
+        &self,
+        sandbox_id: &SandboxId,
+        request: ReadFileRequest,
+    ) -> Result<Vec<u8>, ApiError> {
+        let path = match &request.cwd {
+            Some(cwd) => format!("{}/{}", cwd.trim_end_matches('/'), request.path.trim_start_matches('/')),
+            None => request.path.clone(),
+        };
+        let mut client = self.client.clone();
+        let resp = client
+            .exec_sandbox(ProtoExec {
+                sandbox_id: sandbox_id.to_string(),
+                command: vec!["cat".into(), "--".into(), path],
+                stdin: vec![],
+            })
+            .await
+            .map_err(grpc_to_api)?
+            .into_inner();
+
+        if resp.exit_code != 0 {
+            return Err(ApiError::ExecFailed {
+                detail: String::from_utf8_lossy(&resp.stderr).into_owned(),
+            });
+        }
+        Ok(resp.stdout)
     }
 }
 

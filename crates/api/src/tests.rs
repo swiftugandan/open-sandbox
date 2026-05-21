@@ -9,7 +9,10 @@ use open_sandbox_contracts::error::ApiError;
 use open_sandbox_contracts::types::SandboxId;
 
 use crate::router::build_router;
-use crate::service::{CreateRequest, ExecOutput, ExecRequest, SandboxInfo, SandboxService};
+use crate::service::{
+    CreateRequest, ExecOutput, ExecRequest, ReadFileRequest, SandboxInfo, SandboxService,
+    WriteFilesRequest,
+};
 
 struct MockService {
     sandbox: SandboxInfo,
@@ -66,6 +69,34 @@ impl SandboxService for MockService {
                 stdout: b"hello\n".to_vec(),
                 stderr: vec![],
             })
+        } else {
+            Err(ApiError::SandboxNotFound {
+                sandbox_id: sandbox_id.to_string(),
+            })
+        }
+    }
+
+    async fn write_files(
+        &self,
+        sandbox_id: &SandboxId,
+        _request: WriteFilesRequest,
+    ) -> Result<(), ApiError> {
+        if *sandbox_id == self.sandbox.sandbox_id {
+            Ok(())
+        } else {
+            Err(ApiError::SandboxNotFound {
+                sandbox_id: sandbox_id.to_string(),
+            })
+        }
+    }
+
+    async fn read_file(
+        &self,
+        sandbox_id: &SandboxId,
+        request: ReadFileRequest,
+    ) -> Result<Vec<u8>, ApiError> {
+        if *sandbox_id == self.sandbox.sandbox_id {
+            Ok(format!("contents of {}", request.path).into_bytes())
         } else {
             Err(ApiError::SandboxNotFound {
                 sandbox_id: sandbox_id.to_string(),
@@ -245,6 +276,18 @@ async fn create_sandbox_uses_defaults_for_omitted_fields() {
         async fn exec(&self, _: &SandboxId, _: ExecRequest) -> Result<ExecOutput, ApiError> {
             unreachable!()
         }
+
+        async fn write_files(&self, _: &SandboxId, _: WriteFilesRequest) -> Result<(), ApiError> {
+            unreachable!()
+        }
+
+        async fn read_file(
+            &self,
+            _: &SandboxId,
+            _: ReadFileRequest,
+        ) -> Result<Vec<u8>, ApiError> {
+            unreachable!()
+        }
     }
 
     let sandbox_id = SandboxId::new();
@@ -278,4 +321,116 @@ async fn create_sandbox_uses_defaults_for_omitted_fields() {
         open_sandbox_contracts::constants::DEFAULT_SANDBOX_MEMORY_BYTES
     );
     assert!(captured.env_vars.is_empty());
+}
+
+#[tokio::test]
+async fn write_files_returns_204() {
+    let svc = Arc::new(MockService::new());
+    let id = svc.sandbox.sandbox_id.to_string();
+    let app = build_router(svc);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/sandboxes/{id}/files/write"))
+        .header("content-type", "application/gzip")
+        .body(Body::from(vec![0x1f, 0x8b, 0x08]))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn write_files_returns_404_for_unknown_sandbox() {
+    let svc = Arc::new(MockService::new());
+    let app = build_router(svc);
+    let unknown_id = SandboxId::new().to_string();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/sandboxes/{unknown_id}/files/write"))
+        .header("content-type", "application/gzip")
+        .body(Body::from(vec![0x1f, 0x8b, 0x08]))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn write_files_with_cwd_header() {
+    let svc = Arc::new(MockService::new());
+    let id = svc.sandbox.sandbox_id.to_string();
+    let app = build_router(svc);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/sandboxes/{id}/files/write"))
+        .header("content-type", "application/gzip")
+        .header("x-cwd", "/app/src")
+        .body(Body::from(vec![0x1f, 0x8b, 0x08]))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn read_file_returns_octet_stream() {
+    let svc = Arc::new(MockService::new());
+    let id = svc.sandbox.sandbox_id.to_string();
+    let app = build_router(svc);
+
+    let req = json_request(
+        "POST",
+        &format!("/v1/sandboxes/{id}/files/read"),
+        serde_json::json!({"path": "/etc/hostname"}),
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"contents of /etc/hostname");
+}
+
+#[tokio::test]
+async fn read_file_returns_404_for_unknown_sandbox() {
+    let svc = Arc::new(MockService::new());
+    let app = build_router(svc);
+    let unknown_id = SandboxId::new().to_string();
+
+    let req = json_request(
+        "POST",
+        &format!("/v1/sandboxes/{unknown_id}/files/read"),
+        serde_json::json!({"path": "/etc/hostname"}),
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn read_file_with_cwd() {
+    let svc = Arc::new(MockService::new());
+    let id = svc.sandbox.sandbox_id.to_string();
+    let app = build_router(svc);
+
+    let req = json_request(
+        "POST",
+        &format!("/v1/sandboxes/{id}/files/read"),
+        serde_json::json!({"path": "main.rs", "cwd": "/app/src"}),
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"contents of main.rs");
 }
