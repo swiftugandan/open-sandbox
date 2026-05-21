@@ -152,10 +152,9 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                         heartbeat_monitor.record_heartbeat(agent_id);
 
                         let ack = HeartbeatAck {
-                            timestamp: prost_types::Timestamp::try_from(
+                            timestamp: Some(prost_types::Timestamp::from(
                                 std::time::SystemTime::now(),
-                            )
-                            .ok(),
+                            )),
                         };
                         let command = ControllerCommand {
                             payload: Some(controller_command::Payload::HeartbeatAck(ack)),

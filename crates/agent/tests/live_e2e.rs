@@ -131,10 +131,10 @@ impl TestPg {
 
     async fn wait_for_ready(url: &str) -> sqlx::PgPool {
         for attempt in 0..30 {
-            if let Ok(pool) = sqlx::PgPool::connect(url).await {
-                if sqlx::query("SELECT 1").execute(&pool).await.is_ok() {
-                    return pool;
-                }
+            if let Ok(pool) = sqlx::PgPool::connect(url).await
+                && sqlx::query("SELECT 1").execute(&pool).await.is_ok()
+            {
+                return pool;
             }
             if attempt == 29 {
                 panic!("postgres not ready after 15s");
