@@ -14,11 +14,14 @@ use open_sandbox_contracts::controller::{
 use open_sandbox_contracts::error::ControllerError;
 use open_sandbox_contracts::types::{AgentId, JoinToken, SandboxId};
 
+use crate::exec_broker::ExecBroker;
 use crate::heartbeat::HeartbeatMonitor;
 use crate::registry::{AgentRegistry, RegistrationResult};
 use crate::scheduler::{SandboxAssignment, SandboxRequirements, Scheduler};
 use crate::store::{AgentCapacity, ControllerStore};
 use crate::token::TokenValidator;
+
+use open_sandbox_contracts::types::RoutingEntry;
 
 type CommandSender = mpsc::Sender<Result<ControllerCommand, Status>>;
 
@@ -41,7 +44,7 @@ impl AgentConnections {
         self.senders.lock().unwrap().remove(agent_id);
     }
 
-    async fn send_command(
+    pub(crate) async fn send_command(
         &self,
         agent_id: &AgentId,
         command: ControllerCommand,
@@ -65,6 +68,7 @@ pub struct GrpcHandler<S: ControllerStore> {
     registry: Arc<AgentRegistry<S>>,
     heartbeat_monitor: Arc<HeartbeatMonitor>,
     connections: Arc<AgentConnections>,
+    exec_broker: Arc<ExecBroker>,
 }
 
 #[tonic::async_trait]
@@ -81,6 +85,7 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
         let registry = self.registry.clone();
         let heartbeat_monitor = self.heartbeat_monitor.clone();
         let connections = self.connections.clone();
+        let exec_broker = self.exec_broker.clone();
 
         tokio::spawn(async move {
             let mut registered_agent_id: Option<AgentId> = None;
@@ -164,9 +169,12 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                         }
                     }
 
+                    agent_message::Payload::ExecResult(result) => {
+                        let _ = exec_broker.deliver(result);
+                    }
+
                     agent_message::Payload::SandboxStatus(_)
-                    | agent_message::Payload::ResourceReport(_)
-                    | agent_message::Payload::ExecResult(_) => {}
+                    | agent_message::Payload::ResourceReport(_) => {}
                 }
             }
 
@@ -190,6 +198,7 @@ pub struct Controller<S: ControllerStore> {
     pub(crate) heartbeat_monitor: Arc<HeartbeatMonitor>,
     pub(crate) scheduler: Arc<Scheduler<S>>,
     pub(crate) connections: Arc<AgentConnections>,
+    pub(crate) exec_broker: Arc<ExecBroker>,
 }
 
 impl<S: ControllerStore + 'static> Controller<S> {
@@ -198,12 +207,18 @@ impl<S: ControllerStore + 'static> Controller<S> {
         let heartbeat_monitor = Arc::new(HeartbeatMonitor::new());
         let scheduler = Arc::new(Scheduler::new(store));
         let connections = Arc::new(AgentConnections::new());
+        let exec_broker = Arc::new(ExecBroker::new());
         Self {
             registry,
             heartbeat_monitor,
             scheduler,
             connections,
+            exec_broker,
         }
+    }
+
+    pub fn exec_broker(&self) -> Arc<ExecBroker> {
+        self.exec_broker.clone()
     }
 
     pub fn grpc_service(&self) -> ControllerServiceServer<GrpcHandler<S>> {
@@ -211,6 +226,7 @@ impl<S: ControllerStore + 'static> Controller<S> {
             registry: self.registry.clone(),
             heartbeat_monitor: self.heartbeat_monitor.clone(),
             connections: self.connections.clone(),
+            exec_broker: self.exec_broker.clone(),
         })
     }
 
@@ -240,6 +256,20 @@ impl<S: ControllerStore + 'static> Controller<S> {
             .await?;
 
         Ok(assignment)
+    }
+
+    pub async fn find_routing_entry(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<RoutingEntry>, ControllerError> {
+        self.scheduler.store().find_routing_entry(sandbox_id).await
+    }
+
+    pub async fn remove_routing_entry(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<(), ControllerError> {
+        self.scheduler.store().remove_routing_entry(sandbox_id).await
     }
 
     pub async fn sweep_dead_agents(&self) -> Vec<AgentId> {

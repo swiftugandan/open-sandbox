@@ -12,7 +12,10 @@ use open_sandbox_agent::proxy_client::ProxyConnection;
 use open_sandbox_agent::sandbox::SandboxManager;
 use open_sandbox_agent::tunnel::TunnelForwarder;
 
+use open_sandbox_api::grpc_service::GrpcSandboxService;
+use open_sandbox_api::router::build_router;
 use open_sandbox_controller::grpc::Controller;
+use open_sandbox_controller::management::management_service;
 use open_sandbox_controller::pg_store::PgStore;
 use open_sandbox_controller::token::TokenValidator;
 
@@ -24,7 +27,7 @@ use open_sandbox_proxy::routing_cache::RoutingCache;
 use open_sandbox_proxy::stream_mux::StreamMux;
 use open_sandbox_proxy::tunnel_pool::TunnelPool;
 
-use crate::cli::{AgentArgs, ControllerArgs, ProxyArgs};
+use crate::cli::{AgentArgs, ApiArgs, ControllerArgs, ProxyArgs};
 use crate::docker_runtime::DockerRuntime;
 use crate::http_client::ReqwestHttpClient;
 
@@ -50,22 +53,25 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
         expected: join_token,
     };
 
-    let controller = Controller::new(pg_store, validator);
-    let service = controller.grpc_service();
+    let controller = Arc::new(Controller::new(pg_store, validator));
+    let agent_service = controller.grpc_service();
+    let mgmt_service = management_service(controller.clone(), controller.exec_broker());
 
     let addr = format!("0.0.0.0:{}", args.grpc_port);
     let listener = TcpListener::bind(&addr).await?;
 
+    let sweep_controller = controller.clone();
     let sweep_interval = Duration::from_secs(args.sweep_interval);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(sweep_interval).await;
-            controller.sweep_dead_agents().await;
+            sweep_controller.sweep_dead_agents().await;
         }
     });
 
     tonic::transport::Server::builder()
-        .add_service(service)
+        .add_service(agent_service)
+        .add_service(mgmt_service)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal())
         .await?;
 
@@ -160,6 +166,22 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
         }
         () = shutdown_signal() => {}
     }
+
+    Ok(())
+}
+
+pub async fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let service = GrpcSandboxService::connect(&args.controller_url)
+        .await
+        .map_err(|e| format!("failed to connect to controller: {e}"))?;
+
+    let router = build_router(Arc::new(service));
+    let addr = format!("0.0.0.0:{}", args.port);
+    let listener = TcpListener::bind(&addr).await?;
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
     Ok(())
 }

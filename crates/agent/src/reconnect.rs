@@ -8,13 +8,19 @@ pub struct ExponentialBackoff {
     current: Duration,
 }
 
-impl ExponentialBackoff {
-    pub fn new() -> Self {
+impl Default for ExponentialBackoff {
+    fn default() -> Self {
         Self {
             base: RECONNECT_BASE_DELAY,
             max: RECONNECT_MAX_DELAY,
             current: RECONNECT_BASE_DELAY,
         }
+    }
+}
+
+impl ExponentialBackoff {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn next_delay(&mut self) -> Duration {

@@ -9,9 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 open-sandbox-contracts = { path = "../contracts" }
+open-sandbox-api = { path = "../api" }
 open-sandbox-controller = { path = "../controller" }
 open-sandbox-agent = { path = "../agent" }
 open-sandbox-proxy = { path = "../proxy" }
+axum = "0.8"
 bollard = "0.18"
 clap = { version = "4", features = ["derive", "env"] }
 http = "1"

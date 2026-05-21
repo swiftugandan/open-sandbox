@@ -14,11 +14,17 @@ pub struct TunnelPool {
     tunnels: Mutex<HashMap<AgentId, AgentTunnel>>,
 }
 
-impl TunnelPool {
-    pub fn new() -> Self {
+impl Default for TunnelPool {
+    fn default() -> Self {
         Self {
             tunnels: Mutex::new(HashMap::new()),
         }
+    }
+}
+
+impl TunnelPool {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn register(

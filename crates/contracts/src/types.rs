@@ -11,6 +11,12 @@ impl AgentId {
     }
 }
 
+impl Default for AgentId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl fmt::Display for AgentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -33,6 +39,12 @@ impl SandboxId {
 
     pub fn subdomain(&self) -> String {
         self.0.simple().to_string()[..12].to_string()
+    }
+}
+
+impl Default for SandboxId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

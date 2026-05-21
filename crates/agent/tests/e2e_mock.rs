@@ -184,7 +184,8 @@ impl ControllerService for MockController {
                             .unwrap()
                             .push((status.sandbox_id, status.state));
                     }
-                    agent_message::Payload::ResourceReport(_) => {}
+                    agent_message::Payload::ResourceReport(_)
+                    | agent_message::Payload::ExecResult(_) => {}
                 }
             }
         });

@@ -19,6 +19,8 @@ pub enum Command {
     Proxy(ProxyArgs),
     /// Start the agent and connect to a controller
     Agent(AgentArgs),
+    /// Start the REST API gateway
+    Api(ApiArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -64,4 +66,15 @@ pub struct AgentArgs {
     /// Proxy gRPC address for tunnel connections
     #[arg(long, default_value = "http://127.0.0.1:50052", env = "OPEN_SANDBOX_PROXY_URL")]
     pub proxy_url: String,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ApiArgs {
+    /// HTTP listen port for the REST API
+    #[arg(long, default_value_t = open_sandbox_contracts::constants::API_DEFAULT_PORT, env = "OPEN_SANDBOX_API_PORT")]
+    pub port: u16,
+
+    /// Controller gRPC address
+    #[arg(long, default_value = "http://127.0.0.1:50051", env = "OPEN_SANDBOX_CONTROLLER_URL")]
+    pub controller_url: String,
 }

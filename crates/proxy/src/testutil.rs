@@ -11,11 +11,17 @@ pub struct InMemoryRoutingStore {
     entries: std::sync::Arc<Mutex<HashMap<SandboxId, AgentId>>>,
 }
 
-impl InMemoryRoutingStore {
-    pub fn new() -> Self {
+impl Default for InMemoryRoutingStore {
+    fn default() -> Self {
         Self {
             entries: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+}
+
+impl InMemoryRoutingStore {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn add_entry(&self, sandbox_id: SandboxId, agent_id: AgentId) {

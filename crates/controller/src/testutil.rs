@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use open_sandbox_contracts::error::ControllerError;
-use open_sandbox_contracts::types::{AgentId, RoutingEntry};
+use open_sandbox_contracts::types::{AgentId, RoutingEntry, SandboxId};
 
 use crate::store::*;
 use crate::token::TokenValidator;
@@ -86,6 +86,30 @@ impl ControllerStore for InMemoryStore {
             .lock()
             .unwrap()
             .retain(|e| e.agent_id != *agent_id);
+        Ok(())
+    }
+
+    async fn find_routing_entry(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<RoutingEntry>, ControllerError> {
+        Ok(self
+            .routing
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.sandbox_id == *sandbox_id)
+            .cloned())
+    }
+
+    async fn remove_routing_entry(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<(), ControllerError> {
+        self.routing
+            .lock()
+            .unwrap()
+            .retain(|e| e.sandbox_id != *sandbox_id);
         Ok(())
     }
 }
