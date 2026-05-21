@@ -12,5 +12,8 @@ tokio-stream = "0.1"
 tonic = "0.12"
 uuid = { version = "1", features = ["v4"] }
 
+[features]
+testutil = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "test-util"] }

@@ -6,5 +6,5 @@ pub mod scheduler;
 pub mod grpc;
 pub mod pg_store;
 
-#[cfg(test)]
-pub(crate) mod testutil;
+#[cfg(any(test, feature = "testutil"))]
+pub mod testutil;

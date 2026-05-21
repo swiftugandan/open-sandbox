@@ -33,10 +33,15 @@ impl ContainerRuntime for DockerRuntime {
         config: ContainerConfig,
     ) -> Result<ContainerInfo, AgentError> {
         let sandbox_id_str = config.sandbox_id.to_string();
-        let container_port = format!("{}/tcp", config.exposed_port);
         let name = format!("sandbox-{sandbox_id_str}");
 
-        let docker_config = build_docker_config(&config, &sandbox_id_str, &container_port);
+        let port_hint = if config.exposed_port > 0 {
+            Some(format!("{}/tcp", config.exposed_port))
+        } else {
+            None
+        };
+
+        let docker_config = build_docker_config(&config, &sandbox_id_str);
         let options = CreateContainerOptions {
             name: name.as_str(),
             platform: None,
@@ -59,7 +64,7 @@ impl ContainerRuntime for DockerRuntime {
             .await
             .map_err(docker_err)?;
 
-        let host_port = extract_host_port(&inspect, &container_port)?;
+        let host_port = extract_host_port(&inspect, port_hint.as_deref())?;
 
         Ok(ContainerInfo {
             id: ContainerId(created.id),
@@ -151,7 +156,6 @@ impl ContainerRuntime for DockerRuntime {
 fn build_docker_config(
     config: &ContainerConfig,
     sandbox_id_str: &str,
-    container_port: &str,
 ) -> Config<String> {
     let nano_cpus = (config.cpu_limit_millicores as i64) * NANOCPUS_PER_MILLICPU;
 
@@ -174,10 +178,17 @@ fn build_docker_config(
         (LABEL_SANDBOX_ID.to_string(), sandbox_id_str.to_string()),
     ]);
 
+    let exposed_ports = if config.exposed_port > 0 {
+        let port_key = format!("{}/tcp", config.exposed_port);
+        Some(HashMap::from([(port_key, HashMap::new())]))
+    } else {
+        None
+    };
+
     Config::<String> {
         image: Some(config.image.clone()),
         labels: Some(labels),
-        exposed_ports: Some(HashMap::from([(container_port.to_string(), HashMap::new())])),
+        exposed_ports,
         host_config: Some(host_config),
         env: Some(env_vec),
         ..Default::default()
@@ -186,7 +197,7 @@ fn build_docker_config(
 
 fn extract_host_port(
     inspect: &bollard::models::ContainerInspectResponse,
-    container_port: &str,
+    port_hint: Option<&str>,
 ) -> Result<u16, AgentError> {
     let ports = inspect
         .network_settings
@@ -196,12 +207,14 @@ fn extract_host_port(
             detail: "no port mappings found".into(),
         })?;
 
-    let bindings = ports
-        .get(container_port)
-        .and_then(|b| b.as_ref())
-        .ok_or_else(|| AgentError::Docker {
-            detail: format!("no binding for {container_port}"),
-        })?;
+    let bindings = if let Some(key) = port_hint {
+        ports.get(key).and_then(|b| b.as_ref())
+    } else {
+        ports.values().find_map(|b| b.as_ref())
+    }
+    .ok_or_else(|| AgentError::Docker {
+        detail: "no port bindings available".into(),
+    })?;
 
     bindings
         .first()
