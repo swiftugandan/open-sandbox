@@ -52,6 +52,18 @@ pub struct ExecRequest {
     pub command: Vec<String>,
 }
 
+pub struct WriteFilesRequest {
+    pub content: Vec<u8>,
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ReadFileRequest {
+    pub path: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
 pub trait SandboxService: Send + Sync + 'static {
     fn create(
         &self,
@@ -63,14 +75,23 @@ pub trait SandboxService: Send + Sync + 'static {
         sandbox_id: &SandboxId,
     ) -> impl Future<Output = Result<SandboxInfo, ApiError>> + Send;
 
-    fn delete(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> impl Future<Output = Result<(), ApiError>> + Send;
+    fn delete(&self, sandbox_id: &SandboxId) -> impl Future<Output = Result<(), ApiError>> + Send;
 
     fn exec(
         &self,
         sandbox_id: &SandboxId,
         request: ExecRequest,
     ) -> impl Future<Output = Result<ExecOutput, ApiError>> + Send;
+
+    fn write_files(
+        &self,
+        sandbox_id: &SandboxId,
+        request: WriteFilesRequest,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    fn read_file(
+        &self,
+        sandbox_id: &SandboxId,
+        request: ReadFileRequest,
+    ) -> impl Future<Output = Result<Vec<u8>, ApiError>> + Send;
 }

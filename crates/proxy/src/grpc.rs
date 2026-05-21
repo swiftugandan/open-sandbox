@@ -5,9 +5,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use open_sandbox_contracts::proxy::{
-    tunnel_response,
+    TunnelRequest, TunnelResponse, tunnel_response,
     tunnel_service_server::{TunnelService, TunnelServiceServer},
-    TunnelRequest, TunnelResponse,
 };
 use open_sandbox_contracts::types::AgentId;
 
@@ -94,15 +93,10 @@ pub fn tunnel_service(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use open_sandbox_contracts::proxy::{
-        tunnel_service_client::TunnelServiceClient, TunnelReady,
-    };
+    use open_sandbox_contracts::proxy::{TunnelReady, tunnel_service_client::TunnelServiceClient};
     use tokio_stream::wrappers::TcpListenerStream;
 
-    async fn start_proxy_grpc(
-        mux: Arc<StreamMux>,
-        pool: Arc<TunnelPool>,
-    ) -> String {
+    async fn start_proxy_grpc(mux: Arc<StreamMux>, pool: Arc<TunnelPool>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
 

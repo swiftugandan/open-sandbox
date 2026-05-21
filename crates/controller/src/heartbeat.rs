@@ -47,8 +47,8 @@ impl HeartbeatMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use open_sandbox_contracts::constants::DEAD_AGENT_TIMEOUT;
+    use std::time::Duration;
 
     #[tokio::test(start_paused = true)]
     async fn agent_with_recent_heartbeat_is_alive() {

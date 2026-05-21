@@ -27,12 +27,13 @@ impl HttpClient for ReqwestHttpClient {
     ) -> Result<ForwardResponse, AgentError> {
         let url = format!("http://127.0.0.1:{port}{}", request.uri);
 
-        let method: reqwest::Method = request
-            .method
-            .parse()
-            .map_err(|e: http::method::InvalidMethod| AgentError::Internal {
-                detail: e.to_string(),
-            })?;
+        let method: reqwest::Method =
+            request
+                .method
+                .parse()
+                .map_err(|e: http::method::InvalidMethod| AgentError::Internal {
+                    detail: e.to_string(),
+                })?;
 
         let mut builder = self.client.request(method, &url);
         for (key, value) in &request.headers {

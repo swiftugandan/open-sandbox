@@ -183,10 +183,7 @@ impl ControllerStore for PgStore {
         }))
     }
 
-    async fn remove_routing_entry(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> Result<(), ControllerError> {
+    async fn remove_routing_entry(&self, sandbox_id: &SandboxId) -> Result<(), ControllerError> {
         sqlx::query("DELETE FROM routing_entries WHERE sandbox_id = $1")
             .bind(sandbox_id.0)
             .execute(&self.pool)

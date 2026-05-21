@@ -25,6 +25,13 @@ pub struct ContainerInfo {
     pub running: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExecOutput {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
 pub trait ContainerRuntime: Send + Sync {
     fn create_and_start(
         &self,
@@ -40,4 +47,11 @@ pub trait ContainerRuntime: Send + Sync {
     fn list_sandbox_containers(
         &self,
     ) -> impl Future<Output = Result<Vec<ContainerInfo>, AgentError>> + Send;
+
+    fn exec(
+        &self,
+        id: &ContainerId,
+        command: Vec<String>,
+        stdin: Vec<u8>,
+    ) -> impl Future<Output = Result<ExecOutput, AgentError>> + Send;
 }

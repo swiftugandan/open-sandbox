@@ -5,7 +5,7 @@ use open_sandbox_contracts::controller::{SandboxState, StartSandbox, StopSandbox
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
-use crate::container::{ContainerConfig, ContainerId, ContainerRuntime};
+use crate::container::{ContainerConfig, ContainerId, ContainerRuntime, ExecOutput};
 
 fn parse_sandbox_id(raw: &str) -> Result<SandboxId, AgentError> {
     uuid::Uuid::parse_str(raw)
@@ -111,6 +111,25 @@ impl<R: ContainerRuntime> SandboxManager<R> {
             .ok_or_else(|| AgentError::SandboxNotFound {
                 sandbox_id: sandbox_id.to_string(),
             })
+    }
+
+    pub async fn exec_sandbox(
+        &self,
+        sandbox_id: &SandboxId,
+        command: Vec<String>,
+        stdin: Vec<u8>,
+    ) -> Result<ExecOutput, AgentError> {
+        let entry = self
+            .sandboxes
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .cloned()
+            .ok_or_else(|| AgentError::SandboxNotFound {
+                sandbox_id: sandbox_id.to_string(),
+            })?;
+
+        self.runtime.exec(&entry.container_id, command, stdin).await
     }
 
     pub async fn reconcile(&self) -> Result<Vec<SandboxEntry>, AgentError> {
@@ -285,6 +304,63 @@ mod tests {
             .unwrap();
 
         assert_eq!(manager.list_sandboxes().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exec_sandbox_runs_command() {
+        let runtime = Arc::new(MockContainerRuntime::new());
+        let manager = SandboxManager::new(runtime);
+        let sandbox_id = SandboxId::new();
+
+        manager
+            .start_sandbox(start_cmd(&sandbox_id, "nginx:latest"))
+            .await
+            .unwrap();
+
+        let output = manager
+            .exec_sandbox(&sandbox_id, vec!["echo".into(), "hello".into()], vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, b"echo hello");
+    }
+
+    #[tokio::test]
+    async fn exec_sandbox_pipes_stdin() {
+        let runtime = Arc::new(MockContainerRuntime::new());
+        let manager = SandboxManager::new(runtime);
+        let sandbox_id = SandboxId::new();
+
+        manager
+            .start_sandbox(start_cmd(&sandbox_id, "nginx:latest"))
+            .await
+            .unwrap();
+
+        let stdin_data = b"tar-data-here".to_vec();
+        let output = manager
+            .exec_sandbox(
+                &sandbox_id,
+                vec!["tar".into(), "xzf".into(), "-".into()],
+                stdin_data,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, b"received 13 bytes");
+    }
+
+    #[tokio::test]
+    async fn exec_sandbox_unknown_returns_error() {
+        let runtime = Arc::new(MockContainerRuntime::new());
+        let manager = SandboxManager::new(runtime);
+
+        let result = manager
+            .exec_sandbox(&SandboxId::new(), vec!["echo".into()], vec![])
+            .await;
+
+        assert!(matches!(result, Err(AgentError::SandboxNotFound { .. })));
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use open_sandbox_contracts::controller::{SandboxConfig, StartSandbox};
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
-use crate::container::{ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime};
+use crate::container::{ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOutput};
 use crate::tunnel::{ForwardRequest, ForwardResponse, HttpClient};
 
 pub struct MockContainerRuntime {
@@ -69,6 +69,24 @@ impl ContainerRuntime for MockContainerRuntime {
     async fn list_sandbox_containers(&self) -> Result<Vec<ContainerInfo>, AgentError> {
         Ok(self.existing.lock().unwrap().clone())
     }
+
+    async fn exec(
+        &self,
+        _id: &ContainerId,
+        command: Vec<String>,
+        stdin: Vec<u8>,
+    ) -> Result<ExecOutput, AgentError> {
+        let stdout = if !stdin.is_empty() {
+            format!("received {} bytes", stdin.len()).into_bytes()
+        } else {
+            command.join(" ").into_bytes()
+        };
+        Ok(ExecOutput {
+            exit_code: 0,
+            stdout,
+            stderr: vec![],
+        })
+    }
 }
 
 pub struct FailingContainerRuntime;
@@ -95,6 +113,17 @@ impl ContainerRuntime for FailingContainerRuntime {
 
     async fn list_sandbox_containers(&self) -> Result<Vec<ContainerInfo>, AgentError> {
         Ok(Vec::new())
+    }
+
+    async fn exec(
+        &self,
+        _id: &ContainerId,
+        _command: Vec<String>,
+        _stdin: Vec<u8>,
+    ) -> Result<ExecOutput, AgentError> {
+        Err(AgentError::Docker {
+            detail: "mock docker failure".into(),
+        })
     }
 }
 

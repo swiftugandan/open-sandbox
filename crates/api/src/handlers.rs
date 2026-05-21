@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 
 use open_sandbox_contracts::types::SandboxId;
 
-use crate::service::{CreateRequest, ExecRequest, SandboxService};
+use crate::service::{
+    CreateRequest, ExecRequest, ReadFileRequest, SandboxService, WriteFilesRequest,
+};
 
 pub type AppState<S> = Arc<S>;
 
@@ -64,18 +67,60 @@ pub async fn exec_sandbox<S: SandboxService>(
     }
 }
 
+pub async fn write_files<S: SandboxService>(
+    State(svc): State<AppState<S>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let sandbox_id = match parse_sandbox_id(&id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let cwd = headers
+        .get("x-cwd")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let request = WriteFilesRequest {
+        content: body.to_vec(),
+        cwd,
+    };
+    match svc.write_files(&sandbox_id, request).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => api_error_response(e),
+    }
+}
+
+pub async fn read_file<S: SandboxService>(
+    State(svc): State<AppState<S>>,
+    Path(id): Path<String>,
+    Json(body): Json<ReadFileRequest>,
+) -> Response {
+    let sandbox_id = match parse_sandbox_id(&id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    match svc.read_file(&sandbox_id, body).await {
+        Ok(content) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            content,
+        )
+            .into_response(),
+        Err(e) => api_error_response(e),
+    }
+}
+
 // axum handlers require Response as the error type; boxing adds allocation for no benefit
 #[allow(clippy::result_large_err)]
 fn parse_sandbox_id(id: &str) -> Result<SandboxId, Response> {
-    uuid::Uuid::parse_str(id)
-        .map(SandboxId::from)
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "invalid sandbox_id"})),
-            )
-                .into_response()
-        })
+    uuid::Uuid::parse_str(id).map(SandboxId::from).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid sandbox_id"})),
+        )
+            .into_response()
+    })
 }
 
 fn api_error_response(err: open_sandbox_contracts::error::ApiError) -> Response {

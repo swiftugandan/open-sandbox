@@ -1,0 +1,1 @@
+- [Autonomous progression](feedback_autonomous_progression.md) — proceed through TDD phases without stopping to ask; only pause on real blockers

@@ -1,7 +1,7 @@
-pub mod service;
+pub mod grpc_service;
 pub mod handlers;
 pub mod router;
-pub mod grpc_service;
+pub mod service;
 
 #[cfg(test)]
 mod tests;

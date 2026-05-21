@@ -72,14 +72,28 @@ mod tests {
         let store = Arc::new(InMemoryStore::new());
         let busy_agent = AgentRecord {
             agent_id: AgentId::new(),
-            capacity: AgentCapacity { cpu_cores: 4, memory_bytes: 8_000_000_000 },
-            available: AvailableResources { cpu_millicores: 2000, memory_bytes: 4_000_000_000, running_sandboxes: 2 },
+            capacity: AgentCapacity {
+                cpu_cores: 4,
+                memory_bytes: 8_000_000_000,
+            },
+            available: AvailableResources {
+                cpu_millicores: 2000,
+                memory_bytes: 4_000_000_000,
+                running_sandboxes: 2,
+            },
             state: AgentState::Active,
         };
         let idle_agent = AgentRecord {
             agent_id: AgentId::new(),
-            capacity: AgentCapacity { cpu_cores: 4, memory_bytes: 8_000_000_000 },
-            available: AvailableResources { cpu_millicores: 3500, memory_bytes: 7_000_000_000, running_sandboxes: 0 },
+            capacity: AgentCapacity {
+                cpu_cores: 4,
+                memory_bytes: 8_000_000_000,
+            },
+            available: AvailableResources {
+                cpu_millicores: 3500,
+                memory_bytes: 7_000_000_000,
+                running_sandboxes: 0,
+            },
             state: AgentState::Active,
         };
         let expected_id = idle_agent.agent_id.clone();
@@ -87,9 +101,15 @@ mod tests {
         store.save_agent(idle_agent).await.unwrap();
 
         let scheduler = Scheduler::new(store);
-        let requirements = SandboxRequirements { cpu_millicores: 1000, memory_bytes: 512_000_000 };
+        let requirements = SandboxRequirements {
+            cpu_millicores: 1000,
+            memory_bytes: 512_000_000,
+        };
 
-        let assignment = scheduler.assign_sandbox(SandboxId::new(), &requirements).await.unwrap();
+        let assignment = scheduler
+            .assign_sandbox(SandboxId::new(), &requirements)
+            .await
+            .unwrap();
         assert_eq!(assignment.agent_id, expected_id);
     }
 
@@ -97,9 +117,14 @@ mod tests {
     async fn no_agents_returns_error() {
         let store = Arc::new(InMemoryStore::new());
         let scheduler = Scheduler::new(store);
-        let requirements = SandboxRequirements { cpu_millicores: 1000, memory_bytes: 512_000_000 };
+        let requirements = SandboxRequirements {
+            cpu_millicores: 1000,
+            memory_bytes: 512_000_000,
+        };
 
-        let result = scheduler.assign_sandbox(SandboxId::new(), &requirements).await;
+        let result = scheduler
+            .assign_sandbox(SandboxId::new(), &requirements)
+            .await;
         assert!(matches!(result, Err(ControllerError::NoAvailableAgents)));
     }
 
@@ -108,16 +133,28 @@ mod tests {
         let store = Arc::new(InMemoryStore::new());
         let small_agent = AgentRecord {
             agent_id: AgentId::new(),
-            capacity: AgentCapacity { cpu_cores: 1, memory_bytes: 1_000_000_000 },
-            available: AvailableResources { cpu_millicores: 500, memory_bytes: 256_000_000, running_sandboxes: 1 },
+            capacity: AgentCapacity {
+                cpu_cores: 1,
+                memory_bytes: 1_000_000_000,
+            },
+            available: AvailableResources {
+                cpu_millicores: 500,
+                memory_bytes: 256_000_000,
+                running_sandboxes: 1,
+            },
             state: AgentState::Active,
         };
         store.save_agent(small_agent).await.unwrap();
 
         let scheduler = Scheduler::new(store);
-        let requirements = SandboxRequirements { cpu_millicores: 1000, memory_bytes: 512_000_000 };
+        let requirements = SandboxRequirements {
+            cpu_millicores: 1000,
+            memory_bytes: 512_000_000,
+        };
 
-        let result = scheduler.assign_sandbox(SandboxId::new(), &requirements).await;
+        let result = scheduler
+            .assign_sandbox(SandboxId::new(), &requirements)
+            .await;
         assert!(matches!(result, Err(ControllerError::NoAvailableAgents)));
     }
 
@@ -126,8 +163,15 @@ mod tests {
         let store = Arc::new(InMemoryStore::new());
         let agent = AgentRecord {
             agent_id: AgentId::new(),
-            capacity: AgentCapacity { cpu_cores: 4, memory_bytes: 8_000_000_000 },
-            available: AvailableResources { cpu_millicores: 4000, memory_bytes: 8_000_000_000, running_sandboxes: 0 },
+            capacity: AgentCapacity {
+                cpu_cores: 4,
+                memory_bytes: 8_000_000_000,
+            },
+            available: AvailableResources {
+                cpu_millicores: 4000,
+                memory_bytes: 8_000_000_000,
+                running_sandboxes: 0,
+            },
             state: AgentState::Active,
         };
         let agent_id = agent.agent_id.clone();
@@ -135,9 +179,15 @@ mod tests {
 
         let scheduler = Scheduler::new(store.clone());
         let sandbox_id = SandboxId::new();
-        let requirements = SandboxRequirements { cpu_millicores: 1000, memory_bytes: 512_000_000 };
+        let requirements = SandboxRequirements {
+            cpu_millicores: 1000,
+            memory_bytes: 512_000_000,
+        };
 
-        scheduler.assign_sandbox(sandbox_id.clone(), &requirements).await.unwrap();
+        scheduler
+            .assign_sandbox(sandbox_id.clone(), &requirements)
+            .await
+            .unwrap();
 
         let entries = store.routing_entries_for_agent(&agent_id);
         assert_eq!(entries.len(), 1);

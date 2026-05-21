@@ -3,25 +3,22 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 
-use open_sandbox_contracts::proxy::{
-    tunnel_response, tunnel_service_client::TunnelServiceClient, HttpResponse, StreamClose,
-    TunnelReady, TunnelResponse,
-};
 use open_sandbox_contracts::proxy::tunnel_request;
+use open_sandbox_contracts::proxy::{
+    HttpResponse, StreamClose, TunnelReady, TunnelResponse, tunnel_response,
+    tunnel_service_client::TunnelServiceClient,
+};
 use open_sandbox_contracts::types::{AgentId, SandboxId};
 
 use open_sandbox_proxy::grpc::tunnel_service;
 use open_sandbox_proxy::http_server::HttpServer;
-use open_sandbox_proxy::routing_cache::RoutingCache;
 use open_sandbox_proxy::router::Router;
+use open_sandbox_proxy::routing_cache::RoutingCache;
 use open_sandbox_proxy::stream_mux::StreamMux;
 use open_sandbox_proxy::testutil::InMemoryRoutingStore;
 use open_sandbox_proxy::tunnel_pool::TunnelPool;
 
-async fn start_proxy(
-    pool: Arc<TunnelPool>,
-    mux: Arc<StreamMux>,
-) -> String {
+async fn start_proxy(pool: Arc<TunnelPool>, mux: Arc<StreamMux>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("http://{}", listener.local_addr().unwrap());
 
@@ -90,7 +87,13 @@ async fn full_request_routing_through_mock_agent() {
 
     let route_handle = tokio::spawn(async move {
         router
-            .route_request(&host, "GET".into(), "/hello".into(), Default::default(), vec![])
+            .route_request(
+                &host,
+                "GET".into(),
+                "/hello".into(),
+                Default::default(),
+                vec![],
+            )
             .await
     });
 
@@ -275,7 +278,13 @@ async fn two_agents_serve_different_sandboxes() {
         let router = router.clone();
         tokio::spawn(async move {
             router
-                .route_request(&host_a, "GET".into(), "/a".into(), Default::default(), vec![])
+                .route_request(
+                    &host_a,
+                    "GET".into(),
+                    "/a".into(),
+                    Default::default(),
+                    vec![],
+                )
                 .await
         })
     };
@@ -284,7 +293,13 @@ async fn two_agents_serve_different_sandboxes() {
         let router = router.clone();
         tokio::spawn(async move {
             router
-                .route_request(&host_b, "GET".into(), "/b".into(), Default::default(), vec![])
+                .route_request(
+                    &host_b,
+                    "GET".into(),
+                    "/b".into(),
+                    Default::default(),
+                    vec![],
+                )
                 .await
         })
     };
@@ -340,9 +355,7 @@ async fn http_ingress_routes_through_grpc_tunnel_to_mock_agent() {
     let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_addr = http_listener.local_addr().unwrap();
 
-    let server_handle = tokio::spawn(async move {
-        http_server.run(http_listener).await
-    });
+    let server_handle = tokio::spawn(async move { http_server.run(http_listener).await });
 
     let agent_handle = tokio::spawn(async move {
         while let Ok(Some(req)) = agent_rx.message().await {
@@ -404,9 +417,7 @@ async fn stream_close_returns_502_immediately() {
     let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_addr = http_listener.local_addr().unwrap();
 
-    let server_handle = tokio::spawn(async move {
-        http_server.run(http_listener).await
-    });
+    let server_handle = tokio::spawn(async move { http_server.run(http_listener).await });
 
     let agent_handle = tokio::spawn(async move {
         if let Ok(Some(req)) = agent_rx.message().await {

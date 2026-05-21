@@ -27,11 +27,7 @@ impl TunnelPool {
         Self::default()
     }
 
-    pub fn register(
-        &self,
-        agent_id: AgentId,
-        request_tx: mpsc::Sender<TunnelRequest>,
-    ) {
+    pub fn register(&self, agent_id: AgentId, request_tx: mpsc::Sender<TunnelRequest>) {
         self.tunnels
             .lock()
             .unwrap()

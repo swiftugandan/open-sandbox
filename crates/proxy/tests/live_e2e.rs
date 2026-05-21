@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio_stream::wrappers::TcpListenerStream;
@@ -24,8 +24,8 @@ use open_sandbox_controller::token::TokenValidator;
 use open_sandbox_proxy::grpc::tunnel_service;
 use open_sandbox_proxy::http_server::HttpServer;
 use open_sandbox_proxy::pg_store::PgRoutingStore;
-use open_sandbox_proxy::routing_cache::RoutingCache;
 use open_sandbox_proxy::router::Router;
+use open_sandbox_proxy::routing_cache::RoutingCache;
 use open_sandbox_proxy::stream_mux::StreamMux;
 use open_sandbox_proxy::tunnel_pool::TunnelPool;
 
@@ -71,6 +71,19 @@ impl ContainerRuntime for LiveMockRuntime {
 
     async fn list_sandbox_containers(&self) -> Result<Vec<ContainerInfo>, AgentError> {
         Ok(Vec::new())
+    }
+
+    async fn exec(
+        &self,
+        _id: &ContainerId,
+        _command: Vec<String>,
+        _stdin: Vec<u8>,
+    ) -> Result<open_sandbox_agent::container::ExecOutput, AgentError> {
+        Ok(open_sandbox_agent::container::ExecOutput {
+            exit_code: 0,
+            stdout: vec![],
+            stderr: vec![],
+        })
     }
 }
 
@@ -199,7 +212,12 @@ async fn start_live_controller(pg: &TestPg) -> (Controller<PgStore>, String) {
 
 async fn start_live_proxy(
     pg: &TestPg,
-) -> (Arc<TunnelPool>, Arc<StreamMux>, Arc<RoutingCache<PgRoutingStore>>, String) {
+) -> (
+    Arc<TunnelPool>,
+    Arc<StreamMux>,
+    Arc<RoutingCache<PgRoutingStore>>,
+    String,
+) {
     let routing_store = PgRoutingStore::new(pg.pool.clone());
     let cache = Arc::new(RoutingCache::new(routing_store));
     let pool = Arc::new(TunnelPool::new());
@@ -288,7 +306,13 @@ async fn live_full_request_flow_through_real_proxy() {
     let host = format!("{}.sandbox.example.com", sandbox_id.subdomain());
 
     let result = router
-        .route_request(&host, "GET".into(), "/live-test".into(), Default::default(), vec![])
+        .route_request(
+            &host,
+            "GET".into(),
+            "/live-test".into(),
+            Default::default(),
+            vec![],
+        )
         .await;
 
     let response = result.expect("routing should succeed");
@@ -429,9 +453,7 @@ async fn live_http_ingress_end_to_end() {
     let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_addr = http_listener.local_addr().unwrap();
 
-    let server_handle = tokio::spawn(async move {
-        http_server.run(http_listener).await
-    });
+    let server_handle = tokio::spawn(async move { http_server.run(http_listener).await });
 
     let host = format!("{}.sandbox.example.com", sandbox_id.subdomain());
     let client = reqwest::Client::builder()

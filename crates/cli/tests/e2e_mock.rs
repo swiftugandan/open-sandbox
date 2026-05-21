@@ -138,9 +138,7 @@ async fn agent_connects_to_mock_controller_and_proxy() {
         proxy_url: proxy_addr,
     };
 
-    let handle = tokio::spawn(async move {
-        run::run_agent(args).await.map_err(|e| e.to_string())
-    });
+    let handle = tokio::spawn(async move { run::run_agent(args).await.map_err(|e| e.to_string()) });
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -164,5 +162,8 @@ async fn agent_fails_gracefully_with_unreachable_controller() {
     };
 
     let result = run::run_agent(args).await;
-    assert!(result.is_err(), "agent should return error when controller is unreachable");
+    assert!(
+        result.is_err(),
+        "agent should return error when controller is unreachable"
+    );
 }

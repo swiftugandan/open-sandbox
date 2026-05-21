@@ -33,7 +33,10 @@ impl InMemoryStore {
 
 impl ControllerStore for InMemoryStore {
     async fn save_agent(&self, record: AgentRecord) -> Result<(), ControllerError> {
-        self.agents.lock().unwrap().insert(record.agent_id.clone(), record);
+        self.agents
+            .lock()
+            .unwrap()
+            .insert(record.agent_id.clone(), record);
         Ok(())
     }
 
@@ -102,10 +105,7 @@ impl ControllerStore for InMemoryStore {
             .cloned())
     }
 
-    async fn remove_routing_entry(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> Result<(), ControllerError> {
+    async fn remove_routing_entry(&self, sandbox_id: &SandboxId) -> Result<(), ControllerError> {
         self.routing
             .lock()
             .unwrap()
