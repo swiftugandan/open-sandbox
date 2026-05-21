@@ -1,0 +1,20 @@
+[package]
+name = "open-sandbox"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "open-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+open-sandbox-contracts = { path = "../contracts" }
+open-sandbox-controller = { path = "../controller" }
+open-sandbox-agent = { path = "../agent" }
+open-sandbox-proxy = { path = "../proxy" }
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
