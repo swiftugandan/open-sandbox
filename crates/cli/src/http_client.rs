@@ -5,6 +5,12 @@ pub struct ReqwestHttpClient {
     client: reqwest::Client,
 }
 
+impl Default for ReqwestHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReqwestHttpClient {
     pub fn new() -> Self {
         Self {

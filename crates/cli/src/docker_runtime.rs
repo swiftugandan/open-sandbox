@@ -5,7 +5,7 @@ use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
     StopContainerOptions,
 };
-use bollard::models::{HostConfig, PortBinding};
+use bollard::models::HostConfig;
 
 use open_sandbox_agent::container::{ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime};
 use open_sandbox_contracts::error::AgentError;
@@ -14,6 +14,7 @@ use open_sandbox_contracts::types::SandboxId;
 const LABEL_MANAGED_BY: &str = "open-sandbox.managed-by";
 const LABEL_MANAGED_BY_VALUE: &str = "open-sandbox-agent";
 const LABEL_SANDBOX_ID: &str = "open-sandbox.sandbox-id";
+const NANOCPUS_PER_MILLICPU: i64 = 1_000_000;
 
 pub struct DockerRuntime {
     client: bollard::Docker,
@@ -21,10 +22,7 @@ pub struct DockerRuntime {
 
 impl DockerRuntime {
     pub fn connect() -> Result<Self, AgentError> {
-        let client =
-            bollard::Docker::connect_with_local_defaults().map_err(|e| AgentError::Docker {
-                detail: e.to_string(),
-            })?;
+        let client = bollard::Docker::connect_with_local_defaults().map_err(docker_err)?;
         Ok(Self { client })
     }
 }
@@ -36,70 +34,35 @@ impl ContainerRuntime for DockerRuntime {
     ) -> Result<ContainerInfo, AgentError> {
         let sandbox_id_str = config.sandbox_id.to_string();
         let container_port = format!("{}/tcp", config.exposed_port);
-
-        let nano_cpus = (config.cpu_limit_millicores as i64) * 1_000_000;
-
-        let host_config = HostConfig {
-            memory: Some(config.memory_limit_bytes as i64),
-            nano_cpus: Some(nano_cpus),
-            publish_all_ports: Some(true),
-            ..Default::default()
-        };
-
-        let mut env_vec: Vec<String> = config
-            .env_vars
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
-        env_vec.sort();
-
-        let labels = HashMap::from([
-            (LABEL_MANAGED_BY.to_string(), LABEL_MANAGED_BY_VALUE.to_string()),
-            (LABEL_SANDBOX_ID.to_string(), sandbox_id_str.clone()),
-        ]);
-
-        let container_config = Config::<String> {
-            image: Some(config.image.clone()),
-            labels: Some(labels),
-            exposed_ports: Some(HashMap::from([(container_port.clone(), HashMap::new())])),
-            host_config: Some(host_config),
-            env: Some(env_vec),
-            ..Default::default()
-        };
-
         let name = format!("sandbox-{sandbox_id_str}");
+
+        let docker_config = build_docker_config(&config, &sandbox_id_str, &container_port);
         let options = CreateContainerOptions {
             name: name.as_str(),
             platform: None,
         };
 
-        let create_response = self
+        let created = self
             .client
-            .create_container(Some(options), container_config)
+            .create_container(Some(options), docker_config)
             .await
-            .map_err(|e| AgentError::Docker {
-                detail: e.to_string(),
-            })?;
+            .map_err(docker_err)?;
 
         self.client
-            .start_container::<String>(&create_response.id, None)
+            .start_container::<String>(&created.id, None)
             .await
-            .map_err(|e| AgentError::Docker {
-                detail: e.to_string(),
-            })?;
+            .map_err(docker_err)?;
 
         let inspect = self
             .client
-            .inspect_container(&create_response.id, None)
+            .inspect_container(&created.id, None)
             .await
-            .map_err(|e| AgentError::Docker {
-                detail: e.to_string(),
-            })?;
+            .map_err(docker_err)?;
 
         let host_port = extract_host_port(&inspect, &container_port)?;
 
         Ok(ContainerInfo {
-            id: ContainerId(create_response.id),
+            id: ContainerId(created.id),
             sandbox_id: config.sandbox_id,
             host_port,
             running: true,
@@ -114,8 +77,7 @@ impl ContainerRuntime for DockerRuntime {
         let stop_opts = StopContainerOptions {
             t: timeout.as_secs() as i64,
         };
-
-        // Stop may fail if already stopped — that's fine
+        // Stop may fail if already stopped
         let _ = self.client.stop_container(&id.0, Some(stop_opts)).await;
 
         let remove_opts = RemoveContainerOptions {
@@ -123,13 +85,10 @@ impl ContainerRuntime for DockerRuntime {
             v: true,
             ..Default::default()
         };
-
         self.client
             .remove_container(&id.0, Some(remove_opts))
             .await
-            .map_err(|e| AgentError::Docker {
-                detail: e.to_string(),
-            })?;
+            .map_err(docker_err)?;
 
         Ok(())
     }
@@ -146,21 +105,17 @@ impl ContainerRuntime for DockerRuntime {
             .client
             .list_containers(Some(options))
             .await
-            .map_err(|e| AgentError::Docker {
-                detail: e.to_string(),
-            })?;
+            .map_err(docker_err)?;
 
         let mut result = Vec::with_capacity(containers.len());
         for container in containers {
-            let id = match container.id {
-                Some(ref id) => id.clone(),
-                None => continue,
+            let Some(ref id) = container.id else {
+                continue;
             };
 
             let labels = container.labels.unwrap_or_default();
-            let sandbox_id_str = match labels.get(LABEL_SANDBOX_ID) {
-                Some(s) => s,
-                None => continue,
+            let Some(sandbox_id_str) = labels.get(LABEL_SANDBOX_ID) else {
+                continue;
             };
 
             let sandbox_id = uuid::Uuid::parse_str(sandbox_id_str)
@@ -179,10 +134,10 @@ impl ContainerRuntime for DockerRuntime {
                 .unwrap_or_default()
                 .iter()
                 .find_map(|p| p.public_port)
-                .unwrap_or(0) as u16;
+                .unwrap_or(0);
 
             result.push(ContainerInfo {
-                id: ContainerId(id),
+                id: ContainerId(id.clone()),
                 sandbox_id,
                 host_port,
                 running,
@@ -190,6 +145,42 @@ impl ContainerRuntime for DockerRuntime {
         }
 
         Ok(result)
+    }
+}
+
+fn build_docker_config(
+    config: &ContainerConfig,
+    sandbox_id_str: &str,
+    container_port: &str,
+) -> Config<String> {
+    let nano_cpus = (config.cpu_limit_millicores as i64) * NANOCPUS_PER_MILLICPU;
+
+    let host_config = HostConfig {
+        memory: Some(config.memory_limit_bytes as i64),
+        nano_cpus: Some(nano_cpus),
+        publish_all_ports: Some(true),
+        ..Default::default()
+    };
+
+    let mut env_vec: Vec<String> = config
+        .env_vars
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    env_vec.sort();
+
+    let labels = HashMap::from([
+        (LABEL_MANAGED_BY.to_string(), LABEL_MANAGED_BY_VALUE.to_string()),
+        (LABEL_SANDBOX_ID.to_string(), sandbox_id_str.to_string()),
+    ]);
+
+    Config::<String> {
+        image: Some(config.image.clone()),
+        labels: Some(labels),
+        exposed_ports: Some(HashMap::from([(container_port.to_string(), HashMap::new())])),
+        host_config: Some(host_config),
+        env: Some(env_vec),
+        ..Default::default()
     }
 }
 
@@ -205,7 +196,7 @@ fn extract_host_port(
             detail: "no port mappings found".into(),
         })?;
 
-    let bindings: &Vec<PortBinding> = ports
+    let bindings = ports
         .get(container_port)
         .and_then(|b| b.as_ref())
         .ok_or_else(|| AgentError::Docker {
@@ -219,6 +210,12 @@ fn extract_host_port(
         .ok_or_else(|| AgentError::Docker {
             detail: "could not parse host port".into(),
         })
+}
+
+fn docker_err(e: bollard::errors::Error) -> AgentError {
+    AgentError::Docker {
+        detail: e.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -249,7 +246,6 @@ mod tests {
         assert!(info.host_port > 0);
         assert!(!info.id.0.is_empty());
 
-        // cleanup
         let _ = runtime
             .stop_and_remove(&info.id, Duration::from_secs(5))
             .await;
@@ -284,7 +280,6 @@ mod tests {
         let containers = runtime.list_sandbox_containers().await.unwrap();
         assert!(containers.iter().any(|c| c.sandbox_id == sandbox_id));
 
-        // cleanup
         let _ = runtime
             .stop_and_remove(&info.id, Duration::from_secs(5))
             .await;
@@ -312,7 +307,6 @@ mod tests {
         assert_eq!(host_config.memory, Some(256 * 1024 * 1024));
         assert_eq!(host_config.nano_cpus, Some(500_000_000));
 
-        // cleanup
         let _ = runtime
             .stop_and_remove(&info.id, Duration::from_secs(5))
             .await;
