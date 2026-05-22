@@ -6,7 +6,7 @@ COPY crates crates
 COPY proto proto
 RUN cargo build --release --bin open-sandbox
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/open-sandbox /usr/local/bin/
 ENTRYPOINT ["open-sandbox"]
