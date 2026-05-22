@@ -72,10 +72,16 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let _ = self
+            .controller
+            .save_sandbox_state(&sandbox_id, &assignment.agent_id, "creating")
+            .await;
+
         Ok(Response::new(CreateSandboxResponse {
             sandbox_id: sandbox_id.to_string(),
             subdomain: sandbox_id.subdomain(),
             agent_id: assignment.agent_id.to_string(),
+            status: "creating".into(),
         }))
     }
 
@@ -93,16 +99,21 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             .map_err(|e| Status::internal(e.to_string()))?;
 
         match entry {
-            Some(entry) => Ok(Response::new(GetSandboxResponse {
-                sandbox_id: entry.sandbox_id.to_string(),
-                agent_id: entry.agent_id.to_string(),
-                subdomain: entry.sandbox_id.subdomain(),
-                status: "running".into(),
-            })),
-            None => Err(Status::not_found(format!(
-                "sandbox {} not found",
-                req.sandbox_id
-            ))),
+            Some(entry) => {
+                let status = self
+                    .controller
+                    .get_sandbox_state(&sandbox_id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .unwrap_or_else(|| "running".into());
+                Ok(Response::new(GetSandboxResponse {
+                    sandbox_id: entry.sandbox_id.to_string(),
+                    agent_id: entry.agent_id.to_string(),
+                    subdomain: entry.sandbox_id.subdomain(),
+                    status,
+                }))
+            }
+            None => Err(Status::not_found(req.sandbox_id.clone())),
         }
     }
 
@@ -119,8 +130,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let entry = entry
-            .ok_or_else(|| Status::not_found(format!("sandbox {} not found", req.sandbox_id)))?;
+        let entry = entry.ok_or_else(|| Status::not_found(req.sandbox_id.clone()))?;
 
         let command = ControllerCommand {
             payload: Some(controller_command::Payload::StopSandbox(StopSandbox {
@@ -156,8 +166,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let entry = entry
-            .ok_or_else(|| Status::not_found(format!("sandbox {} not found", req.sandbox_id)))?;
+        let entry = entry.ok_or_else(|| Status::not_found(req.sandbox_id.clone()))?;
 
         let exec_id = uuid::Uuid::new_v4().to_string();
         let rx = self.exec_broker.register(exec_id.clone());
@@ -186,6 +195,10 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
                 Status::deadline_exceeded("exec timeout")
             })?
             .map_err(|_| Status::internal("exec result channel closed"))?;
+
+        if !result.error.is_empty() {
+            return Err(Status::internal(result.error));
+        }
 
         Ok(Response::new(ExecSandboxResponse {
             exit_code: result.exit_code,

@@ -10,6 +10,7 @@ use crate::token::TokenValidator;
 pub struct InMemoryStore {
     agents: Mutex<HashMap<AgentId, AgentRecord>>,
     routing: Mutex<Vec<RoutingEntry>>,
+    sandbox_states: Mutex<HashMap<SandboxId, String>>,
 }
 
 impl InMemoryStore {
@@ -17,6 +18,7 @@ impl InMemoryStore {
         Self {
             agents: Mutex::new(HashMap::new()),
             routing: Mutex::new(Vec::new()),
+            sandbox_states: Mutex::new(HashMap::new()),
         }
     }
 
@@ -111,6 +113,26 @@ impl ControllerStore for InMemoryStore {
             .unwrap()
             .retain(|e| e.sandbox_id != *sandbox_id);
         Ok(())
+    }
+
+    async fn save_sandbox_state(
+        &self,
+        sandbox_id: &SandboxId,
+        _agent_id: &AgentId,
+        state: &str,
+    ) -> Result<(), ControllerError> {
+        self.sandbox_states
+            .lock()
+            .unwrap()
+            .insert(sandbox_id.clone(), state.to_string());
+        Ok(())
+    }
+
+    async fn get_sandbox_state(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<String>, ControllerError> {
+        Ok(self.sandbox_states.lock().unwrap().get(sandbox_id).cloned())
     }
 }
 

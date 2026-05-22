@@ -160,7 +160,7 @@ async fn live_create_sandbox_through_api_to_real_agent() {
     assert_eq!(resp.status(), 201);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["sandbox_id"].is_string());
-    assert_eq!(body["status"], "running");
+    assert_eq!(body["status"], "creating");
 
     // Wait for agent to process StartSandbox
     tokio::time::sleep(Duration::from_secs(3)).await;

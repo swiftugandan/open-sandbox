@@ -32,3 +32,7 @@ pub const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 pub const PROXY_STARTUP_RETRY_ATTEMPTS: u32 = 15;
 
 pub const PROXY_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+pub const DEFAULT_WRITE_CWD: &str = "/home";
+
+pub const DEFAULT_SANDBOX_ENTRYPOINT: &[&str] = &["sleep", "infinity"];

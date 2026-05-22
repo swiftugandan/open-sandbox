@@ -3,19 +3,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use open_sandbox_agent_docker::DockerRuntime;
-use open_sandbox::http_client::ReqwestHttpClient;
 use open_sandbox_agent::container::{ContainerConfig, ContainerRuntime};
 use open_sandbox_agent::sandbox::SandboxManager;
-use open_sandbox_agent::tunnel::{ForwardRequest, TunnelForwarder};
 use open_sandbox_contracts::controller::{SandboxConfig, StartSandbox};
 use open_sandbox_contracts::types::SandboxId;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_lifecycle_create_request_stop() {
+async fn sandbox_lifecycle_create_exec_stop() {
     let runtime = Arc::new(DockerRuntime::connect().unwrap());
     let sandbox_manager = Arc::new(SandboxManager::new(runtime.clone()));
-    let http_client = Arc::new(ReqwestHttpClient::new());
-    let forwarder = TunnelForwarder::new(sandbox_manager.clone(), http_client);
 
     let sandbox_id = SandboxId::new();
     let start_cmd = StartSandbox {
@@ -35,24 +31,16 @@ async fn sandbox_lifecycle_create_request_stop() {
         open_sandbox_contracts::controller::SandboxState::Running
     );
 
-    // nginx needs a moment to accept connections
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let response = forwarder
-        .forward(
+    let output = sandbox_manager
+        .exec_sandbox(
             &sandbox_id,
-            ForwardRequest {
-                method: "GET".into(),
-                uri: "/".into(),
-                headers: HashMap::new(),
-                body: vec![],
-            },
+            vec!["echo".into(), "hello".into()],
+            vec![],
         )
         .await
         .unwrap();
-
-    assert_eq!(response.status_code, 200);
-    assert!(!response.body.is_empty());
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
 
     let entry = sandbox_manager.get_sandbox(&sandbox_id).unwrap();
     let _ = runtime

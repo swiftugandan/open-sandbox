@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::info;
 
 use open_sandbox_contracts::constants::HEARTBEAT_INTERVAL;
 use open_sandbox_contracts::controller::controller_command;
@@ -92,6 +93,8 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
             return Ok(());
         }
 
+        info!(agent_id = %self.agent_id, "registered with controller");
+
         let heartbeat_tx = outbound_tx.clone();
         let agent_id_hb = self.agent_id.clone();
         let heartbeat_handle = tokio::spawn(async move {
@@ -120,6 +123,7 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                 controller_command::Payload::HeartbeatAck(_) => {}
                 controller_command::Payload::StartSandbox(start) => {
                     let sandbox_id_str = start.sandbox_id.clone();
+                    info!(sandbox_id = %sandbox_id_str, "received start command");
                     let state = sandbox_manager.start_sandbox(start).await;
                     let (state_val, error_msg) = match state {
                         Ok(s) => (s as i32, String::new()),
@@ -130,15 +134,17 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                     };
                     let status = AgentMessage {
                         payload: Some(agent_message::Payload::SandboxStatus(SandboxStatus {
-                            sandbox_id: sandbox_id_str,
+                            sandbox_id: sandbox_id_str.clone(),
                             state: state_val,
                             error_message: error_msg,
                         })),
                     };
                     let _ = status_tx.send(status).await;
+                    info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
                 }
                 controller_command::Payload::StopSandbox(stop) => {
                     let sandbox_id_str = stop.sandbox_id.clone();
+                    info!(sandbox_id = %sandbox_id_str, "received stop command");
                     let state = sandbox_manager.stop_sandbox(stop).await;
                     let (state_val, error_msg) = match state {
                         Ok(s) => (s as i32, String::new()),
@@ -149,15 +155,17 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                     };
                     let status = AgentMessage {
                         payload: Some(agent_message::Payload::SandboxStatus(SandboxStatus {
-                            sandbox_id: sandbox_id_str,
+                            sandbox_id: sandbox_id_str.clone(),
                             state: state_val,
                             error_message: error_msg,
                         })),
                     };
                     let _ = status_tx.send(status).await;
+                    info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
                 }
                 controller_command::Payload::RegisterResponse(_) => {}
                 controller_command::Payload::Exec(exec) => {
+                    info!(sandbox_id = %exec.sandbox_id, exec_id = %exec.exec_id, "received exec command");
                     let mgr = sandbox_manager.clone();
                     let tx = status_tx.clone();
                     tokio::spawn(async move {
@@ -178,13 +186,15 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                                 exit_code: output.exit_code,
                                 stdout: output.stdout,
                                 stderr: output.stderr,
+                                error: String::new(),
                             },
                             Err(e) => ExecResult {
                                 sandbox_id: exec.sandbox_id,
                                 exec_id: exec.exec_id,
                                 exit_code: -1,
                                 stdout: vec![],
-                                stderr: e.to_string().into_bytes(),
+                                stderr: vec![],
+                                error: e.to_string(),
                             },
                         };
                         let msg = AgentMessage {

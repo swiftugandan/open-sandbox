@@ -20,6 +20,7 @@ message CreateSandboxResponse {
   string sandbox_id = 1;
   string subdomain = 2;
   string agent_id = 3;
+  string status = 4;
 }
 
 message GetSandboxRequest {

@@ -200,7 +200,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
     );
 
     let http_client = Arc::new(ReqwestHttpClient::new());
-    let forwarder = Arc::new(TunnelForwarder::new(sandbox_manager, http_client));
+    let forwarder = Arc::new(TunnelForwarder::new(sandbox_manager.clone(), http_client));
     let proxy_conn = ProxyConnection::new(agent_id, forwarder);
 
     let controller_url = args.controller_url.clone();
@@ -222,6 +222,22 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
             result??;
         }
         () = shutdown_signal() => {}
+    }
+
+    let sandboxes = sandbox_manager.list_sandboxes();
+    if !sandboxes.is_empty() {
+        warn!(count = sandboxes.len(), "stopping managed sandboxes");
+        for entry in &sandboxes {
+            let stop_cmd = open_sandbox_contracts::controller::StopSandbox {
+                sandbox_id: entry.sandbox_id.to_string(),
+                timeout_seconds: open_sandbox_contracts::constants::SANDBOX_STOP_TIMEOUT
+                    .as_secs() as u32,
+            };
+            match sandbox_manager.stop_sandbox(stop_cmd).await {
+                Ok(_) => info!(sandbox_id = %entry.sandbox_id, "stopped sandbox"),
+                Err(e) => warn!(sandbox_id = %entry.sandbox_id, error = %e, "failed to stop sandbox"),
+            }
+        }
     }
 
     info!("agent shut down");
@@ -248,7 +264,21 @@ pub async fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+    }
 }
 
 fn num_cpus() -> usize {

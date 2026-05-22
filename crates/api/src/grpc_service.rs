@@ -56,7 +56,7 @@ impl SandboxService for GrpcSandboxService {
             sandbox_id: parse_sandbox_id(&resp.sandbox_id)?,
             subdomain: resp.subdomain,
             agent_id: resp.agent_id,
-            status: "running".into(),
+            status: resp.status,
         })
     }
 
@@ -117,7 +117,10 @@ impl SandboxService for GrpcSandboxService {
         sandbox_id: &SandboxId,
         request: WriteFilesRequest,
     ) -> Result<WriteFilesResult, ApiError> {
-        let cwd = request.cwd.as_deref().unwrap_or("/");
+        let cwd = request
+            .cwd
+            .as_deref()
+            .unwrap_or(open_sandbox_contracts::constants::DEFAULT_WRITE_CWD);
         let exec_req = ExecRequest {
             command: vec![
                 "sh".into(),
@@ -163,7 +166,7 @@ impl SandboxService for GrpcSandboxService {
         let resp = client
             .exec_sandbox(ProtoExec {
                 sandbox_id: sandbox_id.to_string(),
-                command: vec!["cat".into(), "--".into(), path],
+                command: vec!["cat".into(), "--".into(), path.clone()],
                 stdin: vec![],
             })
             .await
@@ -171,8 +174,12 @@ impl SandboxService for GrpcSandboxService {
             .into_inner();
 
         if resp.exit_code != 0 {
+            let stderr = String::from_utf8_lossy(&resp.stderr);
+            if stderr.contains("No such file") {
+                return Err(ApiError::FileNotFound { path });
+            }
             return Err(ApiError::ExecFailed {
-                detail: String::from_utf8_lossy(&resp.stderr).into_owned(),
+                detail: stderr.into_owned(),
             });
         }
         Ok(resp.stdout)

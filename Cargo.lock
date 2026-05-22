@@ -2171,6 +2171,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
  "uuid",
 ]
 
@@ -2183,6 +2184,7 @@ dependencies = [
  "open-sandbox-agent",
  "open-sandbox-contracts",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -2239,7 +2241,7 @@ dependencies = [
 
 [[package]]
 name = "open-sandbox-contracts"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "prost",
  "prost-types",

@@ -29,6 +29,7 @@ impl SandboxManagementService for MockController {
             sandbox_id: self.sandbox_id.clone(),
             subdomain: self.subdomain.clone(),
             agent_id: "agent-mock".into(),
+            status: "creating".into(),
         }))
     }
 
@@ -152,7 +153,7 @@ async fn e2e_create_then_get_then_delete() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let created_id = body["sandbox_id"].as_str().unwrap().to_string();
     assert_eq!(created_id, sandbox_id.to_string());
-    assert_eq!(body["status"], "running");
+    assert_eq!(body["status"], "creating");
 
     let resp = client
         .get(format!("{api_url}/v1/sandboxes/{created_id}"))

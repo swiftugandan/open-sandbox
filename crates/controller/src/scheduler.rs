@@ -28,6 +28,10 @@ impl<S: ControllerStore> Scheduler<S> {
         &self.store
     }
 
+    pub fn store_arc(&self) -> Arc<S> {
+        self.store.clone()
+    }
+
     pub async fn assign_sandbox(
         &self,
         sandbox_id: SandboxId,

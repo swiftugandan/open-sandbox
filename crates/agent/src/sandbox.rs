@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tracing::{info, warn};
+
 use open_sandbox_contracts::controller::{SandboxState, StartSandbox, StopSandbox};
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
@@ -51,6 +53,7 @@ impl<R: ContainerRuntime> SandboxManager<R> {
 
         match self.runtime.create_and_start(container_config).await {
             Ok(info) => {
+                info!(sandbox_id = %sandbox_id, host_port = info.host_port, "sandbox started");
                 let entry = SandboxEntry {
                     sandbox_id: sandbox_id.clone(),
                     container_id: info.id,
@@ -60,7 +63,8 @@ impl<R: ContainerRuntime> SandboxManager<R> {
                 self.sandboxes.lock().unwrap().insert(sandbox_id, entry);
                 Ok(SandboxState::Running)
             }
-            Err(_) => {
+            Err(e) => {
+                warn!(sandbox_id = %sandbox_id, error = %e, "sandbox start failed");
                 let entry = SandboxEntry {
                     sandbox_id: sandbox_id.clone(),
                     container_id: ContainerId(String::new()),
@@ -91,6 +95,7 @@ impl<R: ContainerRuntime> SandboxManager<R> {
             .stop_and_remove(&entry.container_id, timeout)
             .await?;
         self.sandboxes.lock().unwrap().remove(&sandbox_id);
+        info!(sandbox_id = %sandbox_id, "sandbox stopped");
         Ok(SandboxState::Stopped)
     }
 

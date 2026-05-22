@@ -63,6 +63,7 @@ mod tests {
                 exit_code: 0,
                 stdout: b"ok".to_vec(),
                 stderr: vec![],
+            error: String::new(),
             })
             .unwrap();
 
@@ -80,6 +81,7 @@ mod tests {
             exit_code: 1,
             stdout: vec![],
             stderr: vec![],
+            error: String::new(),
         });
         assert!(result.is_err());
     }
@@ -96,6 +98,7 @@ mod tests {
             exit_code: 0,
             stdout: vec![],
             stderr: vec![],
+            error: String::new(),
         });
         assert!(result.is_err());
     }

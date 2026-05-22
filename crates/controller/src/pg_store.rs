@@ -44,6 +44,20 @@ impl PgStore {
             detail: e.to_string(),
         })?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS sandboxes (
+                sandbox_id UUID PRIMARY KEY,
+                agent_id UUID NOT NULL,
+                state TEXT NOT NULL DEFAULT 'creating',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
         Ok(())
     }
 }
@@ -192,6 +206,43 @@ impl ControllerStore for PgStore {
                 detail: e.to_string(),
             })?;
         Ok(())
+    }
+
+    async fn save_sandbox_state(
+        &self,
+        sandbox_id: &SandboxId,
+        agent_id: &AgentId,
+        state: &str,
+    ) -> Result<(), ControllerError> {
+        sqlx::query(
+            "INSERT INTO sandboxes (sandbox_id, agent_id, state)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (sandbox_id) DO UPDATE SET state = EXCLUDED.state",
+        )
+        .bind(sandbox_id.0)
+        .bind(agent_id.0)
+        .bind(state)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        Ok(())
+    }
+
+    async fn get_sandbox_state(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<String>, ControllerError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT state FROM sandboxes WHERE sandbox_id = $1")
+                .bind(sandbox_id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| ControllerError::Database {
+                    detail: e.to_string(),
+                })?;
+        Ok(row.map(|r| r.0))
     }
 }
 
