@@ -6,7 +6,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use open_sandbox_contracts::controller::{
-    AgentMessage, ControllerCommand, HeartbeatAck, RegisterResponse,
+    AgentMessage, ControllerCommand, HeartbeatAck, RegisterResponse, SandboxState,
     SandboxConfig as ProtoSandboxConfig, StartSandbox, agent_message, controller_command,
     controller_service_server::{ControllerService, ControllerServiceServer},
 };
@@ -68,6 +68,7 @@ pub struct GrpcHandler<S: ControllerStore> {
     heartbeat_monitor: Arc<HeartbeatMonitor>,
     connections: Arc<AgentConnections>,
     exec_broker: Arc<ExecBroker>,
+    store: Arc<S>,
 }
 
 #[tonic::async_trait]
@@ -85,6 +86,7 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
         let heartbeat_monitor = self.heartbeat_monitor.clone();
         let connections = self.connections.clone();
         let exec_broker = self.exec_broker.clone();
+        let store = self.store.clone();
 
         tokio::spawn(async move {
             let mut registered_agent_id: Option<AgentId> = None;
@@ -172,8 +174,20 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                         let _ = exec_broker.deliver(result);
                     }
 
-                    agent_message::Payload::SandboxStatus(_)
-                    | agent_message::Payload::ResourceReport(_) => {}
+                    agent_message::Payload::SandboxStatus(status) => {
+                        if let Some(ref agent_id) = registered_agent_id {
+                            let sandbox_id = uuid::Uuid::parse_str(&status.sandbox_id)
+                                .map(SandboxId::from);
+                            if let Ok(sandbox_id) = sandbox_id {
+                                let state_str = sandbox_state_to_str(status.state());
+                                let _ = store
+                                    .save_sandbox_state(&sandbox_id, agent_id, state_str)
+                                    .await;
+                            }
+                        }
+                    }
+
+                    agent_message::Payload::ResourceReport(_) => {}
                 }
             }
 
@@ -228,6 +242,7 @@ impl<S: ControllerStore + 'static> Controller<S> {
             heartbeat_monitor: self.heartbeat_monitor.clone(),
             connections: self.connections.clone(),
             exec_broker: self.exec_broker.clone(),
+            store: self.scheduler.store_arc(),
         })
     }
 
@@ -276,6 +291,25 @@ impl<S: ControllerStore + 'static> Controller<S> {
             .await
     }
 
+    pub async fn save_sandbox_state(
+        &self,
+        sandbox_id: &SandboxId,
+        agent_id: &AgentId,
+        state: &str,
+    ) -> Result<(), ControllerError> {
+        self.scheduler
+            .store()
+            .save_sandbox_state(sandbox_id, agent_id, state)
+            .await
+    }
+
+    pub async fn get_sandbox_state(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<String>, ControllerError> {
+        self.scheduler.store().get_sandbox_state(sandbox_id).await
+    }
+
     pub async fn sweep_dead_agents(&self) -> Vec<AgentId> {
         let dead = self.heartbeat_monitor.dead_agents();
         for agent_id in &dead {
@@ -284,6 +318,17 @@ impl<S: ControllerStore + 'static> Controller<S> {
             self.heartbeat_monitor.remove(agent_id);
         }
         dead
+    }
+}
+
+fn sandbox_state_to_str(state: SandboxState) -> &'static str {
+    match state {
+        SandboxState::Creating => "creating",
+        SandboxState::Running => "running",
+        SandboxState::Stopping => "stopping",
+        SandboxState::Stopped => "stopped",
+        SandboxState::Failed => "failed",
+        SandboxState::Unspecified => "unknown",
     }
 }
 

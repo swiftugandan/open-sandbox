@@ -8,7 +8,7 @@ use bollard::container::{
 use bollard::models::HostConfig;
 
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use open_sandbox_agent::container::{
     ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOutput,
@@ -42,6 +42,19 @@ impl ContainerRuntime for DockerRuntime {
         } else {
             None
         };
+
+        self.client
+            .create_image(
+                Some(bollard::image::CreateImageOptions {
+                    from_image: config.image.clone(),
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(runtime_err)?;
 
         let docker_config = build_docker_config(&config, &sandbox_id_str);
         let options = CreateContainerOptions {

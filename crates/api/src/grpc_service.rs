@@ -56,7 +56,7 @@ impl SandboxService for GrpcSandboxService {
             sandbox_id: parse_sandbox_id(&resp.sandbox_id)?,
             subdomain: resp.subdomain,
             agent_id: resp.agent_id,
-            status: "running".into(),
+            status: resp.status,
         })
     }
 
@@ -117,7 +117,10 @@ impl SandboxService for GrpcSandboxService {
         sandbox_id: &SandboxId,
         request: WriteFilesRequest,
     ) -> Result<WriteFilesResult, ApiError> {
-        let cwd = request.cwd.as_deref().unwrap_or("/");
+        let cwd = request
+            .cwd
+            .as_deref()
+            .unwrap_or(open_sandbox_contracts::constants::DEFAULT_WRITE_CWD);
         let exec_req = ExecRequest {
             command: vec![
                 "sh".into(),

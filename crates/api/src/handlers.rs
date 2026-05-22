@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use serde::de::DeserializeOwned;
 
 use open_sandbox_contracts::types::SandboxId;
 
@@ -12,11 +13,35 @@ use crate::service::{
     CreateRequest, ExecRequest, ReadFileRequest, SandboxService, WriteFilesRequest,
 };
 
+pub struct ValidJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ValidJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ValidJson(value)),
+            Err(rejection) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": rejection.body_text(),
+                    "error_code": "INVALID_REQUEST",
+                })),
+            )
+                .into_response()),
+        }
+    }
+}
+
 pub type AppState<S> = Arc<S>;
 
 pub async fn create_sandbox<S: SandboxService>(
     State(svc): State<AppState<S>>,
-    Json(body): Json<CreateRequest>,
+    ValidJson(body): ValidJson<CreateRequest>,
 ) -> Response {
     match svc.create(body).await {
         Ok(info) => (StatusCode::CREATED, Json(info)).into_response(),
@@ -55,12 +80,22 @@ pub async fn delete_sandbox<S: SandboxService>(
 pub async fn exec_sandbox<S: SandboxService>(
     State(svc): State<AppState<S>>,
     Path(id): Path<String>,
-    Json(body): Json<ExecRequest>,
+    ValidJson(body): ValidJson<ExecRequest>,
 ) -> Response {
     let sandbox_id = match parse_sandbox_id(&id) {
         Ok(id) => id,
         Err(resp) => return resp,
     };
+    if body.command.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "command must not be empty",
+                "error_code": "INVALID_REQUEST",
+            })),
+        )
+            .into_response();
+    }
     match svc.exec(&sandbox_id, body).await {
         Ok(output) => Json(output).into_response(),
         Err(e) => api_error_response(e),
@@ -94,7 +129,7 @@ pub async fn write_files<S: SandboxService>(
 pub async fn read_file<S: SandboxService>(
     State(svc): State<AppState<S>>,
     Path(id): Path<String>,
-    Json(body): Json<ReadFileRequest>,
+    ValidJson(body): ValidJson<ReadFileRequest>,
 ) -> Response {
     let sandbox_id = match parse_sandbox_id(&id) {
         Ok(id) => id,
