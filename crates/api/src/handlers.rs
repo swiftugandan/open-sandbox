@@ -167,6 +167,7 @@ fn api_error_response(err: open_sandbox_contracts::error::ApiError) -> Response 
     let (status, message) = match &err {
         ApiError::Unauthorized { .. } => (StatusCode::UNAUTHORIZED, err.to_string()),
         ApiError::SandboxNotFound { .. } => (StatusCode::NOT_FOUND, err.to_string()),
+        ApiError::FileNotFound { .. } => (StatusCode::NOT_FOUND, err.to_string()),
         ApiError::ControllerUnavailable { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
         }

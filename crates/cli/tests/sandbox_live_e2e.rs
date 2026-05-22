@@ -9,7 +9,7 @@ use open_sandbox_agent::container::ContainerRuntime;
 use open_sandbox_agent::controller_client::ControllerConnection;
 use open_sandbox_agent::proxy_client::ProxyConnection;
 use open_sandbox_agent::sandbox::SandboxManager;
-use open_sandbox_agent::tunnel::{ForwardRequest, TunnelForwarder};
+use open_sandbox_agent::tunnel::TunnelForwarder;
 use open_sandbox_contracts::controller::{AgentResources, SandboxState};
 use open_sandbox_contracts::types::{AgentId, JoinToken, SandboxId};
 use open_sandbox_controller::grpc::{Controller, CreateSandboxRequest};
@@ -118,24 +118,21 @@ async fn controller_triggers_sandbox_creation_on_real_agent() {
     );
     let entry = entry.unwrap();
     assert_eq!(entry.state, SandboxState::Running);
-    assert!(entry.host_port > 0);
 
-    // Wait for nginx to accept connections
-    let client = reqwest::Client::new();
-    let mut ready = false;
-    for _ in 0..20 {
-        if client
-            .get(format!("http://127.0.0.1:{}/", entry.host_port))
-            .send()
-            .await
-            .is_ok()
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    assert!(ready, "nginx should be serving on the mapped port");
+    // Verify container is alive via exec
+    let exec_output = runtime
+        .exec(
+            &entry.container_id,
+            vec!["echo".into(), "ready".into()],
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(exec_output.exit_code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&exec_output.stdout).trim(),
+        "ready"
+    );
 
     // Cleanup
     let _ = runtime

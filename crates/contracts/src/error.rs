@@ -56,6 +56,9 @@ pub enum ApiError {
     #[error("exec failed: {detail}")]
     ExecFailed { detail: String },
 
+    #[error("file not found: {path}")]
+    FileNotFound { path: String },
+
     #[error("internal error: {detail}")]
     Internal { detail: String },
 }
@@ -68,6 +71,7 @@ impl ApiError {
             ApiError::SandboxNotFound { .. } => "SANDBOX_NOT_FOUND",
             ApiError::ControllerUnavailable { .. } => "CONTROLLER_UNAVAILABLE",
             ApiError::ExecFailed { .. } => "EXEC_FAILED",
+            ApiError::FileNotFound { .. } => "FILE_NOT_FOUND",
             ApiError::Internal { .. } => "INTERNAL_ERROR",
             _ => "UNKNOWN",
         }

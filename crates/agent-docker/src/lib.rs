@@ -10,6 +10,8 @@ use bollard::models::HostConfig;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use futures::{StreamExt, TryStreamExt};
 
+use tracing::info;
+
 use open_sandbox_agent::container::{
     ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOutput,
 };
@@ -43,6 +45,7 @@ impl ContainerRuntime for DockerRuntime {
             None
         };
 
+        info!(image = %config.image, "pulling image");
         self.client
             .create_image(
                 Some(bollard::image::CreateImageOptions {
@@ -55,6 +58,7 @@ impl ContainerRuntime for DockerRuntime {
             .try_collect::<Vec<_>>()
             .await
             .map_err(runtime_err)?;
+        info!(image = %config.image, "image pull complete");
 
         let docker_config = build_docker_config(&config, &sandbox_id_str);
         let options = CreateContainerOptions {
@@ -80,6 +84,7 @@ impl ContainerRuntime for DockerRuntime {
             .map_err(runtime_err)?;
 
         let host_port = extract_host_port(&inspect, port_hint.as_deref())?;
+        info!(container_id = %created.id, sandbox_id = %sandbox_id_str, host_port, "container started");
 
         Ok(ContainerInfo {
             id: ContainerId(created.id),
@@ -276,6 +281,12 @@ fn build_docker_config(config: &ContainerConfig, sandbox_id_str: &str) -> Config
 
     Config::<String> {
         image: Some(config.image.clone()),
+        cmd: Some(
+            open_sandbox_contracts::constants::DEFAULT_SANDBOX_ENTRYPOINT
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
         labels: Some(labels),
         exposed_ports,
         host_config: Some(host_config),

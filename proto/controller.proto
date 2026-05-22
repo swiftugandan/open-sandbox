@@ -121,4 +121,5 @@ message ExecResult {
   int32 exit_code = 3;
   bytes stdout = 4;
   bytes stderr = 5;
+  string error = 6;
 }

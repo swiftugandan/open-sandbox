@@ -10,4 +10,5 @@ open-sandbox-agent = { path = "../agent" }
 bollard = "0.18"
 futures = "0.3"
 tokio = { version = "1", features = ["io-util"] }
+tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }

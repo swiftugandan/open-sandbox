@@ -228,3 +228,20 @@ Amended with ops-resilience-observability module (proxy startup retry, tracing, 
 **Acceptance criterion:** Create sandbox with uncached image succeeds (agent pulls). `GetSandbox` returns actual state (`creating` → `running` or `failed`). Invalid JSON returns `{"error": "...", "error_code": "INVALID_REQUEST"}`. Error messages don't stutter. Agent shutdown cleans up containers. Write without cwd extracts to `/home`.
 
 Amended with friction-fixes module (image pull, state tracking, validation, shutdown). Tagged `plan/v0.4.0`.
+
+### Module 11: `ops-resilience-observability-api-feedback` (cross-cutting amendment)
+
+**Depends on:** `contracts` v0.6.0
+**Scope:** Six friction points from second round of live agent testing, across agent-docker, agent, controller, API, and CLI crates.
+
+**Sub-tasks:**
+1. Docker CMD override — set `cmd: ["sleep", "infinity"]` in `build_docker_config` to match YoukiRuntime behavior
+2. ExecResult error field — add `string error = 6` to ExecResult proto, agent sets it on runtime errors, controller returns gRPC error, API returns HTTP 500
+3. SIGTERM handling — add `tokio::signal::unix::signal(SignalKind::terminate())` to `shutdown_signal()`
+4. Agent lifecycle logging — add tracing calls to `controller_client.rs`, `sandbox.rs`, `agent-docker/src/lib.rs`
+5. FileNotFound — add `ApiError::FileNotFound` variant, detect `No such file` in `read_file` stderr, return HTTP 404
+6. Container exit detection — DEFERRED to future cycle
+
+**Acceptance criterion:** Container stays alive with `sleep infinity` entrypoint, exec works on any base image. Runtime exec errors return structured error, not stderr bytes. `docker stop` agent triggers container cleanup. Agent logs show lifecycle events. Read non-existent file returns HTTP 404 `FILE_NOT_FOUND`.
+
+Amended with ops-resilience-observability-api-feedback module. Tagged `plan/v0.5.0`.

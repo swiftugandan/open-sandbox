@@ -196,6 +196,10 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             })?
             .map_err(|_| Status::internal("exec result channel closed"))?;
 
+        if !result.error.is_empty() {
+            return Err(Status::internal(result.error));
+        }
+
         Ok(Response::new(ExecSandboxResponse {
             exit_code: result.exit_code,
             stdout: result.stdout,

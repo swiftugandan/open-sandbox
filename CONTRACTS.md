@@ -4,9 +4,9 @@
 
 ## Status
 
-Current frozen version: **contracts/v0.5.0-frozen**
+Current frozen version: **contracts/v0.6.0-frozen**
 
-*Frozen at `contracts/v0.5.0-frozen` on 2026-05-22. Changes require a `contracts/amendment-<desc>` branch and a version bump.*
+*Frozen at `contracts/v0.6.0-frozen` on 2026-05-22. Changes require a `contracts/amendment-<desc>` branch and a version bump.*
 
 ## Cross-cutting policies
 
@@ -94,7 +94,7 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
 - **Producer:** Agent (sends exec output back to controller)
 - **Consumer:** Controller (correlates by `exec_id` and delivers to waiting API request)
 - **Purpose:** Closes the exec loop: API → Controller → Agent (ExecCommand) → Agent executes → Agent → Controller (ExecResult) → API → Client.
-- **Key fields:** `exec_id` correlates the result with the originating `ExecCommand`. `exit_code`, `stdout`, `stderr` carry the command output.
+- **Key fields:** `exec_id` correlates the result with the originating `ExecCommand`. `exit_code`, `stdout`, `stderr` carry the command output. `error` (field 6, added in v0.6.0) carries a runtime-level error message when the exec infrastructure itself fails (container not found, exec API error). When `error` is non-empty, `exit_code` is -1, `stdout`/`stderr` are empty, and the controller returns a gRPC Internal error rather than forwarding the result as a successful exec.
 - **Invariant:** `exec_id` is unique per exec invocation (UUID). The controller holds a pending-exec map keyed by `exec_id`; when `ExecResult` arrives, the waiting API request is unblocked.
 
 ### Domain types (`types.rs`)
@@ -118,8 +118,8 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
   - `ControllerError`: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `NoAvailableAgents`, `Database`, `Internal`
   - `ProxyError`: `RoutingMiss`, `TunnelUnavailable`, `UpstreamTimeout`, `UpstreamRejected`, `Internal`
   - `AgentError`: `ControllerDisconnected`, `TunnelDisconnected`, `Runtime`, `SandboxNotFound`, `Internal`
-  - `ApiError`: `Unauthorized`, `SandboxNotFound`, `ControllerUnavailable`, `ExecFailed`, `Internal`
-- **Error codes:** `ApiError` exposes `fn error_code(&self) -> &'static str` that maps each variant to a stable uppercase string identifier (`UNAUTHORIZED`, `SANDBOX_NOT_FOUND`, `CONTROLLER_UNAVAILABLE`, `EXEC_FAILED`, `INTERNAL_ERROR`). These codes are included in REST API error response JSON bodies as the `error_code` field for programmatic handling.
+  - `ApiError`: `Unauthorized`, `SandboxNotFound`, `ControllerUnavailable`, `ExecFailed`, `FileNotFound`, `Internal`
+- **Error codes:** `ApiError` exposes `fn error_code(&self) -> &'static str` that maps each variant to a stable uppercase string identifier (`UNAUTHORIZED`, `SANDBOX_NOT_FOUND`, `CONTROLLER_UNAVAILABLE`, `EXEC_FAILED`, `FILE_NOT_FOUND`, `INTERNAL_ERROR`). These codes are included in REST API error response JSON bodies as the `error_code` field for programmatic handling.
 - **Retry guidance:**
   - Retryable: `Database` (transient), `TunnelUnavailable` (agent may reconnect), `UpstreamTimeout` (sandbox may be slow)
   - Terminal: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `RoutingMiss`, `NoAvailableAgents`
@@ -142,6 +142,7 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
   - `PROXY_STARTUP_RETRY_ATTEMPTS`: 15 attempts
   - `PROXY_STARTUP_RETRY_INTERVAL`: 2 seconds
   - `DEFAULT_WRITE_CWD`: `/home` (default target directory for file writes when no explicit cwd is provided)
+  - `DEFAULT_SANDBOX_ENTRYPOINT`: `["sleep", "infinity"]` (overrides image CMD/ENTRYPOINT to keep sandbox idle for exec-based interaction)
 
 ## Component-to-contract matrix
 

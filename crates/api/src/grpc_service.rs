@@ -166,7 +166,7 @@ impl SandboxService for GrpcSandboxService {
         let resp = client
             .exec_sandbox(ProtoExec {
                 sandbox_id: sandbox_id.to_string(),
-                command: vec!["cat".into(), "--".into(), path],
+                command: vec!["cat".into(), "--".into(), path.clone()],
                 stdin: vec![],
             })
             .await
@@ -174,8 +174,12 @@ impl SandboxService for GrpcSandboxService {
             .into_inner();
 
         if resp.exit_code != 0 {
+            let stderr = String::from_utf8_lossy(&resp.stderr);
+            if stderr.contains("No such file") {
+                return Err(ApiError::FileNotFound { path });
+            }
             return Err(ApiError::ExecFailed {
-                detail: String::from_utf8_lossy(&resp.stderr).into_owned(),
+                detail: stderr.into_owned(),
             });
         }
         Ok(resp.stdout)
