@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tracing::{info, warn};
 
+use open_sandbox_contracts::constants::{PROXY_STARTUP_RETRY_ATTEMPTS, PROXY_STARTUP_RETRY_INTERVAL};
 use open_sandbox_contracts::controller::{AgentResources, Architecture};
 use open_sandbox_contracts::types::{AgentId, JoinToken};
 
@@ -44,9 +46,11 @@ impl TokenValidator for StaticTokenValidator {
 }
 
 pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::error::Error>> {
+    info!("controller starting");
     let pool = sqlx::PgPool::connect(&args.database_url).await?;
     let pg_store = Arc::new(PgStore::new(pool));
     pg_store.migrate().await?;
+    info!("database migrations applied");
 
     let join_token = std::env::var("OPEN_SANDBOX_JOIN_TOKEN").map_err(|_| {
         "OPEN_SANDBOX_JOIN_TOKEN must be set for the controller to validate agent registrations"
@@ -61,6 +65,7 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
 
     let addr = format!("0.0.0.0:{}", args.grpc_port);
     let listener = TcpListener::bind(&addr).await?;
+    info!(addr = %addr, "controller ready");
 
     let sweep_controller = controller.clone();
     let sweep_interval = Duration::from_secs(args.sweep_interval);
@@ -77,15 +82,39 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal())
         .await?;
 
+    info!("controller shut down");
     Ok(())
 }
 
 pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>> {
+    info!("proxy starting");
     let pg_pool = sqlx::PgPool::connect(&args.database_url).await?;
     let routing_store = PgRoutingStore::new(pg_pool);
     let cache = Arc::new(RoutingCache::new(routing_store));
 
-    cache.refresh().await.map_err(|e| e.to_string())?;
+    for attempt in 1..=PROXY_STARTUP_RETRY_ATTEMPTS {
+        match cache.refresh().await {
+            Ok(()) => {
+                info!(routes = cache.len(), "routing cache loaded");
+                break;
+            }
+            Err(e) if attempt < PROXY_STARTUP_RETRY_ATTEMPTS => {
+                warn!(
+                    attempt,
+                    max = PROXY_STARTUP_RETRY_ATTEMPTS,
+                    error = %e,
+                    "routing cache not ready, retrying"
+                );
+                tokio::time::sleep(PROXY_STARTUP_RETRY_INTERVAL).await;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "routing cache failed after {PROXY_STARTUP_RETRY_ATTEMPTS} attempts: {e}"
+                )
+                .into());
+            }
+        }
+    }
 
     let tunnel_pool = Arc::new(TunnelPool::new());
     let mux = Arc::new(StreamMux::new(tunnel_pool.clone()));
@@ -98,6 +127,7 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
 
     let http_addr = format!("0.0.0.0:{}", args.http_port);
     let http_listener = TcpListener::bind(&http_addr).await?;
+    info!(grpc = %grpc_addr, http = %http_addr, "proxy ready");
 
     let http_server = HttpServer::new(router);
 
@@ -105,7 +135,9 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            let _ = cache_refresh.refresh().await;
+            if let Err(e) = cache_refresh.refresh().await {
+                warn!(error = %e, "routing cache refresh failed");
+            }
         }
     });
 
@@ -124,12 +156,20 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         () = shutdown_signal() => {}
     }
 
+    info!("proxy shut down");
     Ok(())
 }
 
 pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
     let agent_id = AgentId::new();
+    info!(agent_id = %agent_id, "agent starting");
+
     let join_token = JoinToken::new(args.token);
+
+    #[cfg(feature = "youki")]
+    let runtime_name = "youki";
+    #[cfg(not(feature = "youki"))]
+    let runtime_name = "docker";
 
     #[cfg(feature = "youki")]
     let runtime = Arc::new(open_sandbox_agent_youki::YoukiRuntime::new(
@@ -145,6 +185,12 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
         arch: host_architecture() as i32,
         os: std::env::consts::OS.to_string(),
     };
+    info!(
+        runtime = runtime_name,
+        cpu_cores = resources.cpu_cores,
+        memory_mb = resources.memory_bytes / (1024 * 1024),
+        "system resources collected"
+    );
 
     let controller_conn = ControllerConnection::new(
         agent_id.clone(),
@@ -159,6 +205,11 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
 
     let controller_url = args.controller_url.clone();
     let proxy_url = args.proxy_url.clone();
+    info!(
+        controller = %controller_url,
+        proxy = %proxy_url,
+        "connecting to platform"
+    );
 
     let ctrl_handle = tokio::spawn(async move { controller_conn.run(&controller_url).await });
     let proxy_handle = tokio::spawn(async move { proxy_conn.run(&proxy_url).await });
@@ -173,10 +224,12 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
         () = shutdown_signal() => {}
     }
 
+    info!("agent shut down");
     Ok(())
 }
 
 pub async fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
+    info!(controller = %args.controller_url, "api gateway starting");
     let service = GrpcSandboxService::connect(&args.controller_url)
         .await
         .map_err(|e| format!("failed to connect to controller: {e}"))?;
@@ -184,11 +237,13 @@ pub async fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
     let router = build_router(Arc::new(service));
     let addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&addr).await?;
+    info!(addr = %addr, "api gateway ready");
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    info!("api gateway shut down");
     Ok(())
 }
 

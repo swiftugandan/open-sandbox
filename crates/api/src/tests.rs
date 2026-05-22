@@ -10,7 +10,7 @@ use open_sandbox_contracts::types::SandboxId;
 use crate::router::build_router;
 use crate::service::{
     CreateRequest, ExecOutput, ExecRequest, ReadFileRequest, SandboxInfo, SandboxService,
-    WriteFilesRequest,
+    WriteFilesRequest, WriteFilesResult,
 };
 
 struct MockService {
@@ -79,9 +79,9 @@ impl SandboxService for MockService {
         &self,
         sandbox_id: &SandboxId,
         _request: WriteFilesRequest,
-    ) -> Result<(), ApiError> {
+    ) -> Result<WriteFilesResult, ApiError> {
         if *sandbox_id == self.sandbox.sandbox_id {
-            Ok(())
+            Ok(WriteFilesResult { success: true })
         } else {
             Err(ApiError::SandboxNotFound {
                 sandbox_id: sandbox_id.to_string(),
@@ -174,6 +174,8 @@ async fn get_sandbox_returns_404_for_unknown_sandbox() {
     let req = empty_request("GET", &format!("/v1/sandboxes/{unknown_id}"));
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_json(resp).await;
+    assert_eq!(body["error_code"], "SANDBOX_NOT_FOUND");
 }
 
 #[tokio::test]
@@ -184,6 +186,8 @@ async fn get_sandbox_returns_400_for_invalid_uuid() {
     let req = empty_request("GET", "/v1/sandboxes/not-a-uuid");
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error_code"], "INVALID_REQUEST");
 }
 
 #[tokio::test]
@@ -276,7 +280,11 @@ async fn create_sandbox_uses_defaults_for_omitted_fields() {
             unreachable!()
         }
 
-        async fn write_files(&self, _: &SandboxId, _: WriteFilesRequest) -> Result<(), ApiError> {
+        async fn write_files(
+            &self,
+            _: &SandboxId,
+            _: WriteFilesRequest,
+        ) -> Result<WriteFilesResult, ApiError> {
             unreachable!()
         }
 
@@ -319,7 +327,7 @@ async fn create_sandbox_uses_defaults_for_omitted_fields() {
 }
 
 #[tokio::test]
-async fn write_files_returns_204() {
+async fn write_files_returns_200_with_result() {
     let svc = Arc::new(MockService::new());
     let id = svc.sandbox.sandbox_id.to_string();
     let app = build_router(svc);
@@ -332,7 +340,9 @@ async fn write_files_returns_204() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["success"], true);
 }
 
 #[tokio::test]
@@ -367,7 +377,9 @@ async fn write_files_with_cwd_header() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["success"], true);
 }
 
 #[tokio::test]
