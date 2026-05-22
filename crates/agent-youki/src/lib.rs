@@ -3,13 +3,20 @@ pub mod exec;
 pub mod image;
 pub mod spec;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use open_sandbox_agent::container::{
     ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOutput,
 };
 use open_sandbox_contracts::error::AgentError;
+use open_sandbox_contracts::types::SandboxId;
+
+use libcontainer::container::builder::ContainerBuilder;
+use libcontainer::container::Container;
+use libcontainer::syscall::syscall::SyscallType;
 
 pub struct YoukiConfig {
     pub root_dir: PathBuf,
@@ -25,43 +32,230 @@ impl Default for YoukiConfig {
     }
 }
 
+struct ContainerMetadata {
+    sandbox_id: SandboxId,
+    host_port: u16,
+    container_dir: PathBuf,
+    netns_path: String,
+}
+
 pub struct YoukiRuntime {
-    _config: YoukiConfig,
+    config: YoukiConfig,
+    image_manager: image::ImageManager,
+    containers: Mutex<HashMap<String, ContainerMetadata>>,
 }
 
 impl YoukiRuntime {
-    pub fn new(_config: YoukiConfig) -> Result<Self, AgentError> {
-        todo!()
+    pub fn new(config: YoukiConfig) -> Result<Self, AgentError> {
+        for subdir in ["state", "images", "containers"] {
+            std::fs::create_dir_all(config.root_dir.join(subdir)).map_err(|e| {
+                AgentError::Runtime {
+                    detail: format!("failed to create {subdir} directory: {e}"),
+                }
+            })?;
+        }
+
+        let image_manager = image::ImageManager::new(config.root_dir.clone());
+
+        Ok(Self {
+            config,
+            image_manager,
+            containers: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        self.config.root_dir.join("state")
     }
 }
 
 impl ContainerRuntime for YoukiRuntime {
     async fn create_and_start(
         &self,
-        _config: ContainerConfig,
+        config: ContainerConfig,
     ) -> Result<ContainerInfo, AgentError> {
-        todo!()
+        let rootfs = self.image_manager.pull_and_unpack(&config.image).await?;
+
+        let host_port = cni::allocate_port()?;
+        let container_id = format!("osb-{}", uuid::Uuid::new_v4());
+
+        let container_dir = self
+            .config
+            .root_dir
+            .join("containers")
+            .join(&container_id);
+        let bundle_dir = container_dir.join("bundle");
+        tokio::fs::create_dir_all(&bundle_dir)
+            .await
+            .map_err(|e| AgentError::Runtime {
+                detail: format!("failed to create bundle directory: {e}"),
+            })?;
+
+        let cgroup_path = format!("/open-sandbox/{container_id}");
+        let rootfs_str = rootfs.to_string_lossy().to_string();
+        let oci_spec =
+            spec::generate_full_spec(&config, &rootfs_str, Some(&cgroup_path))?;
+        let spec_json = serde_json::to_vec_pretty(&oci_spec).map_err(|e| AgentError::Runtime {
+            detail: format!("failed to serialize OCI spec: {e}"),
+        })?;
+        tokio::fs::write(bundle_dir.join("config.json"), &spec_json)
+            .await
+            .map_err(|e| AgentError::Runtime {
+                detail: format!("failed to write config.json: {e}"),
+            })?;
+
+        let state_dir = self.state_dir();
+        let bundle_dir_c = bundle_dir.clone();
+        let cid_c = container_id.clone();
+        let init_pid = tokio::task::spawn_blocking(move || -> Result<i32, AgentError> {
+            let container = ContainerBuilder::new(cid_c, SyscallType::Linux)
+                .with_root_path(&state_dir)
+                .map_err(|e| AgentError::Runtime {
+                    detail: format!("invalid state directory: {e}"),
+                })?
+                .as_init(&bundle_dir_c)
+                .build()
+                .map_err(|e| AgentError::Runtime {
+                    detail: format!("failed to create container: {e}"),
+                })?;
+
+            container
+                .pid()
+                .map(|p| p.as_raw())
+                .ok_or_else(|| AgentError::Runtime {
+                    detail: "container has no init PID after creation".into(),
+                })
+        })
+        .await
+        .map_err(|e| AgentError::Runtime {
+            detail: format!("container creation task panicked: {e}"),
+        })??;
+
+        let netns_path = format!("/proc/{init_pid}/ns/net");
+
+        let mut conflist = cni::generate_conflist("open-sandbox");
+        cni::inject_port_mappings(&mut conflist, host_port, config.exposed_port as u16);
+        cni::invoke_cni(
+            &conflist,
+            "ADD",
+            &container_id,
+            &netns_path,
+            &self.config.cni_bin_path,
+        )
+        .await?;
+
+        let state_dir = self.state_dir();
+        let cid_c = container_id.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), AgentError> {
+            let container_root = state_dir.join(&cid_c);
+            let mut container =
+                Container::load(container_root).map_err(|e| AgentError::Runtime {
+                    detail: format!("failed to load container for start: {e}"),
+                })?;
+            container.start().map_err(|e| AgentError::Runtime {
+                detail: format!("failed to start container: {e}"),
+            })
+        })
+        .await
+        .map_err(|e| AgentError::Runtime {
+            detail: format!("container start task panicked: {e}"),
+        })??;
+
+        let sandbox_id = config.sandbox_id.clone();
+        self.containers.lock().unwrap().insert(
+            container_id.clone(),
+            ContainerMetadata {
+                sandbox_id: sandbox_id.clone(),
+                host_port,
+                container_dir,
+                netns_path,
+            },
+        );
+
+        Ok(ContainerInfo {
+            id: ContainerId(container_id),
+            sandbox_id,
+            host_port,
+            running: true,
+        })
     }
 
     async fn stop_and_remove(
         &self,
-        _id: &ContainerId,
-        _timeout: Duration,
+        id: &ContainerId,
+        timeout: Duration,
     ) -> Result<(), AgentError> {
-        todo!()
+        let container_id = id.0.clone();
+        let metadata = self.containers.lock().unwrap().remove(&container_id);
+
+        let state_dir = self.state_dir();
+        let cid = container_id.clone();
+        let grace = timeout.min(Duration::from_secs(10));
+        tokio::task::spawn_blocking(move || -> Result<(), AgentError> {
+            let container_root = state_dir.join(&cid);
+            let mut container =
+                Container::load(container_root).map_err(|e| AgentError::Runtime {
+                    detail: format!("failed to load container for stop: {e}"),
+                })?;
+            let _ = container.kill(nix::sys::signal::Signal::SIGTERM, true);
+            std::thread::sleep(grace);
+            container.delete(true).map_err(|e| AgentError::Runtime {
+                detail: format!("failed to delete container: {e}"),
+            })
+        })
+        .await
+        .map_err(|e| AgentError::Runtime {
+            detail: format!("stop task panicked: {e}"),
+        })??;
+
+        if let Some(meta) = &metadata {
+            let conflist = cni::generate_conflist("open-sandbox");
+            let _ = cni::invoke_cni(
+                &conflist,
+                "DEL",
+                &container_id,
+                &meta.netns_path,
+                &self.config.cni_bin_path,
+            )
+            .await;
+        }
+
+        if let Some(meta) = metadata {
+            let _ = tokio::fs::remove_dir_all(&meta.container_dir).await;
+        }
+
+        Ok(())
     }
 
     async fn list_sandbox_containers(&self) -> Result<Vec<ContainerInfo>, AgentError> {
-        todo!()
+        let containers = self.containers.lock().unwrap();
+        Ok(containers
+            .iter()
+            .map(|(cid, meta)| ContainerInfo {
+                id: ContainerId(cid.clone()),
+                sandbox_id: meta.sandbox_id.clone(),
+                host_port: meta.host_port,
+                running: true,
+            })
+            .collect())
     }
 
     async fn exec(
         &self,
-        _id: &ContainerId,
-        _command: Vec<String>,
-        _stdin: Vec<u8>,
+        id: &ContainerId,
+        command: Vec<String>,
+        stdin: Vec<u8>,
     ) -> Result<ExecOutput, AgentError> {
-        todo!()
+        let container_id = id.0.clone();
+        let state_dir = self.state_dir();
+
+        tokio::task::spawn_blocking(move || {
+            exec::exec_in_container(&container_id, &state_dir, command, stdin)
+        })
+        .await
+        .map_err(|e| AgentError::Runtime {
+            detail: format!("exec task panicked: {e}"),
+        })?
     }
 }
 
@@ -70,6 +264,7 @@ mod tests {
     use std::collections::HashMap;
 
     use open_sandbox_contracts::types::SandboxId;
+    use serial_test::serial;
 
     use super::*;
 
@@ -92,6 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn create_and_start_returns_running_container() {
         let runtime = YoukiRuntime::new(test_config()).unwrap();
         let sandbox_id = SandboxId::new();
@@ -110,6 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn stop_and_remove_cleans_up() {
         let runtime = YoukiRuntime::new(test_config()).unwrap();
         let sandbox_id = SandboxId::new();
@@ -128,6 +325,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn list_finds_managed_containers() {
         let runtime = YoukiRuntime::new(test_config()).unwrap();
         let sandbox_id = SandboxId::new();
@@ -144,6 +342,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn exec_runs_command() {
         let runtime = YoukiRuntime::new(test_config()).unwrap();
         let sandbox_id = SandboxId::new();

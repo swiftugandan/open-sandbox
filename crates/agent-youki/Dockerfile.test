@@ -1,0 +1,32 @@
+FROM rust:1.88-alpine
+
+RUN apk add --no-cache \
+    musl-dev \
+    gcc \
+    libseccomp-dev \
+    libseccomp-static \
+    pkgconf \
+    protobuf-dev \
+    git \
+    iptables \
+    util-linux
+
+ENV LIBSECCOMP_LINK_TYPE=static
+ENV LIBSECCOMP_LIB_PATH=/usr/lib
+
+# Install CNI plugins
+RUN wget -q https://github.com/containernetworking/plugins/releases/download/v1.6.2/cni-plugins-linux-amd64-v1.6.2.tgz \
+    -O /tmp/cni-plugins.tgz \
+    && mkdir -p /opt/cni/bin \
+    && tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin \
+    && rm /tmp/cni-plugins.tgz
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates/
+COPY proto proto/
+
+RUN cargo test -p open-sandbox-agent-youki --no-run 2>&1
+
+CMD ["cargo", "test", "-p", "open-sandbox-agent-youki", "--", "--nocapture"]
