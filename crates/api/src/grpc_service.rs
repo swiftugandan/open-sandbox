@@ -120,10 +120,10 @@ impl SandboxService for GrpcSandboxService {
         let cwd = request.cwd.as_deref().unwrap_or("/");
         let exec_req = ExecRequest {
             command: vec![
-                "tar".into(),
-                "xzf".into(),
-                "-".into(),
-                "-C".into(),
+                "sh".into(),
+                "-c".into(),
+                "mkdir -p \"$1\" && tar xzf - -C \"$1\"".into(),
+                "--".into(),
                 cwd.into(),
             ],
         };
