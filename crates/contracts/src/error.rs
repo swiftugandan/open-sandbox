@@ -60,6 +60,20 @@ pub enum ApiError {
     Internal { detail: String },
 }
 
+impl ApiError {
+    pub fn error_code(&self) -> &'static str {
+        #[allow(unreachable_patterns)]
+        match self {
+            ApiError::Unauthorized { .. } => "UNAUTHORIZED",
+            ApiError::SandboxNotFound { .. } => "SANDBOX_NOT_FOUND",
+            ApiError::ControllerUnavailable { .. } => "CONTROLLER_UNAVAILABLE",
+            ApiError::ExecFailed { .. } => "EXEC_FAILED",
+            ApiError::Internal { .. } => "INTERNAL_ERROR",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AgentError {
