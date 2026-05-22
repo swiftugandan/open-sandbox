@@ -1,4 +1,5 @@
 pub mod cni;
+pub mod dns;
 pub mod exec;
 pub mod image;
 pub mod spec;
@@ -86,6 +87,7 @@ impl ContainerRuntime for YoukiRuntime {
         config: ContainerConfig,
     ) -> Result<ContainerInfo, AgentError> {
         let rootfs = self.image_manager.pull_and_unpack(&config.image).await?;
+        dns::write_resolv_conf(&rootfs).await?;
 
         let host_port = cni::allocate_port()?;
         let container_id = format!("{CONTAINER_ID_PREFIX}-{}", uuid::Uuid::new_v4());

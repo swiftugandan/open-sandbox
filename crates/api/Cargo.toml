@@ -18,6 +18,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 open-sandbox-controller = { path = "../controller", features = ["testutil"] }
 open-sandbox-agent = { path = "../agent" }
+open-sandbox-agent-docker = { path = "../agent-docker" }
 open-sandbox = { path = "../cli" }
 reqwest = { version = "0.12", features = ["json"] }
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
