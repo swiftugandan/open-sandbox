@@ -9,7 +9,7 @@ use tonic::transport::Channel;
 
 use crate::service::{
     CreateRequest, ExecOutput, ExecRequest, ReadFileRequest, SandboxInfo, SandboxService,
-    WriteFilesRequest,
+    WriteFilesRequest, WriteFilesResult,
 };
 
 pub struct GrpcSandboxService {
@@ -116,7 +116,7 @@ impl SandboxService for GrpcSandboxService {
         &self,
         sandbox_id: &SandboxId,
         request: WriteFilesRequest,
-    ) -> Result<(), ApiError> {
+    ) -> Result<WriteFilesResult, ApiError> {
         let cwd = request.cwd.as_deref().unwrap_or("/");
         let exec_req = ExecRequest {
             command: vec![
@@ -143,7 +143,7 @@ impl SandboxService for GrpcSandboxService {
                 detail: String::from_utf8_lossy(&resp.stderr).into_owned(),
             });
         }
-        Ok(())
+        Ok(WriteFilesResult { success: true })
     }
 
     async fn read_file(

@@ -86,7 +86,7 @@ pub async fn write_files<S: SandboxService>(
         cwd,
     };
     match svc.write_files(&sandbox_id, request).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => api_error_response(e),
     }
 }
@@ -117,7 +117,10 @@ fn parse_sandbox_id(id: &str) -> Result<SandboxId, Response> {
     uuid::Uuid::parse_str(id).map(SandboxId::from).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "invalid sandbox_id"})),
+            Json(serde_json::json!({
+                "error": "invalid sandbox_id",
+                "error_code": "INVALID_REQUEST",
+            })),
         )
             .into_response()
     })
@@ -136,6 +139,11 @@ fn api_error_response(err: open_sandbox_contracts::error::ApiError) -> Response 
         ApiError::Internal { .. } => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
+    let code = err.error_code();
 
-    (status, Json(serde_json::json!({"error": message}))).into_response()
+    (
+        status,
+        Json(serde_json::json!({"error": message, "error_code": code})),
+    )
+        .into_response()
 }

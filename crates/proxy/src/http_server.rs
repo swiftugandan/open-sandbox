@@ -40,7 +40,7 @@ impl<S: RoutingStore + 'static> HttpServer<S> {
                     .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
                     .await
                 {
-                    eprintln!("http connection error: {e}");
+                    tracing::warn!(error = %e, "http connection error");
                 }
             });
         }

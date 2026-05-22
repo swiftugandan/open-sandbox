@@ -28,3 +28,7 @@ pub const METRICS_DEFAULT_PORT: u16 = 9090;
 pub const API_DEFAULT_PORT: u16 = 8081;
 
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub const PROXY_STARTUP_RETRY_ATTEMPTS: u32 = 15;
+
+pub const PROXY_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(2);

@@ -177,6 +177,7 @@ Reverse tunnel setup:
 - Routing cache stale: a sandbox is created but the NOTIFY hasn't arrived yet. Request returns 502. Self-healing: cache rebuilds on next NOTIFY or periodic full refresh (every 60s as fallback).
 - Tunnel to agent breaks: requests for that agent's sandboxes fail with 502. Agent reconnects and re-establishes tunnel. Proxy detects broken tunnel via gRPC stream error.
 - Upstream sandbox timeout: proxy returns 504 after configurable timeout (default: 30s).
+- Schema not yet migrated: initial routing-cache refresh fails because `routing_entries` table does not exist (controller hasn't run migrations yet). Self-healing: proxy retries with 2s backoff for up to 30 seconds. Once the controller completes migrations, the next retry succeeds.
 
 **Observability surface.**
 - Prometheus metrics: `proxy_requests_total` (by sandbox_id), `proxy_request_duration_seconds` (histogram, by sandbox_id), `proxy_active_tunnels`, `proxy_errors_total` (by type: `routing_miss`, `tunnel_failure`, `upstream_timeout`), `proxy_routing_cache_size`
@@ -305,7 +306,7 @@ Reverse tunnel setup:
 - `SandboxManagementService` gRPC (from controller): unary RPCs for sandbox lifecycle and command execution
 
 **Contracts produced.**
-- REST API responses (to clients): JSON for sandbox metadata, exec output; octet-stream for file reads; standard HTTP error codes
+- REST API responses (to clients): JSON for sandbox metadata, exec output; octet-stream for file reads; standard HTTP error codes. Error responses include a stable `error_code` string for programmatic handling alongside the human-readable `error` message.
 
 ---
 
@@ -319,7 +320,7 @@ Reverse tunnel setup:
 
 ### Logging, metrics, tracing
 
-- **Logging:** Structured JSON to stdout on all components. `tracing` crate with `tracing-subscriber` JSON formatter.
+- **Logging:** Structured JSON to stdout on all components. `tracing` crate with `tracing-subscriber` JSON formatter. Subscriber initialized once in the CLI `main()` function before subcommand dispatch, so all four binaries share a single initialization path. Each component logs lifecycle events: startup, ready (listening on port), shutdown, connection state changes, and errors.
 - **Metrics:** Prometheus exposition format on a dedicated port per component (/metrics endpoint).
 - **Tracing:** Deferred. Request IDs are propagated through the proxy→agent→sandbox chain via an `X-Request-Id` header, but distributed tracing (OpenTelemetry) is not in v1 scope.
 
@@ -415,3 +416,5 @@ Known gaps:
 Amended with API gateway component (ADR-007, ADR-008). Tagged `sad/v0.2.0`.
 
 Amended with daemonless OCI runtime (ADR-009), trust boundary 4, agent component zoom. Tagged `sad/v0.3.0`.
+
+Amended with proxy startup self-healing failure mode, logging subscriber init detail, API error_code in contracts produced. Tagged `sad/v0.4.0`.

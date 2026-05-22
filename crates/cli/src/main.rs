@@ -1,9 +1,17 @@
 use clap::Parser;
 use open_sandbox::cli::{Cli, Command};
 use open_sandbox::run;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
     let cli = Cli::parse();
 
     match cli.command {

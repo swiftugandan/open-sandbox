@@ -4,9 +4,9 @@
 
 ## Status
 
-Current frozen version: **contracts/v0.3.0-frozen**
+Current frozen version: **contracts/v0.4.0-frozen**
 
-*Frozen at `contracts/v0.3.0-frozen` on 2026-05-22. Changes require a `contracts/amendment-<desc>` branch and a version bump.*
+*Frozen at `contracts/v0.4.0-frozen` on 2026-05-22. Changes require a `contracts/amendment-<desc>` branch and a version bump.*
 
 ## Cross-cutting policies
 
@@ -119,6 +119,7 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
   - `ProxyError`: `RoutingMiss`, `TunnelUnavailable`, `UpstreamTimeout`, `UpstreamRejected`, `Internal`
   - `AgentError`: `ControllerDisconnected`, `TunnelDisconnected`, `Runtime`, `SandboxNotFound`, `Internal`
   - `ApiError`: `Unauthorized`, `SandboxNotFound`, `ControllerUnavailable`, `ExecFailed`, `Internal`
+- **Error codes:** `ApiError` exposes `fn error_code(&self) -> &'static str` that maps each variant to a stable uppercase string identifier (`UNAUTHORIZED`, `SANDBOX_NOT_FOUND`, `CONTROLLER_UNAVAILABLE`, `EXEC_FAILED`, `INTERNAL_ERROR`). These codes are included in REST API error response JSON bodies as the `error_code` field for programmatic handling.
 - **Retry guidance:**
   - Retryable: `Database` (transient), `TunnelUnavailable` (agent may reconnect), `UpstreamTimeout` (sandbox may be slow)
   - Terminal: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `RoutingMiss`, `NoAvailableAgents`
@@ -138,6 +139,8 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
   - `RECONNECT_MAX_DELAY`: 30 seconds (backoff ceiling)
   - `DEFAULT_SANDBOX_CPU_MILLICORES`: 1000 (1 core)
   - `DEFAULT_SANDBOX_MEMORY_BYTES`: 512 MB
+  - `PROXY_STARTUP_RETRY_ATTEMPTS`: 15 attempts
+  - `PROXY_STARTUP_RETRY_INTERVAL`: 2 seconds
 
 ## Component-to-contract matrix
 

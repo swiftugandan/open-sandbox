@@ -57,6 +57,11 @@ pub struct WriteFilesRequest {
     pub cwd: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WriteFilesResult {
+    pub success: bool,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ReadFileRequest {
     pub path: String,
@@ -87,7 +92,7 @@ pub trait SandboxService: Send + Sync + 'static {
         &self,
         sandbox_id: &SandboxId,
         request: WriteFilesRequest,
-    ) -> impl Future<Output = Result<(), ApiError>> + Send;
+    ) -> impl Future<Output = Result<WriteFilesResult, ApiError>> + Send;
 
     fn read_file(
         &self,

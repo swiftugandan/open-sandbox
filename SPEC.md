@@ -98,8 +98,8 @@ Developers need isolated, publicly-accessible sandbox environments that can run 
 - **NFR-OBS-2:** The proxy exposes Prometheus metrics: request rate, latency histogram (by sandbox), active tunnels, error rates (by type: routing miss, tunnel failure, upstream timeout).
   - *Rationale:* Request-path observability is essential for debugging latency and availability issues.
 
-- **NFR-OBS-3:** Structured logging (JSON) to stdout on all components. Log levels: error, warn, info, debug, trace. Default level: info.
-  - *Rationale:* JSON to stdout is the lowest-common-denominator logging approach that works with every log aggregation system.
+- **NFR-OBS-3:** Structured logging (JSON) to stdout on all components. Log levels: error, warn, info, debug, trace. Default level: info. The tracing subscriber is initialized once in the CLI entrypoint (`main()`), which is the common entry point for all four subcommands. Each component logs lifecycle events (startup, ready, shutdown, connection state changes, errors) at appropriate levels.
+  - *Rationale:* JSON to stdout is the lowest-common-denominator logging approach that works with every log aggregation system. Centralizing subscriber initialization in `main()` ensures every subcommand gets logging without per-component setup.
 
 ### Operability
 
@@ -111,6 +111,14 @@ Developers need isolated, publicly-accessible sandbox environments that can run 
 
 - **NFR-OPS-3:** Infrastructure is managed via Pulumi with state stored in object storage. Secrets are encrypted by the Pulumi state backend. No external KMS or secrets manager required at the default scale.
   - *Rationale:* Pulumi's built-in encryption is sufficient for a small team and avoids the per-secret monthly cost of cloud KMS services.
+
+- **NFR-OPS-4:** All components tolerate peer unavailability during startup. The proxy retries its initial routing-cache load with backoff (15 attempts × 2s = 30s window) if the database schema has not been initialized by the controller. This makes component startup order-independent in orchestrated deployments.
+  - *Rationale:* In docker-compose and similar orchestrators, `depends_on` with health checks only guarantees the database process is accepting connections, not that application-level migrations have run. The proxy must self-heal rather than crash.
+
+### API quality
+
+- **NFR-API-1:** API error responses include a machine-readable `error_code` string alongside the human-readable `error` message. Error codes are stable identifiers derived from the `ApiError` enum variant names (e.g., `SANDBOX_NOT_FOUND`, `EXEC_FAILED`). Successful mutation responses (file writes) return a structured JSON confirmation body rather than an empty 204.
+  - *Rationale:* Programmatic API consumers (AI agents) need stable identifiers for error handling. Free-text error messages are for humans; error codes are for code. Structured success responses provide confirmation that the operation completed.
 
 ## Non-goals
 
@@ -189,3 +197,5 @@ Amended with FR-11 through FR-14 (API gateway). Tagged `spec/v0.2.0`.
 Amended with runtime-agnostic language and youki/libcontainer as default production runtime (FR-3, NFR-SEC-3, C-2, glossary). Tagged `spec/v0.3.0`.
 
 Amended with container DNS provisioning (FR-3) and auto-mkdir for file write target directories (FR-13). Tagged `spec/v0.3.1`.
+
+Amended with startup resilience (NFR-OPS-4), tracing subscriber init (NFR-OBS-3), and structured API error codes (NFR-API-1). Tagged `spec/v0.4.0`.
