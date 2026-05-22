@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: open_sandbox_test
+      POSTGRES_PASSWORD: test
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 2s
+      retries: 15
+
+  test-runner:
+    build:
+      context: ../..
+      dockerfile: crates/agent-youki/Dockerfile.test
+    command: >
+      cargo test -p open-sandbox-agent-youki
+      --test live_e2e -- --nocapture
+    environment:
+      DATABASE_URL: postgres://postgres:test@postgres:5432/open_sandbox_test
+    depends_on:
+      postgres:
+        condition: service_healthy
+    privileged: true

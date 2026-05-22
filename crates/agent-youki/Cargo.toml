@@ -21,6 +21,10 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "test-util"] }
+tokio-stream = "0.1"
 tempfile = "3"
 serial_test = "3"
+open-sandbox-controller = { path = "../controller" }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "uuid"] }
+tonic = "0.12"
