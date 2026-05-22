@@ -132,13 +132,14 @@ Reverse tunnel setup:
 - `metrics` — Prometheus endpoint
 
 **State.**
-- Persistent (Postgres): agent records, sandbox metadata, routing table, hashed join tokens
+- Persistent (Postgres): agent records, sandbox records (id, agent_id, image, state, created_at), routing table, hashed join tokens. Sandbox state is one of: `creating`, `running`, `failed`, `stopped`.
 - Ephemeral (in-memory): live gRPC stream handles per connected agent, agent health status, scheduler state
 
 **Failure modes.**
 - Controller crash: agents detect via broken gRPC stream, enter reconnection backoff. Sandboxes continue running (agent manages Docker independently). New sandbox creation and routing updates are unavailable until controller restarts. State is recovered from Postgres.
 - Postgres failure: controller cannot write state. New registrations and sandbox operations fail. Existing agent connections stay alive (heartbeats are processed in-memory) but cannot be persisted. Recovery: restart Postgres, controller reconnects automatically.
 - Agent heartbeat timeout: controller marks agent dead, reschedules its sandboxes to other agents, updates routing table.
+- Agent reports sandbox creation failure: controller persists `failed` state. API clients polling `GetSandbox` see the actual state rather than an optimistic `running`.
 
 **Observability surface.**
 - Prometheus metrics: `controller_agents_connected`, `controller_sandboxes_active`, `controller_heartbeat_latency_seconds` (histogram), `controller_sandbox_starts_total`, `controller_sandbox_stops_total`, `controller_routing_table_size`
@@ -200,7 +201,7 @@ Reverse tunnel setup:
 **Internal structure.**
 - `controller_client` — gRPC client maintaining the bidi stream to the controller (registration, heartbeats, receiving commands)
 - `proxy_client` — gRPC client maintaining the reverse tunnel to the proxy (receiving forwarded requests)
-- `sandbox_manager` — manages OCI container lifecycle via the `ContainerRuntime` trait. Production: `YoukiRuntime` (libcontainer + CNI + oci-client). Development: `DockerRuntime` (bollard).
+- `sandbox_manager` — manages OCI container lifecycle via the `ContainerRuntime` trait. Production: `YoukiRuntime` (libcontainer + CNI + oci-client). Development: `DockerRuntime` (bollard). Both runtimes pull images before container creation.
 - `image_manager` — pulls and unpacks OCI images from registries via `oci-client` (production runtime only)
 - `cni_manager` — invokes CNI plugins (bridge, portmap, loopback) for container networking and dynamic port allocation (production runtime only)
 - `tunnel_forwarder` — receives virtual streams from the proxy, connects them to local sandbox ports
@@ -216,6 +217,7 @@ Reverse tunnel setup:
 - Proxy tunnel lost: agent enters reconnection backoff. Sandbox traffic is unavailable until tunnel is re-established. Sandboxes themselves are unaffected.
 - Container runtime error: individual sandbox operations may fail (e.g., image pull failure, CNI plugin error, libcontainer syscall failure). Agent reports errors per-sandbox rather than globally. No daemon to fail — runtime errors are per-operation.
 - Agent crash: OCI containers continue running (kernel manages namespaces/cgroups). On restart, agent reconnects and reconciles its sandbox list with libcontainer's state directory.
+- Agent graceful shutdown: on receiving SIGTERM/SIGINT, the agent stops and removes all managed containers before exiting. This prevents orphaned containers from accumulating across agent restarts.
 
 **Observability surface.**
 - Prometheus metrics: `agent_sandboxes_running`, `agent_tunnel_active`, `agent_controller_connected` (gauge), `agent_forwarded_requests_total`, `agent_runtime_errors_total` (by type: `lifecycle`, `exec`, `image_pull`, `cni`)
@@ -306,7 +308,7 @@ Reverse tunnel setup:
 - `SandboxManagementService` gRPC (from controller): unary RPCs for sandbox lifecycle and command execution
 
 **Contracts produced.**
-- REST API responses (to clients): JSON for sandbox metadata, exec output; octet-stream for file reads; standard HTTP error codes. Error responses include a stable `error_code` string for programmatic handling alongside the human-readable `error` message.
+- REST API responses (to clients): JSON for sandbox metadata, exec output; octet-stream for file reads; standard HTTP error codes. All error responses — including framework-level rejections (malformed JSON, missing fields) — use a consistent `{"error": "...", "error_code": "..."}` envelope. Request payloads are validated at the API boundary before forwarding to downstream services.
 
 ---
 
@@ -418,3 +420,5 @@ Amended with API gateway component (ADR-007, ADR-008). Tagged `sad/v0.2.0`.
 Amended with daemonless OCI runtime (ADR-009), trust boundary 4, agent component zoom. Tagged `sad/v0.3.0`.
 
 Amended with proxy startup self-healing failure mode, logging subscriber init detail, API error_code in contracts produced. Tagged `sad/v0.4.0`.
+
+Amended with sandbox state persistence (controller), agent graceful shutdown, image pull in both runtimes, API validation envelope consistency. Tagged `sad/v0.5.0`.

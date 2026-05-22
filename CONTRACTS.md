@@ -4,9 +4,9 @@
 
 ## Status
 
-Current frozen version: **contracts/v0.4.0-frozen**
+Current frozen version: **contracts/v0.5.0-frozen**
 
-*Frozen at `contracts/v0.4.0-frozen` on 2026-05-22. Changes require a `contracts/amendment-<desc>` branch and a version bump.*
+*Frozen at `contracts/v0.5.0-frozen` on 2026-05-22. Changes require a `contracts/amendment-<desc>` branch and a version bump.*
 
 ## Cross-cutting policies
 
@@ -82,7 +82,7 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
 - **Purpose:** Unary RPCs for external sandbox lifecycle management. Deliberately separate from the bidirectional `AgentStream` — the agent stream is for persistent agent connections, this service is for request/response client interactions.
 - **Shape:** see `proto/api.proto`
 - **Key messages:**
-  - `CreateSandboxRequest` / `CreateSandboxResponse` — create a sandbox, returns sandbox_id + subdomain
+  - `CreateSandboxRequest` / `CreateSandboxResponse` — create a sandbox, returns sandbox_id + subdomain + status (initially `creating`)
   - `GetSandboxRequest` / `GetSandboxResponse` — query sandbox status
   - `DeleteSandboxRequest` / `DeleteSandboxResponse` — stop and remove a sandbox
   - `ExecSandboxRequest` / `ExecSandboxResponse` — run a command, returns stdout/stderr/exit_code
@@ -141,6 +141,7 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
   - `DEFAULT_SANDBOX_MEMORY_BYTES`: 512 MB
   - `PROXY_STARTUP_RETRY_ATTEMPTS`: 15 attempts
   - `PROXY_STARTUP_RETRY_INTERVAL`: 2 seconds
+  - `DEFAULT_WRITE_CWD`: `/home` (default target directory for file writes when no explicit cwd is provided)
 
 ## Component-to-contract matrix
 
