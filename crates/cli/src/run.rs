@@ -131,6 +131,11 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
     let agent_id = AgentId::new();
     let join_token = JoinToken::new(args.token);
 
+    #[cfg(feature = "youki")]
+    let runtime = Arc::new(open_sandbox_agent_youki::YoukiRuntime::new(
+        open_sandbox_agent_youki::YoukiConfig::default(),
+    )?);
+    #[cfg(not(feature = "youki"))]
     let runtime = Arc::new(DockerRuntime::connect()?);
     let sandbox_manager = Arc::new(SandboxManager::new(runtime));
 
