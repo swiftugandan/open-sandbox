@@ -53,11 +53,20 @@ pub enum ApiError {
     #[error("controller unavailable: {detail}")]
     ControllerUnavailable { detail: String },
 
+    #[error("invalid request: {detail}")]
+    InvalidRequest { detail: String },
+
+    #[error("invalid upload: {detail}")]
+    InvalidUpload { detail: String },
+
     #[error("exec failed: {detail}")]
     ExecFailed { detail: String },
 
-    #[error("file not found: {path}")]
-    FileNotFound { path: String },
+    #[error("command not found: {command}")]
+    CommandNotFound { command: String },
+
+    #[error("file not found: {resolved_path}")]
+    FileNotFound { resolved_path: String },
 
     #[error("internal error: {detail}")]
     Internal { detail: String },
@@ -70,7 +79,10 @@ impl ApiError {
             ApiError::Unauthorized { .. } => "UNAUTHORIZED",
             ApiError::SandboxNotFound { .. } => "SANDBOX_NOT_FOUND",
             ApiError::ControllerUnavailable { .. } => "CONTROLLER_UNAVAILABLE",
+            ApiError::InvalidRequest { .. } => "INVALID_REQUEST",
+            ApiError::InvalidUpload { .. } => "INVALID_UPLOAD",
             ApiError::ExecFailed { .. } => "EXEC_FAILED",
+            ApiError::CommandNotFound { .. } => "COMMAND_NOT_FOUND",
             ApiError::FileNotFound { .. } => "FILE_NOT_FOUND",
             ApiError::Internal { .. } => "INTERNAL_ERROR",
             _ => "UNKNOWN",

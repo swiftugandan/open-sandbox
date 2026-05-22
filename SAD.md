@@ -217,12 +217,14 @@ Reverse tunnel setup:
 - Controller connection lost: agent enters reconnection backoff. Existing sandboxes continue running. New commands cannot be received. Heartbeats stop — controller will eventually mark agent dead if reconnection takes too long.
 - Proxy tunnel lost: agent enters reconnection backoff. Sandbox traffic is unavailable until tunnel is re-established. Sandboxes themselves are unaffected.
 - Container runtime error: individual sandbox operations may fail (e.g., image pull failure, CNI plugin error, libcontainer syscall failure). Agent reports errors per-sandbox rather than globally. No daemon to fail — runtime errors are per-operation.
+- Exec command-not-found: when the underlying OCI runtime (runc/crun/youki) cannot resolve the executable, the agent's exec wrapper detects the runtime-specific diagnostic pattern (e.g. `"executable file not found in $PATH"`, OCI runtime error code `OCI_ERR_NOT_FOUND`), sets `ExecResult.command_not_found = true`, places the diagnostic in `stderr` (not `stdout`), and returns `exit_code: 127`. This is distinct from a process that ran and exited 127 of its own accord (`command_not_found` is false in that case).
+- File-not-found on read: the agent resolves the requested path against the supplied `cwd` (or `/home` default), then reads it. If the path does not exist, the returned `AgentError::Runtime` includes the **resolved absolute path** in its detail; the API maps this to `ApiError::FileNotFound { resolved_path }` → HTTP 404. Callers do not need a second round-trip to learn what path the agent actually looked at.
 - Agent crash: OCI containers continue running (kernel manages namespaces/cgroups). On restart, agent reconnects and reconciles its sandbox list with libcontainer's state directory.
 - Agent graceful shutdown: on receiving SIGTERM or SIGINT, the agent stops and removes all managed containers before exiting. The `shutdown_signal()` function handles both signals, ensuring cleanup in both interactive (Ctrl+C) and Docker/systemd (SIGTERM) environments. This prevents orphaned containers from accumulating across agent restarts.
 
 **Observability surface.**
 - Prometheus metrics: `agent_sandboxes_running`, `agent_tunnel_active`, `agent_controller_connected` (gauge), `agent_forwarded_requests_total`, `agent_runtime_errors_total` (by type: `lifecycle`, `exec`, `image_pull`, `cni`)
-- Structured JSON logs: sandbox lifecycle events, connection state changes, Docker operations. Key tracing events: controller connection/registration, sandbox start/stop commands received and status reported, exec command received, image pull start/complete, container started
+- Structured JSON logs: sandbox lifecycle events, connection state changes, Docker operations. Key tracing events: controller connection/registration, sandbox start/stop commands received and status reported, exec command received, image pull start/complete, container started. Exec log lines carry the full command vector (`cmd.argv` field, joined for readability), `cwd` (resolved), `stdin_len`, `sandbox_id`, and `exec_id` — sufficient to identify which command failed from a single log line without correlating events.
 
 **Contracts consumed.**
 - `ControllerCommand` (from controller): StartSandbox, StopSandbox, Exec, FetchLogs
@@ -286,11 +288,13 @@ Reverse tunnel setup:
 
 **Endpoints.**
 - `POST /v1/sandboxes` — create a sandbox (image, cpu, memory, env, exposed_port) → returns sandbox_id + subdomain URL
+- `GET /v1/sandboxes` — list all sandboxes (v0.7.0); returns array of `{sandbox_id, subdomain, agent_id, status}`
 - `GET /v1/sandboxes/:id` — get sandbox status + metadata
 - `DELETE /v1/sandboxes/:id` — stop and remove a sandbox
-- `POST /v1/sandboxes/:id/exec` — execute a command, returns stdout/stderr/exit_code
-- `POST /v1/sandboxes/:id/files/write` — upload tar.gz, extracted into sandbox filesystem
-- `POST /v1/sandboxes/:id/files/read` — read a file, returns octet-stream
+- `POST /v1/sandboxes/:id/exec` — execute a command. Body: `{command: [...], stdin?: string, stdin_b64?: string, cwd?: string}` (v0.7.0 adds `stdin*`/`cwd`). Returns `{exit_code, stdout_b64, stderr_b64, error_code?}` — output bytes are always base64 (RFC 4648). `error_code: COMMAND_NOT_FOUND` is set when the runtime reports the executable was missing.
+- `POST /v1/sandboxes/:id/files/write_files` — upload tar.gz, extracted into sandbox filesystem. Empty or malformed body returns HTTP 400 `INVALID_UPLOAD` (validated at the gateway via length + gzip magic bytes `1f 8b`).
+- `POST /v1/sandboxes/:id/files/write_file` — JSON single-file write (v0.7.0). Body: `{path, content?: string, content_b64?: string, cwd?: string}` (exactly one of `content`/`content_b64`). Atomic write: temp file in same directory + rename.
+- `GET /v1/sandboxes/:id/files/read?path=...&cwd=...` — read a file, returns octet-stream (v0.7.0: replaces POST). `path` is required; `cwd` optional. 404 includes resolved absolute path in error message.
 
 **State.**
 - Persistent: none. The API gateway is stateless — all state lives in Postgres via the controller.
@@ -309,7 +313,7 @@ Reverse tunnel setup:
 - `SandboxManagementService` gRPC (from controller): unary RPCs for sandbox lifecycle and command execution
 
 **Contracts produced.**
-- REST API responses (to clients): JSON for sandbox metadata, exec output; octet-stream for file reads; standard HTTP error codes. All error responses — including framework-level rejections (malformed JSON, missing fields) — use a consistent `{"error": "...", "error_code": "..."}` envelope. Request payloads are validated at the API boundary before forwarding to downstream services. Read-file on a non-existent path returns HTTP 404 with `FILE_NOT_FOUND` error code, detected by inspecting `cat` stderr for "No such file" pattern.
+- REST API responses (to clients): JSON for sandbox metadata, exec output (base64-encoded stdout/stderr per RFC 4648), octet-stream for file reads, standard HTTP error codes. All error responses — including framework-level rejections (malformed JSON, missing fields, unknown fields) — use a consistent `{"error": "...", "error_code": "..."}` envelope. Request payloads are validated at the API boundary before forwarding to downstream services (empty command, conflicting `content`/`content_b64`, unknown fields, empty/malformed tar.gz upload all rejected at the boundary). Read-file on a non-existent path returns HTTP 404 with `FILE_NOT_FOUND` error code AND the resolved absolute path in the error message. Command-not-found is detected on the agent side (runtime error pattern) and surfaced as HTTP 200 with `error_code: COMMAND_NOT_FOUND` in the response envelope alongside `exit_code: 127` — the response itself is well-formed because the exec request was well-formed; the error code disambiguates the runtime miss.
 
 ---
 

@@ -4,9 +4,11 @@
 
 ## Status
 
-Current frozen version: **contracts/v0.6.0-frozen**
+Current frozen version: **contracts/v0.7.0-frozen**
 
-*Frozen at `contracts/v0.6.0-frozen` on 2026-05-22. Changes require a `contracts/amendment-<desc>` branch and a version bump.*
+*Frozen at `contracts/v0.7.0-frozen` on 2026-05-22 (paired with `spec/v0.7.0`). Changes require a `contracts/amendment-<desc>` branch and a version bump.*
+
+v0.7.0 is a **breaking** amendment introducing SDK-agent ergonomics fixes from the 10-item friction report: `ListSandboxes` RPC; `cwd` field on `ExecCommand`/`ExecSandboxRequest`; `command_not_found` on `ExecResult`/`ExecSandboxResponse`; new `ApiError` variants `InvalidRequest`, `InvalidUpload`, `CommandNotFound`; renamed `ApiError::FileNotFound.path` → `resolved_path` (callers were relying on `.path` — recompile required).
 
 ## Cross-cutting policies
 
@@ -84,9 +86,10 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
 - **Key messages:**
   - `CreateSandboxRequest` / `CreateSandboxResponse` — create a sandbox, returns sandbox_id + subdomain + status (initially `creating`)
   - `GetSandboxRequest` / `GetSandboxResponse` — query sandbox status
+  - `ListSandboxesRequest` / `ListSandboxesResponse` — enumerate all sandboxes the caller owns (added v0.7.0)
   - `DeleteSandboxRequest` / `DeleteSandboxResponse` — stop and remove a sandbox
-  - `ExecSandboxRequest` / `ExecSandboxResponse` — run a command, returns stdout/stderr/exit_code
-- **Invariants:** `sandbox_id` in responses matches the ID from the create or get request. `subdomain` is always the first 12 hex chars of the sandbox UUID. `ExecSandboxResponse` blocks until the command completes or the exec timeout (60s) is reached.
+  - `ExecSandboxRequest` / `ExecSandboxResponse` — run a command, returns stdout/stderr/exit_code. `cwd` (field 4, added v0.7.0) sets the working directory; empty string means default (`/home`). `stdin` (field 3) is the bytes written to the process's stdin before close. `command_not_found` (response field 4, added v0.7.0) is true when the runtime reported the executable was missing — distinguishes "command not found" from a process that ran and exited 127 of its own accord.
+- **Invariants:** `sandbox_id` in responses matches the ID from the create or get request. `subdomain` is always the first 12 hex chars of the sandbox UUID. `ExecSandboxResponse` blocks until the command completes or the exec timeout (60s) is reached. When `command_not_found` is true, `exit_code` is 127 and `stderr` contains the runtime's "executable file not found" message; `stdout` is never used to carry runtime-level errors.
 - **Compatibility:** Adding new RPC methods is additive (minor bump). Changing existing message fields is breaking (major bump).
 
 ### Exec result flow (`ExecResult` in `controller.proto`)
@@ -94,7 +97,7 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
 - **Producer:** Agent (sends exec output back to controller)
 - **Consumer:** Controller (correlates by `exec_id` and delivers to waiting API request)
 - **Purpose:** Closes the exec loop: API → Controller → Agent (ExecCommand) → Agent executes → Agent → Controller (ExecResult) → API → Client.
-- **Key fields:** `exec_id` correlates the result with the originating `ExecCommand`. `exit_code`, `stdout`, `stderr` carry the command output. `error` (field 6, added in v0.6.0) carries a runtime-level error message when the exec infrastructure itself fails (container not found, exec API error). When `error` is non-empty, `exit_code` is -1, `stdout`/`stderr` are empty, and the controller returns a gRPC Internal error rather than forwarding the result as a successful exec.
+- **Key fields:** `exec_id` correlates the result with the originating `ExecCommand`. `exit_code`, `stdout`, `stderr` carry the command output. `error` (field 6, added in v0.6.0) carries a runtime-level error message when the exec infrastructure itself fails (container not found, exec API error). When `error` is non-empty, `exit_code` is -1, `stdout`/`stderr` are empty, and the controller returns a gRPC Internal error rather than forwarding the result as a successful exec. `command_not_found` (field 7, added in v0.7.0) is true when the runtime determined the executable was missing; in that case `exit_code` is 127, `stderr` carries the runtime's diagnostic line, and `stdout` is empty.
 - **Invariant:** `exec_id` is unique per exec invocation (UUID). The controller holds a pending-exec map keyed by `exec_id`; when `ExecResult` arrives, the waiting API request is unblocked.
 
 ### Domain types (`types.rs`)
@@ -118,8 +121,8 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
   - `ControllerError`: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `NoAvailableAgents`, `Database`, `Internal`
   - `ProxyError`: `RoutingMiss`, `TunnelUnavailable`, `UpstreamTimeout`, `UpstreamRejected`, `Internal`
   - `AgentError`: `ControllerDisconnected`, `TunnelDisconnected`, `Runtime`, `SandboxNotFound`, `Internal`
-  - `ApiError`: `Unauthorized`, `SandboxNotFound`, `ControllerUnavailable`, `ExecFailed`, `FileNotFound`, `Internal`
-- **Error codes:** `ApiError` exposes `fn error_code(&self) -> &'static str` that maps each variant to a stable uppercase string identifier (`UNAUTHORIZED`, `SANDBOX_NOT_FOUND`, `CONTROLLER_UNAVAILABLE`, `EXEC_FAILED`, `FILE_NOT_FOUND`, `INTERNAL_ERROR`). These codes are included in REST API error response JSON bodies as the `error_code` field for programmatic handling.
+  - `ApiError`: `Unauthorized`, `SandboxNotFound`, `ControllerUnavailable`, `InvalidRequest`, `InvalidUpload`, `ExecFailed`, `CommandNotFound`, `FileNotFound`, `Internal`
+- **Error codes:** `ApiError` exposes `fn error_code(&self) -> &'static str` that maps each variant to a stable uppercase string identifier (`UNAUTHORIZED`, `SANDBOX_NOT_FOUND`, `CONTROLLER_UNAVAILABLE`, `INVALID_REQUEST`, `INVALID_UPLOAD`, `EXEC_FAILED`, `COMMAND_NOT_FOUND`, `FILE_NOT_FOUND`, `INTERNAL_ERROR`). These codes are included in REST API error response JSON bodies as the `error_code` field for programmatic handling. `INVALID_UPLOAD` covers empty/malformed tar.gz bodies for `write_files` (returned as HTTP 400). `COMMAND_NOT_FOUND` is returned with HTTP 200 (since the exec request itself was valid) but the response envelope carries this code to disambiguate from a process that ran and exited 127. `FileNotFound.resolved_path` carries the absolute path the agent attempted to read, so callers can debug path issues without a second round-trip.
 - **Retry guidance:**
   - Retryable: `Database` (transient), `TunnelUnavailable` (agent may reconnect), `UpstreamTimeout` (sandbox may be slow)
   - Terminal: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `RoutingMiss`, `NoAvailableAgents`

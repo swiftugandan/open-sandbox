@@ -107,6 +107,10 @@ message ExecCommand {
   repeated string command = 2;
   string exec_id = 3;
   bytes stdin = 4;
+  // Working directory inside the container. Empty string means use the
+  // container's default working directory (typically /home — see NFR-API-1).
+  // Maps to OCI Runtime Spec Process.cwd.
+  string cwd = 5;
 }
 
 message FetchLogsCommand {
@@ -121,5 +125,13 @@ message ExecResult {
   int32 exit_code = 3;
   bytes stdout = 4;
   bytes stderr = 5;
+  // Runtime-level failure message (container not found, exec API error). When
+  // non-empty, the API responds 500. Distinct from a non-zero exit_code from
+  // a process that ran successfully.
   string error = 6;
+  // When true, the runtime reported the executable could not be found
+  // (e.g. youki/runc/crun "executable file not found"). Distinct from a
+  // process that ran and exited 127 of its own accord. Surfaces in the API
+  // response as error_code: COMMAND_NOT_FOUND.
+  bool command_not_found = 7;
 }
