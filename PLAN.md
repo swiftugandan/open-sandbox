@@ -196,3 +196,17 @@ Known gaps:
 Once confidence is high, commit with `docs: implementation plan` and tag `plan/v0.1.0`. Phase 6 (implementation) may begin.
 
 Amended with agent-docker extraction, agent-youki module, and feature flag strategy. Tagged `plan/v0.2.0`.
+
+### Module 9: `ops-resilience-observability` (cross-cutting amendment)
+
+**Depends on:** `contracts` v0.4.0
+**Scope:** Three targeted fixes across CLI, proxy, and API crates.
+
+**Sub-tasks:**
+1. Tracing subscriber init in CLI `main()` + lifecycle logging in all `run_*` functions + replace proxy `eprintln!` with `tracing::warn!`
+2. Proxy startup retry with backoff using `PROXY_STARTUP_RETRY_ATTEMPTS` / `PROXY_STARTUP_RETRY_INTERVAL` constants
+3. API error codes via `ApiError::error_code()` + `write_files` response enrichment (`WriteFilesResult`)
+
+**Acceptance criterion:** Proxy survives starting before controller (self-heals within 30s), all components produce JSON log output with `RUST_LOG=info`, API error responses contain `error_code` field, `POST /files/write` returns `{"success": true}`.
+
+Amended with ops-resilience-observability module (proxy startup retry, tracing, API feedback). Tagged `plan/v0.3.0`.
