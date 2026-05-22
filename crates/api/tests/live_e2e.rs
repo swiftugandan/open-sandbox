@@ -314,7 +314,7 @@ async fn live_write_files_to_real_container() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200);
 
     // Verify the file exists via exec
     let resp = client
@@ -369,7 +369,7 @@ async fn live_full_file_roundtrip() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200);
 
     // Read back via file read endpoint
     let resp = client

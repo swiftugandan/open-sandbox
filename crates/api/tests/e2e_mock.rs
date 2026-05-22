@@ -226,7 +226,7 @@ async fn e2e_invalid_uuid_returns_400() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn e2e_write_files_returns_204() {
+async fn e2e_write_files_returns_200() {
     let sandbox_id = SandboxId::new();
     let controller_url = start_mock_controller(&sandbox_id).await;
     let api_url = start_api_server(&controller_url).await;
@@ -242,7 +242,9 @@ async fn e2e_write_files_returns_204() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], true);
 }
 
 #[tokio::test(flavor = "multi_thread")]
