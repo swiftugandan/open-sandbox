@@ -8,7 +8,7 @@ A Rust-based sandbox platform where agents dial out to a controller/proxy over T
 
 ## Current phase
 
-Phase 6 in progress: `agent-youki` module at GREEN phase (all 18 tests pass in Docker). All prior modules complete (controller, agent, proxy, CLI shell, infra, agent-docker, proxy-http, api, api-files). The `agent-youki` module replaces Docker Engine with youki/libcontainer as a daemonless OCI container runtime (ADR-009). `DockerRuntime` extracted to its own crate (`crates/agent-docker/`); `YoukiRuntime` in `crates/agent-youki/`. Runtime selection via compile-time Cargo features (`docker` default, `youki` for Linux production). Contracts amended to v0.3.0: `AgentError::Docker` renamed to `AgentError::Runtime`. Spec, SAD, and plan amended accordingly.
+Phase 6 complete: all modules implemented including `agent-youki`. Controller, agent, proxy, CLI shell, infra, agent-docker, proxy-http, api, api-files, and agent-youki modules done. The `agent-youki` module (`module/agent-youki/done`) replaces Docker Engine with youki/libcontainer as a daemonless OCI container runtime (ADR-009). Image pull via oci-client, container lifecycle via libcontainer, networking via CNI bridge+portmap, exec via nsenter. `DockerRuntime` extracted to its own crate (`crates/agent-docker/`); `YoukiRuntime` in `crates/agent-youki/`. Runtime selection via compile-time Cargo features (`docker` default, `youki` for Linux production). Contracts at v0.3.0: `AgentError::Docker` renamed to `AgentError::Runtime`. Build constraint: full build/test on Linux only (`Dockerfile.test` + `docker-compose.test.yml`).
 
 ## Quick status
 
