@@ -102,10 +102,11 @@ async fn extract_layer(data: &[u8], rootfs: &PathBuf) -> Result<(), AgentError> 
                 .to_path_buf();
 
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with(".wh.") {
+                if let Some(whiteout_target) = name.strip_prefix(".wh.") {
                     let target = rootfs
                         .join(path.parent().unwrap_or(std::path::Path::new("")))
-                        .join(&name[4..]);
+                        .join(whiteout_target);
+                    // OCI whiteout: target may not exist if a later layer already removed it
                     let _ = std::fs::remove_file(&target);
                     let _ = std::fs::remove_dir_all(&target);
                     continue;

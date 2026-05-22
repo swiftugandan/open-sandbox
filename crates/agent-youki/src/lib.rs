@@ -14,6 +14,11 @@ use open_sandbox_agent::container::{
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
+const CONTAINER_ID_PREFIX: &str = "osb";
+const CGROUP_PATH_PREFIX: &str = "/open-sandbox";
+const NETWORK_NAME: &str = "open-sandbox";
+const STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
+
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::container::Container;
 use libcontainer::syscall::syscall::SyscallType;
@@ -67,6 +72,12 @@ impl YoukiRuntime {
     fn state_dir(&self) -> PathBuf {
         self.config.root_dir.join("state")
     }
+
+    fn lock_containers(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, ContainerMetadata>>, AgentError> {
+        self.containers.lock().map_err(|_| AgentError::Runtime {
+            detail: "container metadata lock poisoned".into(),
+        })
+    }
 }
 
 impl ContainerRuntime for YoukiRuntime {
@@ -77,7 +88,7 @@ impl ContainerRuntime for YoukiRuntime {
         let rootfs = self.image_manager.pull_and_unpack(&config.image).await?;
 
         let host_port = cni::allocate_port()?;
-        let container_id = format!("osb-{}", uuid::Uuid::new_v4());
+        let container_id = format!("{CONTAINER_ID_PREFIX}-{}", uuid::Uuid::new_v4());
 
         let container_dir = self
             .config
@@ -91,7 +102,7 @@ impl ContainerRuntime for YoukiRuntime {
                 detail: format!("failed to create bundle directory: {e}"),
             })?;
 
-        let cgroup_path = format!("/open-sandbox/{container_id}");
+        let cgroup_path = format!("{CGROUP_PATH_PREFIX}/{container_id}");
         let rootfs_str = rootfs.to_string_lossy().to_string();
         let oci_spec =
             spec::generate_full_spec(&config, &rootfs_str, Some(&cgroup_path))?;
@@ -133,8 +144,12 @@ impl ContainerRuntime for YoukiRuntime {
 
         let netns_path = format!("/proc/{init_pid}/ns/net");
 
-        let mut conflist = cni::generate_conflist("open-sandbox");
-        cni::inject_port_mappings(&mut conflist, host_port, config.exposed_port as u16);
+        let container_port = u16::try_from(config.exposed_port).map_err(|_| AgentError::Runtime {
+            detail: format!("exposed_port {} exceeds u16 range", config.exposed_port),
+        })?;
+
+        let mut conflist = cni::generate_conflist(NETWORK_NAME);
+        cni::inject_port_mappings(&mut conflist, host_port, container_port);
         cni::invoke_cni(
             &conflist,
             "ADD",
@@ -162,7 +177,7 @@ impl ContainerRuntime for YoukiRuntime {
         })??;
 
         let sandbox_id = config.sandbox_id.clone();
-        self.containers.lock().unwrap().insert(
+        self.lock_containers()?.insert(
             container_id.clone(),
             ContainerMetadata {
                 sandbox_id: sandbox_id.clone(),
@@ -186,17 +201,18 @@ impl ContainerRuntime for YoukiRuntime {
         timeout: Duration,
     ) -> Result<(), AgentError> {
         let container_id = id.0.clone();
-        let metadata = self.containers.lock().unwrap().remove(&container_id);
+        let metadata = self.lock_containers()?.remove(&container_id);
 
         let state_dir = self.state_dir();
         let cid = container_id.clone();
-        let grace = timeout.min(Duration::from_secs(10));
+        let grace = timeout.min(STOP_GRACE_PERIOD);
         tokio::task::spawn_blocking(move || -> Result<(), AgentError> {
             let container_root = state_dir.join(&cid);
             let mut container =
                 Container::load(container_root).map_err(|e| AgentError::Runtime {
                     detail: format!("failed to load container for stop: {e}"),
                 })?;
+            // SIGTERM may fail if process already exited — not an error during shutdown
             let _ = container.kill(nix::sys::signal::Signal::SIGTERM, true);
             std::thread::sleep(grace);
             container.delete(true).map_err(|e| AgentError::Runtime {
@@ -209,7 +225,8 @@ impl ContainerRuntime for YoukiRuntime {
         })??;
 
         if let Some(meta) = &metadata {
-            let conflist = cni::generate_conflist("open-sandbox");
+            let conflist = cni::generate_conflist(NETWORK_NAME);
+            // CNI DEL is best-effort cleanup; network may already be torn down
             let _ = cni::invoke_cni(
                 &conflist,
                 "DEL",
@@ -221,6 +238,7 @@ impl ContainerRuntime for YoukiRuntime {
         }
 
         if let Some(meta) = metadata {
+            // Best-effort cleanup; directory may not exist if creation failed partway
             let _ = tokio::fs::remove_dir_all(&meta.container_dir).await;
         }
 
@@ -228,7 +246,7 @@ impl ContainerRuntime for YoukiRuntime {
     }
 
     async fn list_sandbox_containers(&self) -> Result<Vec<ContainerInfo>, AgentError> {
-        let containers = self.containers.lock().unwrap();
+        let containers = self.lock_containers()?;
         Ok(containers
             .iter()
             .map(|(cid, meta)| ContainerInfo {
