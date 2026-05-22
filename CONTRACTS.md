@@ -4,9 +4,9 @@
 
 ## Status
 
-Current frozen version: **not yet frozen**
+Current frozen version: **contracts/v0.3.0-frozen**
 
-Once frozen, this section reads: *Frozen at `contracts/v0.1.0-frozen` on `<date>`. Changes require a `contracts/amendment-<desc>` branch and a version bump.*
+*Frozen at `contracts/v0.3.0-frozen` on 2026-05-22. Changes require a `contracts/amendment-<desc>` branch and a version bump.*
 
 ## Cross-cutting policies
 
@@ -117,12 +117,12 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
 - **Kinds:**
   - `ControllerError`: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `NoAvailableAgents`, `Database`, `Internal`
   - `ProxyError`: `RoutingMiss`, `TunnelUnavailable`, `UpstreamTimeout`, `UpstreamRejected`, `Internal`
-  - `AgentError`: `ControllerDisconnected`, `TunnelDisconnected`, `Docker`, `SandboxNotFound`, `Internal`
+  - `AgentError`: `ControllerDisconnected`, `TunnelDisconnected`, `Runtime`, `SandboxNotFound`, `Internal`
   - `ApiError`: `Unauthorized`, `SandboxNotFound`, `ControllerUnavailable`, `ExecFailed`, `Internal`
 - **Retry guidance:**
   - Retryable: `Database` (transient), `TunnelUnavailable` (agent may reconnect), `UpstreamTimeout` (sandbox may be slow)
   - Terminal: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `RoutingMiss`, `NoAvailableAgents`
-  - Ambiguous: `Internal`, `Docker` (may be transient or persistent depending on cause)
+  - Ambiguous: `Internal`, `Runtime` (may be transient or persistent depending on cause)
 
 ### Constants (`constants.rs`)
 

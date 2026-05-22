@@ -4,31 +4,27 @@
 
 ## Prerequisites
 
-- [x] `contracts/v0.1.0-frozen` tag exists
+- [x] `contracts/v0.3.0-frozen` tag exists
 - [x] `SPEC.md`, `SAD.md`, `CONTRACTS.md` are committed and tagged
 - [ ] Final confidence gate (below) is "high"
 
 ## Dependency DAG
 
 ```
-  open-sandbox-contracts (frozen)
+  open-sandbox-contracts (frozen at v0.3.0)
        │
-   ┌───┼───────────┬──────┐
-   │   │            │      │
-   │   │            │      │
-   ▼   ▼            ▼      ▼
- agent controller  proxy  api
-   │       │        │      │
-   │       │        │      │
-   └───┬───┘        │      │
-       │            │      │
-       └─────┬──────┘──────┘
-             │
-             ▼
-      open-sandbox (CLI binary — subcommand dispatch)
+   ┌───┼──────────┬──────┬──────────────┬───────────────┐
+   │   │          │      │              │               │
+   ▼   ▼          ▼      ▼              ▼               ▼
+ agent controller proxy  api     agent-docker(MOVED) agent-youki(NEW)
+   │       │      │      │              │               │
+   └───┬───┘──────┘──────┘──────────────┘───────────────┘
+       │
+       ▼
+    open-sandbox (CLI — feature-gated runtime selection)
 ```
 
-No cycles. Each component depends only on `contracts`. The final `open-sandbox` binary is the shell that dispatches to subcommands; it depends on all three component crates.
+No cycles. Each component depends only on `contracts` (and `agent` for the runtime crates, which defines the `ContainerRuntime` trait). The final `open-sandbox` binary is the shell that dispatches to subcommands; runtime selection is compile-time via Cargo features (`docker` default, `youki` for Linux production).
 
 ## Implementation order
 
@@ -112,6 +108,50 @@ No cycles. Each component depends only on `contracts`. The final `open-sandbox` 
   - Cloud-init reliability (agent binary download, systemd unit installation)
   - DNS propagation delay for wildcard records
   - Let's Encrypt DNS-01 challenge timing with Cloudflare
+- **Amendment for youki:** Worker cloud-init replaces Docker installation with CNI plugin installation. The systemd unit drops `After=docker.service` / `Requires=docker.service`. Binary is built with `--features youki`.
+
+### 8a. `agent-docker` (extract DockerRuntime from CLI)
+
+- **Depends on:** `contracts`, `agent` (for `ContainerRuntime` trait)
+- **Lives in:** `crates/agent-docker/`
+- **Consumes contracts:** `AgentError::Runtime` (error variant)
+- **Produces:** `DockerRuntime` implementing `ContainerRuntime` trait
+- **Implementation scope:** Mechanical extraction — move `crates/cli/src/docker_runtime.rs` to `crates/agent-docker/src/lib.rs`. No logic changes. Update CLI crate to depend on `agent-docker` behind the `docker` feature flag.
+- **Acceptance criterion:** `cargo check -p open-sandbox-agent-docker` compiles. `cargo test -p open-sandbox` (with default `docker` feature) passes all existing tests. No behavioral change.
+- **Estimated complexity:** S (mechanical refactor)
+
+### 8b. `agent-youki` (YoukiRuntime — daemonless OCI container runtime)
+
+- **Depends on:** `contracts` (v0.3.0), `agent` (for `ContainerRuntime` trait)
+- **Lives in:** `crates/agent-youki/`
+- **Consumes contracts:** `AgentError::Runtime` (error variant)
+- **Produces:** `YoukiRuntime` implementing `ContainerRuntime` trait
+- **Implementation scope:**
+  - `lib.rs` — `YoukiRuntime` struct with `ContainerRuntime` impl (~200 lines)
+  - `image.rs` — OCI image pull and unpack via `oci-client` (~150 lines)
+  - `cni.rs` — CNI plugin invocation, bridge+portmap conflist, dynamic port allocation (~450 lines)
+  - `spec.rs` — OCI spec generation from `ContainerConfig` (~80 lines)
+  - `exec.rs` — `TenantContainerBuilder` with pipe-based stdio capture (~100 lines)
+  - CLI amendment: `run_agent` conditionally constructs `YoukiRuntime` or `DockerRuntime` based on feature flag
+- **Acceptance criterion (live e2e):** Given the agent binary compiled with `--features youki` running on a Linux VM with CNI plugins installed, the agent starts, registers with the controller, receives a `StartSandbox` command, pulls an alpine:latest image via oci-client, creates an OCI container via libcontainer with bridge+portmap networking, reports `SandboxStatus(running)`, executes a command via `exec` and returns stdout/stderr/exit_code, and the sandbox is accessible via the reverse tunnel. Stop removes the container and cleans up CNI state.
+- **Estimated complexity:** L
+- **Risks:**
+  - CNI dynamic port allocation (bind 0, read port, close, pass to portmap) has a theoretical TOCTOU race. Benign in practice (portmap uses iptables DNAT).
+  - libcontainer documentation is 14.7% — implementation relies on source reading.
+  - Cannot run live tests on macOS — CI must use Linux runners or Docker-in-Docker.
+  - OCI image whiteout file handling and zstd layer support are production gaps for complex images.
+
+## Runtime feature flags (CLI crate)
+
+The `open-sandbox` binary supports compile-time runtime selection via Cargo features:
+
+- `docker` (default): Uses `DockerRuntime` backed by `bollard`. Suitable for macOS development and environments with Docker Engine installed.
+- `youki`: Uses `YoukiRuntime` backed by `libcontainer`, `oci-client`, `oci-spec`. Requires Linux with CNI plugins. Production default for worker VMs.
+
+Build commands:
+- Dev (macOS): `cargo build` (docker feature, default)
+- Production (Linux): `cargo build --features youki --no-default-features` or via Alpine Dockerfile
+- Check only (macOS, youki code): `cargo check -p open-sandbox-agent-youki --target x86_64-unknown-linux-musl`
 
 ---
 
@@ -147,8 +187,12 @@ Residual risks:
   - All three core binaries (controller, agent, proxy) are estimated L complexity. The total implementation effort is substantial. The contracts freeze and TDD discipline mitigate integration risk, but calendar risk is real.
   - The Pulumi stack (module 6) depends on a working binary, so it cannot be started until at least the CLI shell (module 5) produces a runnable artifact. However, the Platform abstraction layer and cloud-init scripts can be developed in parallel with the Rust work.
   - Live e2e testing for the proxy requires a real TLS cert and DNS setup, which means the infra module (or a local dev equivalent) must exist before proxy live-e2e can complete.
+  - agent-youki can only be fully built and tested on Linux. macOS dev iteration is limited to cargo check with musl target. CI must use Linux runners.
+  - libcontainer documentation is sparse (14.7% coverage); implementation relies on reading youki source.
 Known gaps:
   - None blocking. The DAG is acyclic, all contracts surfaces are covered, and every acceptance criterion is stated as a testable contract-boundary assertion.
 ```
 
 Once confidence is high, commit with `docs: implementation plan` and tag `plan/v0.1.0`. Phase 6 (implementation) may begin.
+
+Amended with agent-docker extraction, agent-youki module, and feature flag strategy. Tagged `plan/v0.2.0`.

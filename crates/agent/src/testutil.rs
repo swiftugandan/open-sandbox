@@ -96,8 +96,8 @@ impl ContainerRuntime for FailingContainerRuntime {
         &self,
         _config: ContainerConfig,
     ) -> Result<ContainerInfo, AgentError> {
-        Err(AgentError::Docker {
-            detail: "mock docker failure".into(),
+        Err(AgentError::Runtime {
+            detail: "mock runtime failure".into(),
         })
     }
 
@@ -106,8 +106,8 @@ impl ContainerRuntime for FailingContainerRuntime {
         _id: &ContainerId,
         _timeout: Duration,
     ) -> Result<(), AgentError> {
-        Err(AgentError::Docker {
-            detail: "mock docker failure".into(),
+        Err(AgentError::Runtime {
+            detail: "mock runtime failure".into(),
         })
     }
 
@@ -121,8 +121,8 @@ impl ContainerRuntime for FailingContainerRuntime {
         _command: Vec<String>,
         _stdin: Vec<u8>,
     ) -> Result<ExecOutput, AgentError> {
-        Err(AgentError::Docker {
-            detail: "mock docker failure".into(),
+        Err(AgentError::Runtime {
+            detail: "mock runtime failure".into(),
         })
     }
 }

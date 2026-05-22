@@ -14,8 +14,8 @@ Developers need isolated, publicly-accessible sandbox environments that can run 
 - **FR-2:** The controller authenticates agents via join tokens (opaque strings), stores agent records in Postgres, and maintains a live connection table. Agents send heartbeats; the controller marks agents dead after N consecutive missed heartbeats and reschedules their sandboxes.
   - *Rationale:* Heartbeat-based failure detection is standard for distributed systems with long-lived connections. N = 3 missed heartbeats at 5-second intervals (15s detection) balances detection speed with tolerance for transient network jitter.
 
-- **FR-3:** The controller can issue `StartSandbox`, `StopSandbox`, `Exec`, and `FetchLogs` commands to agents over the existing gRPC stream. Agents execute sandbox lifecycle operations via the Docker Engine API (Unix socket).
-  - *Source:* Docker Engine API provides container lifecycle management via `/var/run/docker.sock` [3].
+- **FR-3:** The controller can issue `StartSandbox`, `StopSandbox`, `Exec`, and `FetchLogs` commands to agents over the existing gRPC stream. Agents execute sandbox lifecycle operations via a pluggable container runtime. The default production runtime uses youki/libcontainer (daemonless OCI) for direct in-process container management. A Docker Engine runtime (via Unix socket) is available as a development fallback.
+  - *Source:* OCI Runtime Specification defines container lifecycle operations [9]. youki/libcontainer implements the OCI spec as an in-process Rust library [15]. Docker Engine API provides an alternative via `/var/run/docker.sock` [3].
 
 - **FR-4:** Each agent opens a second gRPC connection to the proxy for reverse tunneling. The proxy multiplexes virtual streams over the single HTTP/2 connection — one per inbound sandbox request — using HTTP/2's native stream multiplexing.
   - *Source:* HTTP/2 (RFC 9113) supports multiplexing multiple streams over a single TCP connection [4]. gRPC maps each RPC to an HTTP/2 stream [1].
@@ -80,8 +80,8 @@ Developers need isolated, publicly-accessible sandbox environments that can run 
 - **NFR-SEC-2:** The proxy routes sandbox traffic solely based on the routing table written by the controller. A sandbox ID routes only to the agent that owns it. The platform does not authenticate end-user sandbox traffic — that is the sandbox's responsibility.
   - *Rationale:* The platform is a transport layer. Imposing auth requirements on sandbox traffic would limit the types of applications sandboxes can serve.
 
-- **NFR-SEC-3:** Docker sandboxes run with default isolation (Linux namespaces: pid, network, mount, ipc, uts; cgroups for CPU/memory limits). No `--privileged` flag. Seccomp default profile applied.
-  - *Source:* OCI Runtime Specification defines container isolation via namespaces and cgroups [9]. Docker's default seccomp profile blocks ~44 syscalls [3].
+- **NFR-SEC-3:** Sandboxes run with OCI-standard isolation (Linux namespaces: pid, network, mount, ipc, uts; cgroups v2 for CPU/memory limits). No privileged capabilities. Seccomp profile applied via libseccomp (adds 8K to binary size; no reason to disable).
+  - *Source:* OCI Runtime Specification defines container isolation via namespaces and cgroups [9]. libseccomp provides the seccomp BPF filter interface [15].
 
 - **NFR-SEC-4:** Join tokens are generated with ≥ 128 bits of entropy, transmitted only over TLS, stored hashed (bcrypt or argon2) in Postgres, and are revocable.
   - *Rationale:* 128 bits of entropy makes brute-force infeasible. Hashing prevents token leakage from database compromise.
@@ -124,7 +124,7 @@ Developers need isolated, publicly-accessible sandbox environments that can run 
 
 - **C-1:** Default deployment cost must stay under $20/month on Hetzner. This constrains the default to self-hosted Postgres on the controller VM, no managed load balancer, and small spot/cheap VMs for workers.
   - *Source:* Hetzner CAX11 (2 vCPU ARM, 4 GB RAM): ~€3.79/month. CX22 (2 vCPU x86, 4 GB RAM): ~€4.59/month. 20 GB block volume: ~€1/month. Floating IP: ~€0.60/month [12].
-- **C-2:** Agent binary must be statically linked and run on Linux (x86_64, aarch64) and macOS (aarch64) without runtime dependencies beyond Docker.
+- **C-2:** Agent binary must be statically linked and run on Linux (x86_64, aarch64) and macOS (aarch64) without runtime dependencies beyond CNI plugin binaries (bridge, portmap, loopback) on Linux production hosts. Docker is an optional development dependency for the Docker runtime backend.
 - **C-3:** The platform must work when agents are behind NAT, corporate firewalls, or residential ISPs — the only network requirement is outbound TCP/443.
 - **C-4:** DNS is managed via Cloudflare regardless of compute cloud, to decouple domain management from infrastructure provider.
 
@@ -139,10 +139,10 @@ Developers need isolated, publicly-accessible sandbox environments that can run 
 
 ## Glossary
 
-- **Agent:** The binary running on a worker machine that manages Docker sandboxes and maintains connections to the controller and proxy.
+- **Agent:** The binary running on a worker machine that manages OCI container sandboxes and maintains connections to the controller and proxy.
 - **Controller:** The control-plane component that manages agent registrations, sandbox scheduling, and the routing table.
 - **Proxy:** The data-plane component that terminates public TLS, routes requests by subdomain to agents via reverse tunnels.
-- **Sandbox:** An isolated Docker container running a user's workload, accessible via a unique subdomain.
+- **Sandbox:** An isolated OCI container running a user's workload, accessible via a unique subdomain.
 - **Join token:** An opaque credential used by an agent to authenticate with the controller during registration.
 - **BYO worker:** A bring-your-own worker — any machine running the agent binary that has been registered with a join token.
 - **Routing table:** The Postgres-backed mapping from sandbox ID to the agent that hosts it, consumed by the proxy for request routing.
@@ -165,6 +165,7 @@ Developers need isolated, publicly-accessible sandbox environments that can run 
 12. Hetzner Cloud — ARM and x86 VM pricing, included bandwidth. https://www.hetzner.com/cloud/
 13. Vercel Sandbox REST API — file write via tar.gz upload, file read via octet-stream. https://vercel.com/docs/rest-api/sandboxes/write-files
 14. RFC 6750 — Bearer Token Usage for OAuth 2.0. https://www.rfc-editor.org/rfc/rfc6750
+15. youki — OCI container runtime in Rust, libcontainer library. https://github.com/youki-dev/youki
 
 ---
 
@@ -183,3 +184,5 @@ Known gaps:
 ```
 
 Amended with FR-11 through FR-14 (API gateway). Tagged `spec/v0.2.0`.
+
+Amended with runtime-agnostic language and youki/libcontainer as default production runtime (FR-3, NFR-SEC-3, C-2, glossary). Tagged `spec/v0.3.0`.

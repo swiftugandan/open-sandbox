@@ -27,7 +27,7 @@ pub struct DockerRuntime {
 
 impl DockerRuntime {
     pub fn connect() -> Result<Self, AgentError> {
-        let client = bollard::Docker::connect_with_local_defaults().map_err(docker_err)?;
+        let client = bollard::Docker::connect_with_local_defaults().map_err(runtime_err)?;
         Ok(Self { client })
     }
 }
@@ -53,18 +53,18 @@ impl ContainerRuntime for DockerRuntime {
             .client
             .create_container(Some(options), docker_config)
             .await
-            .map_err(docker_err)?;
+            .map_err(runtime_err)?;
 
         self.client
             .start_container::<String>(&created.id, None)
             .await
-            .map_err(docker_err)?;
+            .map_err(runtime_err)?;
 
         let inspect = self
             .client
             .inspect_container(&created.id, None)
             .await
-            .map_err(docker_err)?;
+            .map_err(runtime_err)?;
 
         let host_port = extract_host_port(&inspect, port_hint.as_deref())?;
 
@@ -91,7 +91,7 @@ impl ContainerRuntime for DockerRuntime {
         self.client
             .remove_container(&id.0, Some(remove_opts))
             .await
-            .map_err(docker_err)?;
+            .map_err(runtime_err)?;
 
         Ok(())
     }
@@ -108,7 +108,7 @@ impl ContainerRuntime for DockerRuntime {
             .client
             .list_containers(Some(options))
             .await
-            .map_err(docker_err)?;
+            .map_err(runtime_err)?;
 
         let mut result = Vec::with_capacity(containers.len());
         for container in containers {
@@ -166,7 +166,7 @@ impl ContainerRuntime for DockerRuntime {
             .client
             .create_exec(&id.0, exec_opts)
             .await
-            .map_err(docker_err)?;
+            .map_err(runtime_err)?;
 
         let start_opts = StartExecOptions {
             detach: false,
@@ -177,7 +177,7 @@ impl ContainerRuntime for DockerRuntime {
             .client
             .start_exec(&exec_created.id, Some(start_opts))
             .await
-            .map_err(docker_err)?;
+            .map_err(runtime_err)?;
 
         let mut stdout_buf = Vec::new();
         let mut stderr_buf = Vec::new();
@@ -192,16 +192,16 @@ impl ContainerRuntime for DockerRuntime {
                 input
                     .write_all(&stdin)
                     .await
-                    .map_err(|e| AgentError::Docker {
+                    .map_err(|e| AgentError::Runtime {
                         detail: e.to_string(),
                     })?;
-                input.shutdown().await.map_err(|e| AgentError::Docker {
+                input.shutdown().await.map_err(|e| AgentError::Runtime {
                     detail: e.to_string(),
                 })?;
             }
 
             while let Some(chunk) = output.next().await {
-                let chunk = chunk.map_err(docker_err)?;
+                let chunk = chunk.map_err(runtime_err)?;
                 match chunk {
                     bollard::container::LogOutput::StdOut { message } => {
                         stdout_buf.extend_from_slice(&message);
@@ -218,7 +218,7 @@ impl ContainerRuntime for DockerRuntime {
             .client
             .inspect_exec(&exec_created.id)
             .await
-            .map_err(docker_err)?;
+            .map_err(runtime_err)?;
 
         let exit_code = inspect.exit_code.unwrap_or(-1) as i32;
 
@@ -280,7 +280,7 @@ fn extract_host_port(
         .network_settings
         .as_ref()
         .and_then(|ns| ns.ports.as_ref())
-        .ok_or_else(|| AgentError::Docker {
+        .ok_or_else(|| AgentError::Runtime {
             detail: "no port mappings found".into(),
         })?;
 
@@ -289,7 +289,7 @@ fn extract_host_port(
     } else {
         ports.values().find_map(|b| b.as_ref())
     }
-    .ok_or_else(|| AgentError::Docker {
+    .ok_or_else(|| AgentError::Runtime {
         detail: "no port bindings available".into(),
     })?;
 
@@ -297,13 +297,13 @@ fn extract_host_port(
         .first()
         .and_then(|b| b.host_port.as_ref())
         .and_then(|p| p.parse::<u16>().ok())
-        .ok_or_else(|| AgentError::Docker {
+        .ok_or_else(|| AgentError::Runtime {
             detail: "could not parse host port".into(),
         })
 }
 
-fn docker_err(e: bollard::errors::Error) -> AgentError {
-    AgentError::Docker {
+fn runtime_err(e: bollard::errors::Error) -> AgentError {
+    AgentError::Runtime {
         detail: e.to_string(),
     }
 }

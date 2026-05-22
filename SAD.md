@@ -13,8 +13,8 @@
   End users ──HTTPS──► [Proxy] ─────routing────► [Agent] ──► [Sandbox Container]
                     │     ▲                          │            │
                     │     │                          │            │
-                    │  TLS term                  Docker API       │
-                    │  Host routing               (local)         │
+                    │  TLS term               OCI Runtime         │
+                    │  Host routing           (in-process)        │
                     │                                             │
   AI agents ──REST──► [API Gateway] ──gRPC──► [Controller] ◄──gRPC──── [Agent]           │
   Operators ──REST──►      │                     │                                     │
@@ -32,7 +32,9 @@
   - BYO developers: run agent binary on their own machines
   - Cloudflare: DNS management, DNS-01 challenge for TLS certs
   - Let's Encrypt: TLS certificate authority
-  - Docker Engine: container runtime on each worker
+  - youki/libcontainer: in-process daemonless OCI container runtime
+  - CNI plugins: bridge + portmap + loopback for container networking
+  - OCI registries: container image pull via oci-client
 ```
 
 ### Trust boundaries
@@ -43,7 +45,7 @@
 
 3. **Controller → Agent:** Trusted. The agent validates the controller's TLS certificate. Commands from the controller (StartSandbox, StopSandbox, Exec, FetchLogs) are executed without further authentication — the TLS channel is the trust boundary.
 
-4. **Agent → Docker Engine:** Trusted. The agent has full access to the Docker socket on its host. Sandboxes are isolated from each other and from the agent via Linux namespaces and cgroups (NFR-SEC-3), but the agent is not isolated from Docker — it is the supervisor.
+4. **Agent → OCI Runtime (in-process):** Trusted. The agent calls libcontainer directly within the same process — no socket, no daemon. Container isolation relies on kernel namespaces and cgroups, created by libcontainer's system calls. The agent is the supervisor. CNI plugins (separate binaries) handle networking via an exec-based protocol.
 
 5. **Proxy → Agent (reverse tunnel):** Trusted after registration. The proxy uses the routing table (written by the controller) to determine which agent serves which sandbox. A compromised proxy could route traffic to the wrong agent, but it cannot forge agent authentication.
 
@@ -68,7 +70,7 @@
 - **API Gateway:** owns the external control-plane surface — REST endpoints for sandbox lifecycle (create, get, delete), command execution, and file operations. Translates REST to gRPC unary RPCs against the controller. Authenticates clients via API key. Speaks HTTP to clients, gRPC to the controller.
 - **Controller:** owns agent lifecycle (registration, heartbeat monitoring, dead-agent detection), sandbox scheduling (assign sandbox to agent), routing-table writes, join-token management. Speaks gRPC (bidirectional streams) to agents, gRPC (unary RPCs) to the API gateway, SQL to Postgres.
 - **Proxy:** owns TLS termination, Host-header-based routing, and reverse-tunnel management. Speaks HTTPS to end users, gRPC (reverse tunnel) to agents, SQL (read-only + LISTEN) to Postgres.
-- **Agent:** owns sandbox lifecycle on its host (Docker container create/start/stop/remove), heartbeat emission, resource reporting, and reverse-tunnel data forwarding. Speaks gRPC to controller and proxy, Docker API to local engine.
+- **Agent:** owns sandbox lifecycle on its host (OCI container create/start/stop/remove), heartbeat emission, resource reporting, and reverse-tunnel data forwarding. Speaks gRPC to controller and proxy; calls libcontainer in-process for container operations, CNI plugins for networking, and oci-client for image pull.
 - **Postgres:** owns all durable state. Routing-table changes propagated to proxies via LISTEN/NOTIFY.
 - **Contracts crate:** owns all shared types — message schemas, error types, newtypes. Every binary depends on it; no binary depends on another binary's internals.
 
@@ -88,7 +90,7 @@ Sandbox lifecycle:
   Operator ──CreateSandbox(image, config)──► Controller API
   Controller ──[pick agent, write PG, NOTIFY proxy]──► Postgres
   Controller ──StartSandbox(sandbox_id, image, config)──► Agent
-  Agent ──[docker create + start]──► Docker
+  Agent ──[oci-client pull + libcontainer create + CNI ADD + start]──► OCI Container
   Agent ──SandboxStatus(sandbox_id, running)──► Controller
 
 Request routing:
@@ -197,23 +199,25 @@ Reverse tunnel setup:
 **Internal structure.**
 - `controller_client` — gRPC client maintaining the bidi stream to the controller (registration, heartbeats, receiving commands)
 - `proxy_client` — gRPC client maintaining the reverse tunnel to the proxy (receiving forwarded requests)
-- `sandbox_manager` — manages Docker container lifecycle via the Docker Engine API
+- `sandbox_manager` — manages OCI container lifecycle via the `ContainerRuntime` trait. Production: `YoukiRuntime` (libcontainer + CNI + oci-client). Development: `DockerRuntime` (bollard).
+- `image_manager` — pulls and unpacks OCI images from registries via `oci-client` (production runtime only)
+- `cni_manager` — invokes CNI plugins (bridge, portmap, loopback) for container networking and dynamic port allocation (production runtime only)
 - `tunnel_forwarder` — receives virtual streams from the proxy, connects them to local sandbox ports
 - `reconnect_loop` — exponential backoff with jitter for both controller and proxy connections
 - `resource_monitor` — reports available CPU/memory to the controller
 
 **State.**
-- Persistent: none on the agent itself. Sandbox containers are Docker's state. Agent ID is generated on first run and stored in a local file for reconnection identity.
+- Persistent: none on the agent itself. Sandbox containers are OCI runtime state managed by libcontainer under a configurable root directory (default: `/run/open-sandbox/containers`). Agent ID is generated on first run and stored in a local file for reconnection identity.
 - Ephemeral (in-memory): list of running sandboxes, controller stream handle, proxy tunnel handle, active forwarded connections
 
 **Failure modes.**
 - Controller connection lost: agent enters reconnection backoff. Existing sandboxes continue running. New commands cannot be received. Heartbeats stop — controller will eventually mark agent dead if reconnection takes too long.
 - Proxy tunnel lost: agent enters reconnection backoff. Sandbox traffic is unavailable until tunnel is re-established. Sandboxes themselves are unaffected.
-- Docker daemon failure: all sandbox operations fail. Agent reports `ResourceReport` with zero capacity. Controller stops scheduling new sandboxes to this agent.
-- Agent crash: Docker containers continue running (Docker manages their lifecycle). On restart, agent reconnects and reconciles its sandbox list with Docker's actual state.
+- Container runtime error: individual sandbox operations may fail (e.g., image pull failure, CNI plugin error, libcontainer syscall failure). Agent reports errors per-sandbox rather than globally. No daemon to fail — runtime errors are per-operation.
+- Agent crash: OCI containers continue running (kernel manages namespaces/cgroups). On restart, agent reconnects and reconciles its sandbox list with libcontainer's state directory.
 
 **Observability surface.**
-- Prometheus metrics: `agent_sandboxes_running`, `agent_tunnel_active`, `agent_controller_connected` (gauge), `agent_forwarded_requests_total`, `agent_docker_errors_total`
+- Prometheus metrics: `agent_sandboxes_running`, `agent_tunnel_active`, `agent_controller_connected` (gauge), `agent_forwarded_requests_total`, `agent_runtime_errors_total` (by type: `lifecycle`, `exec`, `image_pull`, `cni`)
 - Structured JSON logs: sandbox lifecycle events, connection state changes, Docker operations
 
 **Contracts consumed.**
@@ -388,6 +392,12 @@ Configuration shape per component:
 - **Decision:** Exec-backed file operations. Writes upload tar.gz to the API, which sends an exec that pipes the archive into `tar xzf`. Reads exec `cat <path>` and return the output.
 - **Consequences:** No changes to the tunnel protocol or agent. File operations ride the existing exec path. Latency is higher than a dedicated channel, but AI agent file operations are infrequent and small. The tar.gz convention matches Vercel's sandbox SDK, making future SDK compatibility easier.
 
+### ADR-009: Daemonless OCI runtime via youki/libcontainer
+
+- **Context:** Each agent VM runs Docker Engine (`dockerd` + `containerd`), consuming ~250MB resident memory for the daemon. The agent uses only low-level container primitives (create, start, exec, stop, delete, port-forward) that map directly to OCI runtime operations. Docker's higher-level features (Compose, Swarm, build, image layer caching) are unused. Spike 001 validated that youki's `libcontainer` crate provides the same primitives as an in-process Rust library with zero daemon overhead and a ~542K static binary.
+- **Decision:** Replace Docker Engine with youki/libcontainer as the default production container runtime. The existing `ContainerRuntime` trait remains unchanged. `YoukiRuntime` is a new implementation alongside the existing `DockerRuntime`, each in its own crate (`crates/agent-youki/`, `crates/agent-docker/`). Runtime selection is compile-time via Cargo feature flags: `youki` (for Linux production) and `docker` (default, for macOS development). Dependencies: `libcontainer 0.6.0`, `oci-client 0.17`, `oci-spec 0.9` (versions pinned together). Container networking via CNI plugins (bridge + portmap + loopback). Image pull via `oci-client`.
+- **Consequences:** Worker VMs drop from ~250MB daemon overhead to ~0MB. The agent binary is fully self-contained — no daemon socket, no background process. CNI plugins (~3 small binaries) replace Docker's built-in networking. Image pull via `oci-client` replaces Docker's built-in pull. The `DockerRuntime` remains for macOS development where `libcontainer` cannot link (Linux kernel dependency). Build environment for the `youki` feature requires Linux (Alpine with `musl-dev`, `gcc`, `libseccomp-dev`, `libseccomp-static`, `pkgconf`). Worker VM cloud-init simplifies: no Docker installation, just CNI plugin binaries.
+
 ---
 
 ## Confidence gate
@@ -403,3 +413,5 @@ Known gaps:
 ```
 
 Amended with API gateway component (ADR-007, ADR-008). Tagged `sad/v0.2.0`.
+
+Amended with daemonless OCI runtime (ADR-009), trust boundary 4, agent component zoom. Tagged `sad/v0.3.0`.

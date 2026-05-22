@@ -69,8 +69,8 @@ pub enum AgentError {
     #[error("proxy tunnel lost")]
     TunnelDisconnected,
 
-    #[error("docker error: {detail}")]
-    Docker { detail: String },
+    #[error("container runtime error: {detail}")]
+    Runtime { detail: String },
 
     #[error("sandbox {sandbox_id} not found locally")]
     SandboxNotFound { sandbox_id: String },
