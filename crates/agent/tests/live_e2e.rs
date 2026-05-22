@@ -265,6 +265,8 @@ async fn live_agent_processes_start_sandbox_from_real_controller() {
                 cpu_millicores: 1000,
                 memory_bytes: 512_000_000,
             },
+            env_vars: std::collections::HashMap::new(),
+            exposed_port: 8080,
         })
         .await;
     assert!(result.is_ok(), "sandbox creation should succeed");

@@ -221,6 +221,8 @@ async fn live_sandbox_creation() {
                 cpu_millicores: 1000,
                 memory_bytes: 512_000_000,
             },
+            env_vars: std::collections::HashMap::new(),
+            exposed_port: 8080,
         })
         .await
         .unwrap();

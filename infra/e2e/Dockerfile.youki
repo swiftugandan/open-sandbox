@@ -1,0 +1,26 @@
+FROM rust:1.88-alpine AS builder
+
+RUN apk add --no-cache \
+    musl-dev gcc pkgconf protobuf-dev git \
+    libseccomp-dev libseccomp-static
+
+ENV LIBSECCOMP_LINK_TYPE=static
+ENV LIBSECCOMP_LIB_PATH=/usr/lib
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates/
+COPY proto proto/
+
+ARG FEATURES="docker"
+RUN cargo build --release --bin open-sandbox --no-default-features --features ${FEATURES}
+
+FROM alpine:3.21
+RUN apk add --no-cache iptables util-linux libseccomp ca-certificates
+RUN wget -q https://github.com/containernetworking/plugins/releases/download/v1.6.2/cni-plugins-linux-amd64-v1.6.2.tgz \
+    -O /tmp/cni-plugins.tgz \
+    && mkdir -p /opt/cni/bin \
+    && tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin \
+    && rm /tmp/cni-plugins.tgz
+COPY --from=builder /build/target/release/open-sandbox /usr/local/bin/
+ENTRYPOINT ["open-sandbox"]

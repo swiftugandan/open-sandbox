@@ -51,6 +51,12 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             req.memory_bytes
         };
 
+        let exposed_port = if req.exposed_port == 0 {
+            open_sandbox_contracts::constants::DEFAULT_SANDBOX_EXPOSED_PORT
+        } else {
+            req.exposed_port
+        };
+
         let assignment = self
             .controller
             .create_sandbox(InternalCreateRequest {
@@ -60,6 +66,8 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
                     cpu_millicores: cpu,
                     memory_bytes: mem,
                 },
+                env_vars: req.env_vars,
+                exposed_port,
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;

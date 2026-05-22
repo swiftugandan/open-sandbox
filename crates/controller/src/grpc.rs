@@ -190,6 +190,8 @@ pub struct CreateSandboxRequest {
     pub sandbox_id: SandboxId,
     pub image: String,
     pub requirements: SandboxRequirements,
+    pub env_vars: std::collections::HashMap<String, String>,
+    pub exposed_port: u32,
 }
 
 pub struct Controller<S: ControllerStore> {
@@ -245,8 +247,8 @@ impl<S: ControllerStore + 'static> Controller<S> {
                 config: Some(ProtoSandboxConfig {
                     cpu_limit_millicores: request.requirements.cpu_millicores,
                     memory_limit_bytes: request.requirements.memory_bytes,
-                    env_vars: HashMap::new(),
-                    exposed_port: 0,
+                    env_vars: request.env_vars,
+                    exposed_port: request.exposed_port,
                 }),
             })),
         };
@@ -435,6 +437,8 @@ mod tests {
                     cpu_millicores: 1000,
                     memory_bytes: 512_000_000,
                 },
+                env_vars: std::collections::HashMap::new(),
+                exposed_port: 8080,
             })
             .await
             .unwrap();

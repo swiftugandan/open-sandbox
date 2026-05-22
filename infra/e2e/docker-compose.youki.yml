@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: open_sandbox
+      POSTGRES_PASSWORD: test
+    networks:
+      platform:
+        ipv4_address: 10.0.0.2
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 2s
+      retries: 15
+
+  controller:
+    build:
+      context: ../..
+      dockerfile: infra/e2e/Dockerfile.youki
+      args:
+        FEATURES: docker
+    command: controller --database-url postgres://postgres:test@10.0.0.2:5432/open_sandbox
+    environment:
+      OPEN_SANDBOX_JOIN_TOKEN: e2e-youki-token
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      platform:
+        ipv4_address: 10.0.0.3
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/e2e/Dockerfile.youki
+      args:
+        FEATURES: docker
+    command: api --controller-url http://10.0.0.3:50051
+    depends_on:
+      - controller
+    ports:
+      - "8081:8081"
+    networks:
+      platform:
+        ipv4_address: 10.0.0.5
+
+  proxy:
+    build:
+      context: ../..
+      dockerfile: infra/e2e/Dockerfile.youki
+      args:
+        FEATURES: docker
+    command: proxy --database-url postgres://postgres:test@10.0.0.2:5432/open_sandbox
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      platform:
+        ipv4_address: 10.0.0.4
+
+networks:
+  platform:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.0.0/24

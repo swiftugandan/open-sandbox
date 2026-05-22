@@ -125,6 +125,7 @@ impl ContainerRuntime for YoukiRuntime {
                     detail: format!("invalid state directory: {e}"),
                 })?
                 .as_init(&bundle_dir_c)
+                .with_systemd(false)
                 .build()
                 .map_err(|e| AgentError::Runtime {
                     detail: format!("failed to create container: {e}"),

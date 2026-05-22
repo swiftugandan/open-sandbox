@@ -102,6 +102,8 @@ async fn controller_triggers_sandbox_creation_on_real_agent() {
                 cpu_millicores: 500,
                 memory_bytes: 256 * 1024 * 1024,
             },
+            env_vars: std::collections::HashMap::new(),
+            exposed_port: 8080,
         })
         .await
         .unwrap();

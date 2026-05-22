@@ -289,6 +289,8 @@ async fn live_full_request_flow_through_real_proxy() {
                 cpu_millicores: 1000,
                 memory_bytes: 512_000_000,
             },
+            env_vars: std::collections::HashMap::new(),
+            exposed_port: 8080,
         })
         .await
         .expect("sandbox creation should succeed");
@@ -354,6 +356,8 @@ async fn live_routing_cache_refreshes_from_postgres() {
                 cpu_millicores: 1000,
                 memory_bytes: 512_000_000,
             },
+            env_vars: std::collections::HashMap::new(),
+            exposed_port: 8080,
         })
         .await
         .expect("sandbox creation should succeed");
@@ -439,6 +443,8 @@ async fn live_http_ingress_end_to_end() {
                 cpu_millicores: 1000,
                 memory_bytes: 512_000_000,
             },
+            env_vars: std::collections::HashMap::new(),
+            exposed_port: 8080,
         })
         .await
         .expect("sandbox creation should succeed");

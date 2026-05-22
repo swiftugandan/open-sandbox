@@ -96,6 +96,8 @@ async fn live_youki_agent_creates_real_container_via_controller() {
                 cpu_millicores: 1000,
                 memory_bytes: 512_000_000,
             },
+            env_vars: std::collections::HashMap::new(),
+            exposed_port: 8080,
         })
         .await;
     assert!(result.is_ok(), "sandbox creation should succeed");
