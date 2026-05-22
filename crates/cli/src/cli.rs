@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(
     name = "open-sandbox",
-    about = "Open Sandbox — isolated Docker environments with public HTTPS access",
+    about = "Open Sandbox — isolated container environments with public HTTPS access",
     version = env!("CARGO_PKG_VERSION"),
 )]
 pub struct Cli {

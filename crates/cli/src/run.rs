@@ -28,8 +28,10 @@ use open_sandbox_proxy::stream_mux::StreamMux;
 use open_sandbox_proxy::tunnel_pool::TunnelPool;
 
 use crate::cli::{AgentArgs, ApiArgs, ControllerArgs, ProxyArgs};
-use crate::docker_runtime::DockerRuntime;
 use crate::http_client::ReqwestHttpClient;
+
+#[cfg(feature = "docker")]
+use open_sandbox_agent_docker::DockerRuntime;
 
 struct StaticTokenValidator {
     expected: String,

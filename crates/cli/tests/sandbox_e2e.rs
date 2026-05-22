@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use open_sandbox::docker_runtime::DockerRuntime;
+use open_sandbox_agent_docker::DockerRuntime;
 use open_sandbox::http_client::ReqwestHttpClient;
 use open_sandbox_agent::container::{ContainerConfig, ContainerRuntime};
 use open_sandbox_agent::sandbox::SandboxManager;

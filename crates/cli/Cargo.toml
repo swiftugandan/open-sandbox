@@ -7,16 +7,19 @@ edition = "2024"
 name = "open-sandbox"
 path = "src/main.rs"
 
+[features]
+default = ["docker"]
+docker = ["dep:open-sandbox-agent-docker"]
+
 [dependencies]
+open-sandbox-agent-docker = { path = "../agent-docker", optional = true }
 open-sandbox-contracts = { path = "../contracts" }
 open-sandbox-api = { path = "../api" }
 open-sandbox-controller = { path = "../controller" }
 open-sandbox-agent = { path = "../agent" }
 open-sandbox-proxy = { path = "../proxy" }
 axum = "0.8"
-bollard = "0.18"
 clap = { version = "4", features = ["derive", "env"] }
-futures = "0.3"
 http = "1"
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
@@ -27,6 +30,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 assert_cmd = "2"
+open-sandbox-agent-docker = { path = "../agent-docker" }
 open-sandbox-contracts = { path = "../contracts" }
 open-sandbox-agent = { path = "../agent" }
 open-sandbox-controller = { path = "../controller", features = ["testutil"] }

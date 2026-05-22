@@ -1,0 +1,13 @@
+[package]
+name = "open-sandbox-agent-docker"
+version = "0.1.0"
+edition = "2024"
+description = "Docker container runtime for Open Sandbox (development backend)"
+
+[dependencies]
+open-sandbox-contracts = { path = "../contracts" }
+open-sandbox-agent = { path = "../agent" }
+bollard = "0.18"
+futures = "0.3"
+tokio = { version = "1", features = ["io-util"] }
+uuid = { version = "1", features = ["v4"] }

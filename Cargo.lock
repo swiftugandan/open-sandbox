@@ -1596,11 +1596,10 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "axum 0.8.9",
- "bollard",
  "clap",
- "futures",
  "http",
  "open-sandbox-agent",
+ "open-sandbox-agent-docker",
  "open-sandbox-api",
  "open-sandbox-contracts",
  "open-sandbox-controller",
@@ -1626,6 +1625,18 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "uuid",
+]
+
+[[package]]
+name = "open-sandbox-agent-docker"
+version = "0.1.0"
+dependencies = [
+ "bollard",
+ "futures",
+ "open-sandbox-agent",
+ "open-sandbox-contracts",
+ "tokio",
  "uuid",
 ]
 

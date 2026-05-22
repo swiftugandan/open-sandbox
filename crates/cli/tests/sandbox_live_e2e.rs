@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio_stream::wrappers::TcpListenerStream;
 
-use open_sandbox::docker_runtime::DockerRuntime;
+use open_sandbox_agent_docker::DockerRuntime;
 use open_sandbox::http_client::ReqwestHttpClient;
 use open_sandbox_agent::container::ContainerRuntime;
 use open_sandbox_agent::controller_client::ControllerConnection;

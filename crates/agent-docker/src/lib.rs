@@ -80,7 +80,6 @@ impl ContainerRuntime for DockerRuntime {
         let stop_opts = StopContainerOptions {
             t: timeout.as_secs() as i64,
         };
-        // Stop may fail if already stopped
         let _ = self.client.stop_container(&id.0, Some(stop_opts)).await;
 
         let remove_opts = RemoveContainerOptions {
