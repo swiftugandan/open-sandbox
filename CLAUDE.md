@@ -4,11 +4,11 @@
 
 ## Overview
 
-A Rust-based sandbox platform where agents dial out to a controller/proxy over TLS, enabling BYO workers from any network topology. The platform provides isolated Docker sandbox environments with public HTTPS access via wildcard subdomains, backed by a cloud-portable Pulumi infrastructure layer.
+A Rust-based sandbox platform where agents dial out to a controller/proxy over TLS, enabling BYO workers from any network topology. The platform provides isolated OCI container sandbox environments with public HTTPS access via wildcard subdomains, backed by a cloud-portable Pulumi infrastructure layer.
 
 ## Current phase
 
-Phase 6 complete: all modules implemented including the API gateway and file operations. Controller, agent, proxy, CLI shell, infra, agent-docker, proxy-http, api, and api-files modules done. The `api-files` module (`module/api-files/done`) adds exec-backed file read/write matching the Vercel Sandbox SDK shape: `POST /v1/sandboxes/{id}/files/write` (gzip tar body, `x-cwd` header) and `POST /v1/sandboxes/{id}/files/read` (JSON `{path, cwd}` → octet-stream). Contract amendment added `stdin: bytes` to ExecCommand and ExecSandboxRequest. Agent now handles ExecCommand dispatch (was previously ignored). ContainerRuntime trait extended with `exec` method. Infra live e2e (`pulumi up` against real Hetzner/Cloudflare) deferred until cloud credentials are configured.
+Phase 6 complete: all modules implemented including `agent-youki`. Controller, agent, proxy, CLI shell, infra, agent-docker, proxy-http, api, api-files, and agent-youki modules done. The `agent-youki` module (`module/agent-youki/done`) replaces Docker Engine with youki/libcontainer as a daemonless OCI container runtime (ADR-009). Image pull via oci-client, container lifecycle via libcontainer, networking via CNI bridge+portmap, exec via nsenter. `DockerRuntime` extracted to its own crate (`crates/agent-docker/`); `YoukiRuntime` in `crates/agent-youki/`. Runtime selection via compile-time Cargo features (`docker` default, `youki` for Linux production). Contracts at v0.3.0: `AgentError::Docker` renamed to `AgentError::Runtime`. Build constraint: full build/test on Linux only (`Dockerfile.test` + `docker-compose.test.yml`).
 
 ## Quick status
 
