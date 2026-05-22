@@ -10,9 +10,11 @@ path = "src/main.rs"
 [features]
 default = ["docker"]
 docker = ["dep:open-sandbox-agent-docker"]
+youki = ["dep:open-sandbox-agent-youki"]
 
 [dependencies]
 open-sandbox-agent-docker = { path = "../agent-docker", optional = true }
+open-sandbox-agent-youki = { path = "../agent-youki", optional = true }
 open-sandbox-contracts = { path = "../contracts" }
 open-sandbox-api = { path = "../api" }
 open-sandbox-controller = { path = "../controller" }
