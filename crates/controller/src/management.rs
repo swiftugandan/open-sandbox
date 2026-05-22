@@ -5,6 +5,7 @@ use tonic::{Request, Response, Status};
 use open_sandbox_contracts::api::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     ExecSandboxRequest, ExecSandboxResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse,
     sandbox_management_service_server::{SandboxManagementService, SandboxManagementServiceServer},
 };
 use open_sandbox_contracts::controller::{
@@ -177,6 +178,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
                 command: req.command,
                 exec_id: exec_id.clone(),
                 stdin: req.stdin,
+                cwd: req.cwd,
             })),
         };
         self.controller
@@ -204,7 +206,36 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             exit_code: result.exit_code,
             stdout: result.stdout,
             stderr: result.stderr,
+            command_not_found: result.command_not_found,
         }))
+    }
+
+    async fn list_sandboxes(
+        &self,
+        _request: Request<ListSandboxesRequest>,
+    ) -> Result<Response<ListSandboxesResponse>, Status> {
+        let entries = self
+            .controller
+            .list_routing_entries()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut sandboxes = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let status = self
+                .controller
+                .get_sandbox_state(&entry.sandbox_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .unwrap_or_else(|| "running".into());
+            sandboxes.push(GetSandboxResponse {
+                sandbox_id: entry.sandbox_id.to_string(),
+                agent_id: entry.agent_id.to_string(),
+                subdomain: entry.sandbox_id.subdomain(),
+                status,
+            });
+        }
+        Ok(Response::new(ListSandboxesResponse { sandboxes }))
     }
 }
 

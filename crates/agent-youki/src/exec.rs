@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use open_sandbox_agent::container::ExecOutput;
+use open_sandbox_agent::container::{ExecOutput, detect_command_not_found};
 use open_sandbox_contracts::error::AgentError;
 
 use libcontainer::container::Container;
@@ -10,6 +10,7 @@ pub fn exec_in_container(
     state_dir: &Path,
     command: Vec<String>,
     stdin_data: Vec<u8>,
+    cwd: &str,
 ) -> Result<ExecOutput, AgentError> {
     let container_root = state_dir.join(container_id);
     let container = Container::load(container_root).map_err(|e| AgentError::Runtime {
@@ -26,8 +27,15 @@ pub fn exec_in_container(
         .arg("--uts")
         .arg("--ipc")
         .arg("--net")
-        .arg("--pid")
-        .arg("--")
+        .arg("--pid");
+
+    if !cwd.is_empty() {
+        // --wd= chdirs inside the target namespace, so the working directory
+        // is resolved against the container's mount namespace, not the host.
+        cmd.arg(format!("--wd={cwd}"));
+    }
+
+    cmd.arg("--")
         .args(&command)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -56,10 +64,25 @@ pub fn exec_in_container(
         detail: format!("exec process failed: {e}"),
     })?;
 
+    let exit_code = output.status.code().unwrap_or(-1);
+    let mut stdout = output.stdout;
+    let mut stderr = output.stderr;
+    let mut cnf = false;
+    if exit_code == 127 {
+        if detect_command_not_found(&stderr) {
+            cnf = true;
+        } else if detect_command_not_found(&stdout) {
+            cnf = true;
+            stderr.extend_from_slice(&stdout);
+            stdout.clear();
+        }
+    }
+
     Ok(ExecOutput {
-        exit_code: output.status.code().unwrap_or(-1),
-        stdout: output.stdout,
-        stderr: output.stderr,
+        exit_code,
+        stdout,
+        stderr,
+        command_not_found: cnf,
     })
 }
 
@@ -75,6 +98,7 @@ mod tests {
             Path::new("/tmp/test"),
             vec!["echo".into(), "hello".into()],
             vec![],
+            "",
         );
 
         let output = result.unwrap();
@@ -91,6 +115,7 @@ mod tests {
             Path::new("/tmp/test"),
             vec!["false".into()],
             vec![],
+            "",
         );
 
         let output = result.unwrap();
@@ -105,6 +130,7 @@ mod tests {
             Path::new("/tmp/test"),
             vec!["cat".into()],
             b"input data".to_vec(),
+            "",
         );
 
         let output = result.unwrap();

@@ -64,6 +64,7 @@ mod tests {
                 stdout: b"ok".to_vec(),
                 stderr: vec![],
             error: String::new(),
+            command_not_found: false,
             })
             .unwrap();
 
@@ -82,6 +83,7 @@ mod tests {
             stdout: vec![],
             stderr: vec![],
             error: String::new(),
+            command_not_found: false,
         });
         assert!(result.is_err());
     }
@@ -99,6 +101,7 @@ mod tests {
             stdout: vec![],
             stderr: vec![],
             error: String::new(),
+            command_not_found: false,
         });
         assert!(result.is_err());
     }

@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use open_sandbox_agent::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOutput,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOptions, ExecOutput,
 };
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
@@ -264,14 +264,19 @@ impl ContainerRuntime for YoukiRuntime {
     async fn exec(
         &self,
         id: &ContainerId,
-        command: Vec<String>,
-        stdin: Vec<u8>,
+        options: ExecOptions,
     ) -> Result<ExecOutput, AgentError> {
         let container_id = id.0.clone();
         let state_dir = self.state_dir();
 
         tokio::task::spawn_blocking(move || {
-            exec::exec_in_container(&container_id, &state_dir, command, stdin)
+            exec::exec_in_container(
+                &container_id,
+                &state_dir,
+                options.command,
+                options.stdin,
+                &options.cwd,
+            )
         })
         .await
         .map_err(|e| AgentError::Runtime {
@@ -372,7 +377,14 @@ mod tests {
         let info = runtime.create_and_start(config).await.unwrap();
 
         let output = runtime
-            .exec(&info.id, vec!["echo".into(), "hello".into()], vec![])
+            .exec(
+                &info.id,
+                ExecOptions {
+                    command: vec!["echo".into(), "hello".into()],
+                    stdin: vec![],
+                    cwd: String::new(),
+                },
+            )
             .await
             .unwrap();
 

@@ -30,6 +30,19 @@ pub struct ExecOutput {
     pub exit_code: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// Set when the runtime determined the executable was missing. Lets the
+    /// agent (and ultimately the API) distinguish "command not found" from a
+    /// process that ran and exited 127 of its own accord.
+    pub command_not_found: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecOptions {
+    pub command: Vec<String>,
+    pub stdin: Vec<u8>,
+    /// Working directory inside the container. Empty string means the
+    /// runtime's default (typically `/home` per FR-13).
+    pub cwd: String,
 }
 
 pub trait ContainerRuntime: Send + Sync {
@@ -51,7 +64,20 @@ pub trait ContainerRuntime: Send + Sync {
     fn exec(
         &self,
         id: &ContainerId,
-        command: Vec<String>,
-        stdin: Vec<u8>,
+        options: ExecOptions,
     ) -> impl Future<Output = Result<ExecOutput, AgentError>> + Send;
+}
+
+/// Heuristic shared by all runtimes: scan stderr for the canonical OCI
+/// "executable file not found" diagnostic produced by runc/crun/youki when
+/// the requested binary cannot be resolved in the container.
+///
+/// Centralising the pattern here keeps every runtime backend consistent and
+/// guards against drift between Docker, youki, and any future runtime.
+pub fn detect_command_not_found(stderr: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(stderr);
+    let lower = s.to_ascii_lowercase();
+    lower.contains("executable file not found")
+        || lower.contains("no such file or directory")
+            && (lower.contains("exec:") || lower.contains("starting container process"))
 }

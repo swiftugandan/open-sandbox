@@ -107,6 +107,10 @@ impl ControllerStore for InMemoryStore {
             .cloned())
     }
 
+    async fn list_routing_entries(&self) -> Result<Vec<RoutingEntry>, ControllerError> {
+        Ok(self.routing.lock().unwrap().clone())
+    }
+
     async fn remove_routing_entry(&self, sandbox_id: &SandboxId) -> Result<(), ControllerError> {
         self.routing
             .lock()

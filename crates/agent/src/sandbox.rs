@@ -121,8 +121,7 @@ impl<R: ContainerRuntime> SandboxManager<R> {
     pub async fn exec_sandbox(
         &self,
         sandbox_id: &SandboxId,
-        command: Vec<String>,
-        stdin: Vec<u8>,
+        options: crate::container::ExecOptions,
     ) -> Result<ExecOutput, AgentError> {
         let entry = self
             .sandboxes
@@ -134,7 +133,7 @@ impl<R: ContainerRuntime> SandboxManager<R> {
                 sandbox_id: sandbox_id.to_string(),
             })?;
 
-        self.runtime.exec(&entry.container_id, command, stdin).await
+        self.runtime.exec(&entry.container_id, options).await
     }
 
     pub async fn reconcile(&self) -> Result<Vec<SandboxEntry>, AgentError> {
@@ -323,7 +322,14 @@ mod tests {
             .unwrap();
 
         let output = manager
-            .exec_sandbox(&sandbox_id, vec!["echo".into(), "hello".into()], vec![])
+            .exec_sandbox(
+                &sandbox_id,
+                crate::container::ExecOptions {
+                    command: vec!["echo".into(), "hello".into()],
+                    stdin: vec![],
+                    cwd: String::new(),
+                },
+            )
             .await
             .unwrap();
 
@@ -346,8 +352,11 @@ mod tests {
         let output = manager
             .exec_sandbox(
                 &sandbox_id,
-                vec!["tar".into(), "xzf".into(), "-".into()],
-                stdin_data,
+                crate::container::ExecOptions {
+                    command: vec!["tar".into(), "xzf".into(), "-".into()],
+                    stdin: stdin_data,
+                    cwd: String::new(),
+                },
             )
             .await
             .unwrap();
@@ -362,7 +371,14 @@ mod tests {
         let manager = SandboxManager::new(runtime);
 
         let result = manager
-            .exec_sandbox(&SandboxId::new(), vec!["echo".into()], vec![])
+            .exec_sandbox(
+                &SandboxId::new(),
+                crate::container::ExecOptions {
+                    command: vec!["echo".into()],
+                    stdin: vec![],
+                    cwd: String::new(),
+                },
+            )
             .await;
 
         assert!(matches!(result, Err(AgentError::SandboxNotFound { .. })));

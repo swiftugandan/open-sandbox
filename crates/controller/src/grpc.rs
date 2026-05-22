@@ -281,6 +281,10 @@ impl<S: ControllerStore + 'static> Controller<S> {
         self.scheduler.store().find_routing_entry(sandbox_id).await
     }
 
+    pub async fn list_routing_entries(&self) -> Result<Vec<RoutingEntry>, ControllerError> {
+        self.scheduler.store().list_routing_entries().await
+    }
+
     pub async fn remove_routing_entry(
         &self,
         sandbox_id: &SandboxId,

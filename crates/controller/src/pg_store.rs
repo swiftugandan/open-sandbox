@@ -197,6 +197,24 @@ impl ControllerStore for PgStore {
         }))
     }
 
+    async fn list_routing_entries(&self) -> Result<Vec<RoutingEntry>, ControllerError> {
+        let rows = sqlx::query_as::<_, RoutingRow>(
+            "SELECT sandbox_id, agent_id FROM routing_entries ORDER BY sandbox_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|r| RoutingEntry {
+                sandbox_id: SandboxId(r.sandbox_id),
+                agent_id: AgentId(r.agent_id),
+            })
+            .collect())
+    }
+
     async fn remove_routing_entry(&self, sandbox_id: &SandboxId) -> Result<(), ControllerError> {
         sqlx::query("DELETE FROM routing_entries WHERE sandbox_id = $1")
             .bind(sandbox_id.0)

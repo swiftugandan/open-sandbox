@@ -13,7 +13,7 @@ use futures::{StreamExt, TryStreamExt};
 use tracing::info;
 
 use open_sandbox_agent::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOutput,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOptions, ExecOutput,
 };
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
@@ -167,17 +167,23 @@ impl ContainerRuntime for DockerRuntime {
     async fn exec(
         &self,
         id: &ContainerId,
-        command: Vec<String>,
-        stdin: Vec<u8>,
+        options: ExecOptions,
     ) -> Result<ExecOutput, AgentError> {
-        let attach_stdin = !stdin.is_empty();
+        let attach_stdin = !options.stdin.is_empty();
+        let working_dir = if options.cwd.is_empty() {
+            None
+        } else {
+            Some(options.cwd)
+        };
         let exec_opts = CreateExecOptions {
-            cmd: Some(command),
+            cmd: Some(options.command),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             attach_stdin: Some(attach_stdin),
+            working_dir,
             ..Default::default()
         };
+        let stdin = options.stdin;
 
         let exec_created = self
             .client
@@ -239,10 +245,26 @@ impl ContainerRuntime for DockerRuntime {
 
         let exit_code = inspect.exit_code.unwrap_or(-1) as i32;
 
+        // Docker pipes the OCI runtime's "command not found" diagnostic to
+        // stdout (bug #8 in the SDK friction report) when the exec syscall
+        // fails. Detect the pattern on either stream and lift it into stderr
+        // so callers don't have to look at stdout for runtime-level errors.
+        let mut cnf = false;
+        if exit_code == 127 {
+            if open_sandbox_agent::container::detect_command_not_found(&stderr_buf) {
+                cnf = true;
+            } else if open_sandbox_agent::container::detect_command_not_found(&stdout_buf) {
+                cnf = true;
+                stderr_buf.extend_from_slice(&stdout_buf);
+                stdout_buf.clear();
+            }
+        }
+
         Ok(ExecOutput {
             exit_code,
             stdout: stdout_buf,
             stderr: stderr_buf,
+            command_not_found: cnf,
         })
     }
 }

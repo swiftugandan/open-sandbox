@@ -165,14 +165,26 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                 }
                 controller_command::Payload::RegisterResponse(_) => {}
                 controller_command::Payload::Exec(exec) => {
-                    info!(sandbox_id = %exec.sandbox_id, exec_id = %exec.exec_id, "received exec command");
+                    info!(
+                        sandbox_id = %exec.sandbox_id,
+                        exec_id = %exec.exec_id,
+                        cmd.argv = exec.command.join(" "),
+                        cmd.cwd = %exec.cwd,
+                        cmd.stdin_len = exec.stdin.len(),
+                        "received exec command"
+                    );
                     let mgr = sandbox_manager.clone();
                     let tx = status_tx.clone();
                     tokio::spawn(async move {
                         let sandbox_id = uuid::Uuid::parse_str(&exec.sandbox_id)
                             .map(open_sandbox_contracts::types::SandboxId::from);
+                        let options = crate::container::ExecOptions {
+                            command: exec.command,
+                            stdin: exec.stdin,
+                            cwd: exec.cwd,
+                        };
                         let result = match sandbox_id {
-                            Ok(sid) => mgr.exec_sandbox(&sid, exec.command, exec.stdin).await,
+                            Ok(sid) => mgr.exec_sandbox(&sid, options).await,
                             Err(_) => {
                                 Err(open_sandbox_contracts::error::AgentError::SandboxNotFound {
                                     sandbox_id: exec.sandbox_id.clone(),
@@ -187,6 +199,7 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                                 stdout: output.stdout,
                                 stderr: output.stderr,
                                 error: String::new(),
+                                command_not_found: output.command_not_found,
                             },
                             Err(e) => ExecResult {
                                 sandbox_id: exec.sandbox_id,
@@ -195,6 +208,7 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                                 stdout: vec![],
                                 stderr: vec![],
                                 error: e.to_string(),
+                                command_not_found: false,
                             },
                         };
                         let msg = AgentMessage {

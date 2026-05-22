@@ -10,7 +10,7 @@ use open_sandbox_contracts::types::SandboxId;
 use crate::router::build_router;
 use crate::service::{
     CreateRequest, ExecOutput, ExecRequest, ReadFileRequest, SandboxInfo, SandboxService,
-    WriteFilesRequest, WriteFilesResult,
+    WriteFileRequest, WriteFilesRequest, WriteFilesResult,
 };
 
 struct MockService {
@@ -47,6 +47,10 @@ impl SandboxService for MockService {
         }
     }
 
+    async fn list(&self) -> Result<Vec<SandboxInfo>, ApiError> {
+        Ok(vec![self.sandbox.clone()])
+    }
+
     async fn delete(&self, sandbox_id: &SandboxId) -> Result<(), ApiError> {
         if *sandbox_id == self.sandbox.sandbox_id {
             Ok(())
@@ -67,6 +71,7 @@ impl SandboxService for MockService {
                 exit_code: 0,
                 stdout: b"hello\n".to_vec(),
                 stderr: vec![],
+                command_not_found: false,
             })
         } else {
             Err(ApiError::SandboxNotFound {
@@ -79,6 +84,20 @@ impl SandboxService for MockService {
         &self,
         sandbox_id: &SandboxId,
         _request: WriteFilesRequest,
+    ) -> Result<WriteFilesResult, ApiError> {
+        if *sandbox_id == self.sandbox.sandbox_id {
+            Ok(WriteFilesResult { success: true })
+        } else {
+            Err(ApiError::SandboxNotFound {
+                sandbox_id: sandbox_id.to_string(),
+            })
+        }
+    }
+
+    async fn write_file(
+        &self,
+        sandbox_id: &SandboxId,
+        _request: WriteFileRequest,
     ) -> Result<WriteFilesResult, ApiError> {
         if *sandbox_id == self.sandbox.sandbox_id {
             Ok(WriteFilesResult { success: true })
@@ -214,6 +233,8 @@ async fn delete_sandbox_returns_404_for_unknown_sandbox() {
 
 #[tokio::test]
 async fn exec_returns_stdout_and_exit_code() {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
     let svc = Arc::new(MockService::new());
     let id = svc.sandbox.sandbox_id.to_string();
     let app = build_router(svc);
@@ -231,8 +252,9 @@ async fn exec_returns_stdout_and_exit_code() {
 
     let body = body_json(resp).await;
     assert_eq!(body["exit_code"], 0);
-    assert_eq!(body["stdout"], "hello\n");
-    assert_eq!(body["stderr"], "");
+    assert_eq!(body["stdout_b64"], engine.encode(b"hello\n"));
+    assert_eq!(body["stderr_b64"], engine.encode(b""));
+    assert!(body.get("error_code").is_none());
 }
 
 #[tokio::test]
@@ -272,6 +294,10 @@ async fn create_sandbox_uses_defaults_for_omitted_fields() {
             unreachable!()
         }
 
+        async fn list(&self) -> Result<Vec<SandboxInfo>, ApiError> {
+            unreachable!()
+        }
+
         async fn delete(&self, _: &SandboxId) -> Result<(), ApiError> {
             unreachable!()
         }
@@ -284,6 +310,14 @@ async fn create_sandbox_uses_defaults_for_omitted_fields() {
             &self,
             _: &SandboxId,
             _: WriteFilesRequest,
+        ) -> Result<WriteFilesResult, ApiError> {
+            unreachable!()
+        }
+
+        async fn write_file(
+            &self,
+            _: &SandboxId,
+            _: WriteFileRequest,
         ) -> Result<WriteFilesResult, ApiError> {
             unreachable!()
         }
@@ -334,7 +368,7 @@ async fn write_files_returns_200_with_result() {
 
     let req = Request::builder()
         .method("POST")
-        .uri(format!("/v1/sandboxes/{id}/files/write"))
+        .uri(format!("/v1/sandboxes/{id}/files/write_files"))
         .header("content-type", "application/gzip")
         .body(Body::from(vec![0x1f, 0x8b, 0x08]))
         .unwrap();
@@ -353,7 +387,7 @@ async fn write_files_returns_404_for_unknown_sandbox() {
 
     let req = Request::builder()
         .method("POST")
-        .uri(format!("/v1/sandboxes/{unknown_id}/files/write"))
+        .uri(format!("/v1/sandboxes/{unknown_id}/files/write_files"))
         .header("content-type", "application/gzip")
         .body(Body::from(vec![0x1f, 0x8b, 0x08]))
         .unwrap();
@@ -370,7 +404,7 @@ async fn write_files_with_cwd_header() {
 
     let req = Request::builder()
         .method("POST")
-        .uri(format!("/v1/sandboxes/{id}/files/write"))
+        .uri(format!("/v1/sandboxes/{id}/files/write_files"))
         .header("content-type", "application/gzip")
         .header("x-cwd", "/app/src")
         .body(Body::from(vec![0x1f, 0x8b, 0x08]))
@@ -383,15 +417,335 @@ async fn write_files_with_cwd_header() {
 }
 
 #[tokio::test]
-async fn read_file_returns_octet_stream() {
+async fn write_files_returns_400_for_empty_body() {
+    let svc = Arc::new(MockService::new());
+    let id = svc.sandbox.sandbox_id.to_string();
+    let app = build_router(svc);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/sandboxes/{id}/files/write_files"))
+        .header("content-type", "application/gzip")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error_code"], "INVALID_UPLOAD");
+}
+
+#[tokio::test]
+async fn write_files_returns_400_for_non_gzip_body() {
+    let svc = Arc::new(MockService::new());
+    let id = svc.sandbox.sandbox_id.to_string();
+    let app = build_router(svc);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/sandboxes/{id}/files/write_files"))
+        .header("content-type", "application/gzip")
+        .body(Body::from(b"this is not gzip".to_vec()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error_code"], "INVALID_UPLOAD");
+}
+
+#[tokio::test]
+async fn write_file_returns_200_for_existing_sandbox() {
     let svc = Arc::new(MockService::new());
     let id = svc.sandbox.sandbox_id.to_string();
     let app = build_router(svc);
 
     let req = json_request(
         "POST",
-        &format!("/v1/sandboxes/{id}/files/read"),
-        serde_json::json!({"path": "/etc/hostname"}),
+        &format!("/v1/sandboxes/{id}/files/write_file"),
+        serde_json::json!({
+            "path": "hello.py",
+            "content": "print('hi')\n",
+            "cwd": "/home"
+        }),
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["success"], true);
+}
+
+#[tokio::test]
+async fn write_file_rejects_both_content_and_content_b64() {
+    let svc = Arc::new(MockService::new());
+    let id = svc.sandbox.sandbox_id.to_string();
+    let app = build_router(svc);
+
+    let req = json_request(
+        "POST",
+        &format!("/v1/sandboxes/{id}/files/write_file"),
+        serde_json::json!({
+            "path": "a.txt",
+            "content": "x",
+            "content_b64": "eA=="
+        }),
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error_code"], "INVALID_REQUEST");
+}
+
+#[tokio::test]
+async fn write_file_rejects_neither_content_nor_content_b64() {
+    let svc = Arc::new(MockService::new());
+    let id = svc.sandbox.sandbox_id.to_string();
+    let app = build_router(svc);
+
+    let req = json_request(
+        "POST",
+        &format!("/v1/sandboxes/{id}/files/write_file"),
+        serde_json::json!({"path": "a.txt"}),
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error_code"], "INVALID_REQUEST");
+}
+
+#[tokio::test]
+async fn list_sandboxes_returns_caller_owned_set() {
+    let svc = Arc::new(MockService::new());
+    let app = build_router(svc.clone());
+
+    let req = empty_request("GET", "/v1/sandboxes");
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let arr = body["sandboxes"].as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["sandbox_id"], svc.sandbox.sandbox_id.to_string());
+}
+
+#[tokio::test]
+async fn exec_rejects_unknown_fields() {
+    let svc = Arc::new(MockService::new());
+    let id = svc.sandbox.sandbox_id.to_string();
+    let app = build_router(svc);
+
+    let req = json_request(
+        "POST",
+        &format!("/v1/sandboxes/{id}/exec"),
+        serde_json::json!({
+            "command": ["echo"],
+            "totally_unsupported_option": true
+        }),
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error_code"], "INVALID_REQUEST");
+}
+
+#[tokio::test]
+async fn exec_rejects_both_stdin_and_stdin_b64() {
+    let svc = Arc::new(MockService::new());
+    let id = svc.sandbox.sandbox_id.to_string();
+    let app = build_router(svc);
+
+    let req = json_request(
+        "POST",
+        &format!("/v1/sandboxes/{id}/exec"),
+        serde_json::json!({
+            "command": ["cat"],
+            "stdin": "hi",
+            "stdin_b64": "aGk="
+        }),
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error_code"], "INVALID_REQUEST");
+}
+
+#[tokio::test]
+async fn exec_surfaces_command_not_found_in_response_envelope() {
+    use base64::Engine;
+    use std::sync::Mutex;
+
+    struct NotFoundSvc {
+        info: SandboxInfo,
+        captured_stdin: Mutex<Vec<u8>>,
+    }
+
+    impl SandboxService for NotFoundSvc {
+        async fn create(&self, _: CreateRequest) -> Result<SandboxInfo, ApiError> {
+            unreachable!()
+        }
+        async fn get(&self, _: &SandboxId) -> Result<SandboxInfo, ApiError> {
+            unreachable!()
+        }
+        async fn list(&self) -> Result<Vec<SandboxInfo>, ApiError> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &SandboxId) -> Result<(), ApiError> {
+            unreachable!()
+        }
+        async fn exec(
+            &self,
+            _: &SandboxId,
+            request: ExecRequest,
+        ) -> Result<ExecOutput, ApiError> {
+            *self.captured_stdin.lock().unwrap() = request.stdin_bytes().unwrap();
+            Ok(ExecOutput {
+                exit_code: 127,
+                stdout: vec![],
+                stderr: b"exec: nonexistent: not found\n".to_vec(),
+                command_not_found: true,
+            })
+        }
+        async fn write_files(
+            &self,
+            _: &SandboxId,
+            _: WriteFilesRequest,
+        ) -> Result<WriteFilesResult, ApiError> {
+            unreachable!()
+        }
+        async fn write_file(
+            &self,
+            _: &SandboxId,
+            _: WriteFileRequest,
+        ) -> Result<WriteFilesResult, ApiError> {
+            unreachable!()
+        }
+        async fn read_file(&self, _: &SandboxId, _: ReadFileRequest) -> Result<Vec<u8>, ApiError> {
+            unreachable!()
+        }
+    }
+
+    let sandbox_id = SandboxId::new();
+    let svc = Arc::new(NotFoundSvc {
+        info: SandboxInfo {
+            subdomain: sandbox_id.subdomain(),
+            sandbox_id: sandbox_id.clone(),
+            agent_id: "agent-1".into(),
+            status: "running".into(),
+        },
+        captured_stdin: Mutex::new(Vec::new()),
+    });
+    let app = build_router(svc.clone());
+
+    let req = json_request(
+        "POST",
+        &format!("/v1/sandboxes/{}/exec", svc.info.sandbox_id),
+        serde_json::json!({
+            "command": ["nonexistent_binary"]
+        }),
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["exit_code"], 127);
+    assert_eq!(body["error_code"], "COMMAND_NOT_FOUND");
+    let engine = base64::engine::general_purpose::STANDARD;
+    assert_eq!(
+        body["stderr_b64"],
+        engine.encode(b"exec: nonexistent: not found\n")
+    );
+}
+
+#[tokio::test]
+async fn exec_passes_stdin_through() {
+    use std::sync::Mutex;
+
+    struct CapturingExec {
+        info: SandboxInfo,
+        captured: Mutex<Vec<u8>>,
+    }
+
+    impl SandboxService for CapturingExec {
+        async fn create(&self, _: CreateRequest) -> Result<SandboxInfo, ApiError> {
+            unreachable!()
+        }
+        async fn get(&self, _: &SandboxId) -> Result<SandboxInfo, ApiError> {
+            unreachable!()
+        }
+        async fn list(&self) -> Result<Vec<SandboxInfo>, ApiError> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &SandboxId) -> Result<(), ApiError> {
+            unreachable!()
+        }
+        async fn exec(
+            &self,
+            _: &SandboxId,
+            request: ExecRequest,
+        ) -> Result<ExecOutput, ApiError> {
+            let bytes = request.stdin_bytes().unwrap();
+            *self.captured.lock().unwrap() = bytes.clone();
+            Ok(ExecOutput {
+                exit_code: 0,
+                stdout: bytes,
+                stderr: vec![],
+                command_not_found: false,
+            })
+        }
+        async fn write_files(
+            &self,
+            _: &SandboxId,
+            _: WriteFilesRequest,
+        ) -> Result<WriteFilesResult, ApiError> {
+            unreachable!()
+        }
+        async fn write_file(
+            &self,
+            _: &SandboxId,
+            _: WriteFileRequest,
+        ) -> Result<WriteFilesResult, ApiError> {
+            unreachable!()
+        }
+        async fn read_file(&self, _: &SandboxId, _: ReadFileRequest) -> Result<Vec<u8>, ApiError> {
+            unreachable!()
+        }
+    }
+
+    let sandbox_id = SandboxId::new();
+    let svc = Arc::new(CapturingExec {
+        info: SandboxInfo {
+            subdomain: sandbox_id.subdomain(),
+            sandbox_id,
+            agent_id: "a".into(),
+            status: "running".into(),
+        },
+        captured: Mutex::new(Vec::new()),
+    });
+    let app = build_router(svc.clone());
+
+    let req = json_request(
+        "POST",
+        &format!("/v1/sandboxes/{}/exec", svc.info.sandbox_id),
+        serde_json::json!({"command": ["cat"], "stdin": "hello stdin"}),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(svc.captured.lock().unwrap().as_slice(), b"hello stdin");
+}
+
+#[tokio::test]
+async fn read_file_returns_octet_stream() {
+    let svc = Arc::new(MockService::new());
+    let id = svc.sandbox.sandbox_id.to_string();
+    let app = build_router(svc);
+
+    let req = empty_request(
+        "GET",
+        &format!("/v1/sandboxes/{id}/files/read?path=/etc/hostname"),
     );
 
     let resp = app.oneshot(req).await.unwrap();
@@ -412,10 +766,9 @@ async fn read_file_returns_404_for_unknown_sandbox() {
     let app = build_router(svc);
     let unknown_id = SandboxId::new().to_string();
 
-    let req = json_request(
-        "POST",
-        &format!("/v1/sandboxes/{unknown_id}/files/read"),
-        serde_json::json!({"path": "/etc/hostname"}),
+    let req = empty_request(
+        "GET",
+        &format!("/v1/sandboxes/{unknown_id}/files/read?path=/etc/hostname"),
     );
 
     let resp = app.oneshot(req).await.unwrap();
@@ -428,10 +781,9 @@ async fn read_file_with_cwd() {
     let id = svc.sandbox.sandbox_id.to_string();
     let app = build_router(svc);
 
-    let req = json_request(
-        "POST",
-        &format!("/v1/sandboxes/{id}/files/read"),
-        serde_json::json!({"path": "main.rs", "cwd": "/app/src"}),
+    let req = empty_request(
+        "GET",
+        &format!("/v1/sandboxes/{id}/files/read?path=main.rs&cwd=/app/src"),
     );
 
     let resp = app.oneshot(req).await.unwrap();
@@ -440,4 +792,75 @@ async fn read_file_with_cwd() {
         .await
         .unwrap();
     assert_eq!(body.as_ref(), b"contents of main.rs");
+}
+
+#[tokio::test]
+async fn read_file_404_includes_resolved_path() {
+    struct MissingSvc {
+        info: SandboxInfo,
+    }
+    impl SandboxService for MissingSvc {
+        async fn create(&self, _: CreateRequest) -> Result<SandboxInfo, ApiError> {
+            unreachable!()
+        }
+        async fn get(&self, _: &SandboxId) -> Result<SandboxInfo, ApiError> {
+            unreachable!()
+        }
+        async fn list(&self) -> Result<Vec<SandboxInfo>, ApiError> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &SandboxId) -> Result<(), ApiError> {
+            unreachable!()
+        }
+        async fn exec(&self, _: &SandboxId, _: ExecRequest) -> Result<ExecOutput, ApiError> {
+            unreachable!()
+        }
+        async fn write_files(
+            &self,
+            _: &SandboxId,
+            _: WriteFilesRequest,
+        ) -> Result<WriteFilesResult, ApiError> {
+            unreachable!()
+        }
+        async fn write_file(
+            &self,
+            _: &SandboxId,
+            _: WriteFileRequest,
+        ) -> Result<WriteFilesResult, ApiError> {
+            unreachable!()
+        }
+        async fn read_file(&self, _: &SandboxId, _: ReadFileRequest) -> Result<Vec<u8>, ApiError> {
+            Err(ApiError::FileNotFound {
+                resolved_path: "/home/missing.py".into(),
+            })
+        }
+    }
+    let sandbox_id = SandboxId::new();
+    let svc = Arc::new(MissingSvc {
+        info: SandboxInfo {
+            subdomain: sandbox_id.subdomain(),
+            sandbox_id,
+            agent_id: "a".into(),
+            status: "running".into(),
+        },
+    });
+    let app = build_router(svc.clone());
+
+    let req = empty_request(
+        "GET",
+        &format!(
+            "/v1/sandboxes/{}/files/read?path=missing.py",
+            svc.info.sandbox_id
+        ),
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_json(resp).await;
+    assert_eq!(body["error_code"], "FILE_NOT_FOUND");
+    let msg = body["error"].as_str().unwrap();
+    assert!(
+        msg.contains("/home/missing.py"),
+        "error message should include resolved path, got: {msg}"
+    );
 }

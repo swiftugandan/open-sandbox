@@ -7,7 +7,9 @@ use open_sandbox_contracts::controller::{SandboxConfig, StartSandbox};
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
-use crate::container::{ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOutput};
+use crate::container::{
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOptions, ExecOutput,
+};
 use crate::tunnel::{ForwardRequest, ForwardResponse, HttpClient};
 
 pub struct MockContainerRuntime {
@@ -73,18 +75,18 @@ impl ContainerRuntime for MockContainerRuntime {
     async fn exec(
         &self,
         _id: &ContainerId,
-        command: Vec<String>,
-        stdin: Vec<u8>,
+        options: ExecOptions,
     ) -> Result<ExecOutput, AgentError> {
-        let stdout = if !stdin.is_empty() {
-            format!("received {} bytes", stdin.len()).into_bytes()
+        let stdout = if !options.stdin.is_empty() {
+            format!("received {} bytes", options.stdin.len()).into_bytes()
         } else {
-            command.join(" ").into_bytes()
+            options.command.join(" ").into_bytes()
         };
         Ok(ExecOutput {
             exit_code: 0,
             stdout,
             stderr: vec![],
+            command_not_found: false,
         })
     }
 }
@@ -118,8 +120,7 @@ impl ContainerRuntime for FailingContainerRuntime {
     async fn exec(
         &self,
         _id: &ContainerId,
-        _command: Vec<String>,
-        _stdin: Vec<u8>,
+        _options: ExecOptions,
     ) -> Result<ExecOutput, AgentError> {
         Err(AgentError::Runtime {
             detail: "mock runtime failure".into(),
