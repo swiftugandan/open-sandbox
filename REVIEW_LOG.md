@@ -240,6 +240,28 @@ comp-1 cross-component CLI reconnect-loop follow-up closed here.
 
 ---
 
+## Component 7 — ws-client (in-crate findings)
+
+6 findings; 3 closed in `review/07-ws-client`, 3 deferred (read timeout, frame size, interactive-bash raw mode).
+
+### [comp-7 · critical] No TLS feature: wss:// broken — **closed**
+
+- **Fix:** `tokio-tungstenite = { features = ["rustls-tls-webpki-roots"] }`.
+
+### [comp-7 · high] No Ctrl-C → SIGINT forwarding — **closed**
+
+- **Fix:** background `tokio::signal::ctrl_c()` task pumps an mpsc; main select forwards each press as `session.send_signal(2)`.
+
+### [comp-7 · med] CLI exit codes collided with sandbox exits — **closed**
+
+- **Fix:** CLI-level codes shifted to 124..=127 (timeout/sudo convention).
+
+### [comp-7 · DEFERRED] read timeout, frame size, raw-mode TTY
+
+- See `NEEDS_HUMAN_ATTENTION.md`.
+
+---
+
 ## Component 6 — api (in-crate findings)
 
 8 findings; 3 closed in `review/06-api`, 5 deferred (chunking, structured-trailer NotFound mapping, mutex poison, body limit middleware, tonic codec sizes).
