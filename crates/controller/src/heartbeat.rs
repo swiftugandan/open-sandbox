@@ -42,6 +42,10 @@ impl HeartbeatMonitor {
             .map(|(id, _)| id.clone())
             .collect()
     }
+
+    pub fn tracked_agents(&self) -> Vec<AgentId> {
+        self.heartbeats.lock().unwrap().keys().cloned().collect()
+    }
 }
 
 #[cfg(test)]

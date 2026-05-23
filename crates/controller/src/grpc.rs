@@ -544,6 +544,142 @@ mod tests {
         assert!(store.routing_entries_for_agent(&agent_id).is_empty());
     }
 
+    fn sandbox_status_message(sandbox_id: &SandboxId, state: SandboxState) -> AgentMessage {
+        use open_sandbox_contracts::controller::SandboxStatus;
+        AgentMessage {
+            payload: Some(agent_message::Payload::SandboxStatus(SandboxStatus {
+                sandbox_id: sandbox_id.to_string(),
+                state: state as i32,
+                error_message: String::new(),
+            })),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_with_mismatched_agent_id_is_ignored() {
+        // F3: agent registered as A sends Heartbeat{agent_id: B} where B is a
+        // legitimately-registered peer (so registry.heartbeat(&B) would
+        // succeed). The controller MUST NOT refresh B's liveness — otherwise
+        // any agent can keep a dead peer alive in HeartbeatMonitor and
+        // prevent eviction.
+        let (controller, addr) = start_controller(AcceptAllTokens).await;
+
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+
+        // Pre-register B directly so registry.heartbeat(&B) succeeds — this is
+        // the precondition that makes the bug exploitable.
+        controller
+            .registry
+            .register(
+                agent_b.clone(),
+                &JoinToken::new("token".into()),
+                AgentCapacity {
+                    cpu_cores: 4,
+                    memory_bytes: 8_000_000_000,
+                },
+            )
+            .await
+            .unwrap();
+        // Crucially, B is NOT in heartbeat_monitor (it never streamed).
+        assert!(!controller.heartbeat_monitor.tracked_agents().contains(&agent_b));
+
+        let (tx, mut inbound) = connect_agent(&addr).await;
+        tx.send(register_message(&agent_a, "token")).await.unwrap();
+        let _ = inbound.message().await.unwrap().unwrap();
+
+        // A sends Heartbeat{agent_id: B}.
+        tx.send(heartbeat_message(&agent_b)).await.unwrap();
+
+        // Barrier: legitimate heartbeat for A so we know the prior message has
+        // been processed before we observe the monitor.
+        tx.send(heartbeat_message(&agent_a)).await.unwrap();
+        let msg = inbound.message().await.unwrap().unwrap();
+        assert!(matches!(
+            msg.payload,
+            Some(controller_command::Payload::HeartbeatAck(_))
+        ));
+
+        let tracked = controller.heartbeat_monitor.tracked_agents();
+        assert!(
+            !tracked.contains(&agent_b),
+            "B must NOT be in heartbeat monitor; current tracked: {tracked:?}"
+        );
+        assert!(tracked.contains(&agent_a));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandbox_status_from_non_owning_agent_is_ignored() {
+        // F2: routing assigns sandbox_x → agent_A. Agent B (connected and
+        // registered) sends SandboxStatus{sandbox_id: sandbox_x, state: Failed}.
+        // The controller MUST reject the update because B is not the owner.
+        let (controller, addr) = start_controller(AcceptAllTokens).await;
+
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+        let sandbox_x = SandboxId::new();
+
+        // Register agent A in registry/connections, seed the routing entry x→A,
+        // and pre-set the sandbox state to "running" so we can detect overwrites.
+        controller
+            .registry
+            .register(
+                agent_a.clone(),
+                &JoinToken::new("token".into()),
+                AgentCapacity {
+                    cpu_cores: 4,
+                    memory_bytes: 8_000_000_000,
+                },
+            )
+            .await
+            .unwrap();
+        controller
+            .scheduler
+            .store()
+            .insert_routing_entry(RoutingEntry {
+                sandbox_id: sandbox_x.clone(),
+                agent_id: agent_a.clone(),
+            })
+            .await
+            .unwrap();
+        controller
+            .scheduler
+            .store()
+            .save_sandbox_state(&sandbox_x, &agent_a, "running", None)
+            .await
+            .unwrap();
+
+        // Open a stream and register as B.
+        let (tx, mut inbound) = connect_agent(&addr).await;
+        tx.send(register_message(&agent_b, "token")).await.unwrap();
+        let _ = inbound.message().await.unwrap().unwrap();
+
+        // B sends a SandboxStatus for sandbox_x.
+        tx.send(sandbox_status_message(&sandbox_x, SandboxState::Failed))
+            .await
+            .unwrap();
+
+        // Barrier: heartbeat ack proves the prior message was processed.
+        tx.send(heartbeat_message(&agent_b)).await.unwrap();
+        let msg = inbound.message().await.unwrap().unwrap();
+        assert!(matches!(
+            msg.payload,
+            Some(controller_command::Payload::HeartbeatAck(_))
+        ));
+
+        let row = controller
+            .scheduler
+            .store()
+            .get_sandbox_state(&sandbox_x)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state, "running",
+            "non-owning agent B must not be able to overwrite sandbox_x's state"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn sweep_preserves_heartbeat_when_mark_dead_fails_transiently() {
         let store = Arc::new(FailNextStore::new());
