@@ -277,6 +277,42 @@ impl ControllerStore for PgStore {
                 })?;
         Ok(row.map(|(state, error)| crate::store::SandboxStateRow { state, error }))
     }
+
+    async fn mark_agent_dead_atomic(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<(), ControllerError> {
+        let mut tx = self.pool.begin().await.map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        let result = sqlx::query("UPDATE agents SET state = $1 WHERE agent_id = $2")
+            .bind(state_to_str(&AgentState::Dead))
+            .bind(agent_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ControllerError::Database {
+                detail: e.to_string(),
+            })?;
+        if result.rows_affected() == 0 {
+            return Err(ControllerError::AgentNotFound {
+                agent_id: agent_id.to_string(),
+            });
+        }
+
+        sqlx::query("DELETE FROM routing_entries WHERE agent_id = $1")
+            .bind(agent_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ControllerError::Database {
+                detail: e.to_string(),
+            })?;
+
+        tx.commit().await.map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        Ok(())
+    }
 }
 
 fn state_to_str(state: &AgentState) -> &'static str {

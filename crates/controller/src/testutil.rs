@@ -142,6 +142,26 @@ impl ControllerStore for InMemoryStore {
     ) -> Result<Option<SandboxStateRow>, ControllerError> {
         Ok(self.sandbox_states.lock().unwrap().get(sandbox_id).cloned())
     }
+
+    async fn mark_agent_dead_atomic(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<(), ControllerError> {
+        // In-memory atomicity: hold both locks for the whole critical section.
+        // Ordering is fixed (agents → routing) so deadlock is impossible.
+        let mut agents = self.agents.lock().unwrap();
+        let mut routing = self.routing.lock().unwrap();
+        match agents.get_mut(agent_id) {
+            Some(agent) => {
+                agent.state = AgentState::Dead;
+                routing.retain(|e| e.agent_id != *agent_id);
+                Ok(())
+            }
+            None => Err(ControllerError::AgentNotFound {
+                agent_id: agent_id.to_string(),
+            }),
+        }
+    }
 }
 
 pub struct AcceptAllTokens;
@@ -165,6 +185,7 @@ impl TokenValidator for RejectAllTokens {
 pub struct FailNextStore {
     inner: InMemoryStore,
     fail_update_agent_state: Mutex<bool>,
+    fail_remove_routing_entries_for_agent: Mutex<bool>,
 }
 
 impl FailNextStore {
@@ -172,11 +193,16 @@ impl FailNextStore {
         Self {
             inner: InMemoryStore::new(),
             fail_update_agent_state: Mutex::new(false),
+            fail_remove_routing_entries_for_agent: Mutex::new(false),
         }
     }
 
     pub fn arm_update_agent_state_failure(&self) {
         *self.fail_update_agent_state.lock().unwrap() = true;
+    }
+
+    pub fn arm_remove_routing_entries_for_agent_failure(&self) {
+        *self.fail_remove_routing_entries_for_agent.lock().unwrap() = true;
     }
 
     pub fn inner(&self) -> &InMemoryStore {
@@ -269,5 +295,34 @@ impl ControllerStore for FailNextStore {
         sandbox_id: &SandboxId,
     ) -> Result<Option<SandboxStateRow>, ControllerError> {
         self.inner.get_sandbox_state(sandbox_id).await
+    }
+
+    async fn mark_agent_dead_atomic(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<(), ControllerError> {
+        let (should_fail_state, should_fail_remove) = {
+            let mut state_armed = self.fail_update_agent_state.lock().unwrap();
+            let mut remove_armed = self.fail_remove_routing_entries_for_agent.lock().unwrap();
+            let s = *state_armed;
+            let r = *remove_armed;
+            *state_armed = false;
+            *remove_armed = false;
+            (s, r)
+        };
+        if should_fail_state || should_fail_remove {
+            // Simulate the txn aborting: no side-effects. Verify the agent
+            // exists so the returned error semantics match a real failure
+            // (Database vs AgentNotFound).
+            if self.inner.get_agent(agent_id).await?.is_none() {
+                return Err(ControllerError::AgentNotFound {
+                    agent_id: agent_id.to_string(),
+                });
+            }
+            return Err(ControllerError::Database {
+                detail: "injected mark_agent_dead_atomic failure".into(),
+            });
+        }
+        self.inner.mark_agent_dead_atomic(agent_id).await
     }
 }

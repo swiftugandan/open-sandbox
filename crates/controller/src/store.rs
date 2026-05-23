@@ -79,6 +79,19 @@ pub trait ControllerStore: Send + Sync {
         &self,
         sandbox_id: &SandboxId,
     ) -> impl Future<Output = Result<Option<SandboxStateRow>, ControllerError>> + Send;
+
+    /// Atomically transition an agent to Dead AND remove all of its routing
+    /// entries. Either both writes persist, or neither does — implementations
+    /// MUST NOT leave the system in a state where the agent is marked Dead in
+    /// storage but routing entries still reference it (or vice-versa).
+    ///
+    /// AgentNotFound is returned only when the agent did not exist before the
+    /// call; transient errors return ControllerError::Database so the caller
+    /// can retry. See REVIEW_LOG.md F7 for the original failure mode.
+    fn mark_agent_dead_atomic(
+        &self,
+        agent_id: &AgentId,
+    ) -> impl Future<Output = Result<(), ControllerError>> + Send;
 }
 
 #[derive(Debug, Clone)]
