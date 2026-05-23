@@ -16,6 +16,8 @@ futures-util = "0.3"
 prost = "0.13"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.24"
+# Comp-7: TLS feature required so `wss://` works against the production
+# proxy. Webpki roots avoid pulling in OpenSSL.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 url = "2"
 urlencoding = "2"

@@ -78,7 +78,11 @@ async fn main() -> ExitCode {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("connect: {e}");
-                return ExitCode::from(2);
+                // Comp-7: shift CLI-level error codes into the 124..=127 /
+                // 128+ range to avoid colliding with legitimate sandbox
+                // process exit codes (timeout(1)/sudo/env convention).
+                // 124 = client could not connect.
+                return ExitCode::from(124);
             }
         };
 
@@ -124,6 +128,21 @@ async fn main() -> ExitCode {
         None
     };
 
+    // Comp-7: Ctrl-C handler. The CLI previously died on SIGINT without
+    // notifying the agent; the in-container PID kept running. We forward
+    // each Ctrl-C as a SIGINT to the remote via a dedicated mpsc.
+    let (sigint_tx, mut sigint_rx) = mpsc::channel::<()>(4);
+    tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            if sigint_tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+
     #[allow(unused_assignments)]
     let mut exit_code: i32 = 0;
     loop {
@@ -133,9 +152,19 @@ async fn main() -> ExitCode {
         // outside the select — same trick used by tower's mpsc
         // adapters.
         let frame_res = match (stdin_done, deadline) {
-            (true, None) => session.next_frame().await,
+            (true, None) => tokio::select! {
+                f = session.next_frame() => f,
+                Some(()) = sigint_rx.recv() => {
+                    let _ = session.send_signal(2).await;
+                    continue;
+                }
+            },
             (true, Some(d)) => tokio::select! {
                 f = session.next_frame() => f,
+                Some(()) = sigint_rx.recv() => {
+                    let _ = session.send_signal(2).await;
+                    continue;
+                }
                 _ = tokio::time::sleep_until(d) => {
                     eprintln!("# read deadline reached after {}s — exiting cleanly", args.read_for_secs);
                     return ExitCode::from(0);
@@ -157,6 +186,10 @@ async fn main() -> ExitCode {
                         }
                     }
                 }
+                Some(()) = sigint_rx.recv() => {
+                    let _ = session.send_signal(2).await;
+                    continue;
+                }
                 f = session.next_frame() => f,
             },
             (false, Some(d)) => tokio::select! {
@@ -174,6 +207,10 @@ async fn main() -> ExitCode {
                             continue;
                         }
                     }
+                }
+                Some(()) = sigint_rx.recv() => {
+                    let _ = session.send_signal(2).await;
+                    continue;
                 }
                 f = session.next_frame() => f,
                 _ = tokio::time::sleep_until(d) => {
@@ -210,15 +247,17 @@ async fn main() -> ExitCode {
             }
             Ok(Some(ServerFrame::Error { code, detail })) => {
                 eprintln!("# error code={code} detail={detail}");
-                return ExitCode::from(3);
+                // Comp-7: shifted to 125 (CLI-level remote-error class) to
+                // avoid colliding with sandbox process exits 1..=125.
+                return ExitCode::from(125);
             }
             Ok(None) => {
                 eprintln!("# session closed without exit");
-                return ExitCode::from(4);
+                return ExitCode::from(126);
             }
             Err(e) => {
                 eprintln!("# i/o: {e}");
-                return ExitCode::from(5);
+                return ExitCode::from(127);
             }
         }
     }
