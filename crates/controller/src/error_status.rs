@@ -2,7 +2,25 @@ use open_sandbox_contracts::error::ControllerError;
 use tonic::{Code, Status};
 
 pub fn controller_error_to_status(err: &ControllerError) -> Status {
-    Status::internal(err.to_string())
+    match err {
+        ControllerError::InvalidToken => Status::unauthenticated(err.to_string()),
+        ControllerError::SandboxNotFound { sandbox_id } => Status::not_found(sandbox_id.clone()),
+        ControllerError::AgentNotFound { agent_id } => {
+            Status::failed_precondition(format!("agent {agent_id} not available"))
+        }
+        ControllerError::NoAvailableAgents => Status::resource_exhausted(err.to_string()),
+        ControllerError::Database { detail } => {
+            Status::internal(format!("database error: {detail}"))
+        }
+        ControllerError::Internal { detail } => Status::internal(detail.clone()),
+        // ControllerError is #[non_exhaustive]; new variants land here as Internal.
+        // If you add a variant, add a dedicated arm above — Internal is a fallback,
+        // not a contract.
+        other => {
+            tracing::warn!(error = %other, "unmapped ControllerError variant; defaulting to Internal");
+            Status::internal(other.to_string())
+        }
+    }
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ use open_sandbox_contracts::api::{
 use open_sandbox_contracts::controller::{ControllerCommand, StopSandbox, controller_command};
 use open_sandbox_contracts::types::SandboxId;
 
+use crate::error_status::controller_error_to_status;
 use crate::grpc::{Controller, CreateSandboxRequest as InternalCreateRequest};
 use crate::scheduler::SandboxRequirements;
 use crate::store::ControllerStore;
@@ -63,7 +64,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
                 exposed_port,
             })
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| controller_error_to_status(&e))?;
 
         let _ = self
             .controller
@@ -89,7 +90,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             .controller
             .find_routing_entry(&sandbox_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| controller_error_to_status(&e))?;
 
         match entry {
             Some(entry) => {
@@ -97,7 +98,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
                     .controller
                     .get_sandbox_state(&sandbox_id)
                     .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                    .map_err(|e| controller_error_to_status(&e))?;
                 let (status, error) = match row {
                     Some(r) => (r.state, r.error.unwrap_or_default()),
                     None => ("running".to_string(), String::new()),
@@ -125,7 +126,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             .controller
             .find_routing_entry(&sandbox_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| controller_error_to_status(&e))?;
 
         let entry = entry.ok_or_else(|| Status::not_found(req.sandbox_id.clone()))?;
 
@@ -140,12 +141,12 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             .connections
             .send_command(&entry.agent_id, command)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| controller_error_to_status(&e))?;
 
         self.controller
             .remove_routing_entry(&sandbox_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| controller_error_to_status(&e))?;
 
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
@@ -158,7 +159,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             .controller
             .list_routing_entries()
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| controller_error_to_status(&e))?;
 
         let mut sandboxes = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -166,7 +167,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
                 .controller
                 .get_sandbox_state(&entry.sandbox_id)
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(|e| controller_error_to_status(&e))?;
             let (status, error) = match row {
                 Some(r) => (r.state, r.error.unwrap_or_default()),
                 None => ("running".to_string(), String::new()),
