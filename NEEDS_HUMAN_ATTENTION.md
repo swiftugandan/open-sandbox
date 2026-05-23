@@ -218,6 +218,22 @@ This needs an SPEC amendment and live testing on the Linux dev env. Block on you
 - **Summary:** tokio-tungstenite defaults to max_message_size=64 MiB, max_frame_size=16 MiB; the api side has no coordinated cap. A single stdout chunk >16 MiB silently closes the client.
 - **Recommended next step:** decide the contracted per-frame upper bound (recommend 1 MiB matching typical WS gateway defaults), document in the contracts crate, and set the same on both sides. I can ship once you decide.
 
+## [comp-8 · decision] Secrets leak via Debug derive
+
+- **Blocker class:** `decision`
+- **Source:** comp-8 review
+- **File:** `crates/cli/src/cli.rs` (AgentArgs/ApiArgs/ControllerArgs/ProxyArgs)
+- **Summary:** API key, join token, and the postgres `DATABASE_URL` (which contains password in userinfo) are stored as plain `String` with `#[derive(Debug)]`. Any future `tracing::error!(?args, ...)` during incident triage prints them in plaintext.
+- **Recommended next step:** wrap each secret in a newtype with a redacted Debug impl (or pull in the `secrecy` crate). 3 fields, ~30 LOC. Want me to ship?
+
+## [comp-8 · decision] RUST_LOG malformed → silent info fallback + no panic-on-task-panic
+
+- **Blocker class:** `decision`
+- **Source:** comp-8 review
+- **File:** `crates/cli/src/main.rs:11`
+- **Summary:** EnvFilter parse errors fall back to plain "info" silently; operator sees no signal that their RUST_LOG had a typo. Plus no `std::panic::set_hook` to abort on spawned-task panics, so a panic in the routing-cache refresh loop or LISTEN subscriber gets caught by tokio and the proxy keeps serving with broken state.
+- **Recommended next step:** eprintln on EnvFilter parse error before falling back, and install set_hook that calls process::abort. Tell me if you want me to ship this together with the secret-redaction.
+
 ## [comp-9 · decision] Production deployment story (TLS, secrets, backups, observability)
 
 - **Blocker class:** `decision`
