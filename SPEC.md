@@ -226,9 +226,11 @@ v1.0 confidence gate
 Confidence: high
 Residual risks:
   - WebSocket-on-HTTP/1.1 vs HTTP/2 (RFC 8441) — using the well-supported HTTP/1.1 Upgrade path; HTTP/2 WebSocket is not widely deployed
-  - Docker backend's signal_exec requires `kill` in the sandbox image (alongside the existing `tar` requirement); youki backend bypasses this via setns+kill(2) syscalls
+  - Both runtimes' signal delivery uses `kill` inside the container (docker: `docker exec <ctr> kill`; youki: `nsenter ... -- kill`). Sandbox images must therefore contain `kill` and `sh` — the in-container PID capture wraps user commands in `sh -c '... exec "$@"'` so a process-namespace-local `$$` can be reported on stderr before exec replaces the shell in place. busybox-based images (alpine, distroless `:debug`) satisfy both. Pure-distroless images do not work today.
   - Idle WebSocket sessions need application-level ping/pong (30s interval) to bound disconnect-detection latency past TCP keepalive defaults
 Known gaps: None blocking.
+
+Implementation note added at module/exec-streaming-6 (live-verified): the original "youki bypasses kill via setns+kill(2) syscalls" expectation was relaxed — youki uses `nsenter ... -- kill` to mirror docker's shape. Direct-syscall signal delivery remains a v1.1 optimisation, not a correctness requirement. Verified against alpine sandbox images.
 ```
 
 ```
