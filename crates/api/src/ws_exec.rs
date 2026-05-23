@@ -179,7 +179,12 @@ async fn pump_ws_session(
     let mut ping_interval = tokio::time::interval(WS_IDLE_PING_INTERVAL);
     ping_interval.reset();
 
-    let mut recv_task_handle = recv_task;
+    // Wrap in Option so the JoinHandle is consumed exactly once.
+    // Polling a completed JoinHandle panics ("JoinHandle polled
+    // after completion"), so the select arm pulls the handle out
+    // of the Option when it fires, leaving subsequent select
+    // iterations and the post-loop wait both with `None`.
+    let mut recv_task_handle: Option<tokio::task::JoinHandle<()>> = Some(recv_task);
     loop {
         tokio::select! {
             biased;
@@ -190,7 +195,11 @@ async fn pump_ws_session(
             // doesn't see the synthetic IoClose until after the
             // next ping → its ExecRegistry cleanup is delayed
             // accordingly.
-            _ = &mut recv_task_handle => break,
+            res = async { recv_task_handle.as_mut().unwrap().await }, if recv_task_handle.is_some() => {
+                let _ = res;
+                recv_task_handle = None;
+                break;
+            }
             frame = server_rx.recv() => match frame {
                 None => break,
                 Some(Err(e)) => {
@@ -257,7 +266,10 @@ async fn pump_ws_session(
     // client stream → agent cleans up.
     drop(client_tx);
     // Wait briefly for the recv task to finish (it observes WS close).
-    let _ = tokio::time::timeout(Duration::from_secs(2), recv_task_handle).await;
+    // Only awaitable if it hasn't already been consumed in the loop.
+    if let Some(h) = recv_task_handle {
+        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+    }
 
     info!(
         sandbox_id = %sandbox_id,

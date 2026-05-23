@@ -115,31 +115,50 @@ impl ProxyClientPool {
 
         let mut inbound = response.into_inner();
 
-        // Pump tonic Stream into a friendlier mpsc.
+        // Pump tonic Stream into a friendlier mpsc. The pump races
+        // inbound.message() against server_tx.closed() so a caller
+        // that drops the receiver (e.g. ws_exec exiting on client
+        // disconnect) causes the tonic stream to be dropped
+        // immediately. Without that race the pump would stay parked
+        // on inbound.message() until the proxy happened to send
+        // something — which, on the disconnect path, doesn't happen
+        // until the in-container process exits naturally. The cost
+        // is the difference between "cleanup fires when the user
+        // gave up" and "cleanup fires when the workload finishes
+        // anyway."
         let (server_tx, server_rx) = mpsc::channel::<Result<IoServerFrame, ApiError>>(32);
         tokio::spawn(async move {
             loop {
-                match inbound.message().await {
-                    Ok(Some(frame)) => {
-                        if server_tx.send(Ok(frame)).await.is_err() {
+                tokio::select! {
+                    biased;
+                    _ = server_tx.closed() => {
+                        // Consumer dropped server_rx — abandon the
+                        // tonic stream so the proxy sees an end of
+                        // request stream on its side.
+                        return;
+                    }
+                    msg = inbound.message() => match msg {
+                        Ok(Some(frame)) => {
+                            if server_tx.send(Ok(frame)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => return,
+                        Err(status) => {
+                            let mapped = match status.code() {
+                                tonic::Code::NotFound => ApiError::SandboxGone {
+                                    sandbox_id: status.message().to_string(),
+                                },
+                                tonic::Code::Unavailable => ApiError::ProxyUnavailable {
+                                    detail: status.message().to_string(),
+                                },
+                                _ => ApiError::IoStreamFailed {
+                                    detail: status.message().to_string(),
+                                },
+                            };
+                            let _ = server_tx.send(Err(mapped)).await;
                             return;
                         }
-                    }
-                    Ok(None) => return,
-                    Err(status) => {
-                        let mapped = match status.code() {
-                            tonic::Code::NotFound => ApiError::SandboxGone {
-                                sandbox_id: status.message().to_string(),
-                            },
-                            tonic::Code::Unavailable => ApiError::ProxyUnavailable {
-                                detail: status.message().to_string(),
-                            },
-                            _ => ApiError::IoStreamFailed {
-                                detail: status.message().to_string(),
-                            },
-                        };
-                        let _ = server_tx.send(Err(mapped)).await;
-                        return;
                     }
                 }
             }
