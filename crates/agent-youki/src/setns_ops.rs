@@ -20,25 +20,33 @@
 //! ## Thread safety
 //!
 //! `setns(CLONE_NEWNS)` changes only the calling thread's
-//! namespace. We MUST keep all four steps on the same OS
-//! thread; we do this by running inside
-//! `tokio::task::spawn_blocking`, which gives the closure
-//! exclusive use of a thread for its duration. The Drop guard
-//! restores the namespace before the thread returns to the
-//! blocking pool — without that, the worker would leak into
-//! subsequent tasks.
+//! namespace. The kernel additionally requires that the
+//! calling thread's `fs_struct` (cwd/root/umask) is NOT shared
+//! with any other thread — `mntns_install` returns `EINVAL`
+//! if `fs->users != 1`. Linux threads in the same process
+//! share `fs_struct` by default, so we must call
+//! `unshare(CLONE_FS)` before `setns(CLONE_NEWNS)`. That call
+//! is irreversible (the kernel won't let you re-share), which
+//! means we cannot safely reuse a tokio blocking-pool worker
+//! after running setns on it.
+//!
+//! Therefore each call runs on a fresh, short-lived OS thread
+//! via `std::thread::spawn` — the thread terminates as soon as
+//! the closure returns, taking its private `fs_struct` with
+//! it. The async layer bridges the join via a tokio oneshot.
 //!
 //! ## Required capabilities
 //!
-//! `CAP_SYS_ADMIN` (for `setns`). The youki agent already runs
-//! privileged for `libcontainer`; no new capability needed.
+//! `CAP_SYS_ADMIN` (for `setns` + `unshare`). The youki agent
+//! already runs privileged for `libcontainer`; no new
+//! capability needed.
 
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::path::Path;
 
 use bytes::Bytes;
-use nix::sched::{CloneFlags, setns};
+use nix::sched::{CloneFlags, setns, unshare};
 
 use open_sandbox_contracts::error::AgentError;
 
@@ -56,30 +64,53 @@ where
             detail: format!("invalid container pid {target_pid}"),
         });
     }
-    tokio::task::spawn_blocking(move || {
-        let save_fd = File::open("/proc/self/ns/mnt").map_err(|e| AgentError::Runtime {
-            detail: format!("open self mnt ns: {e}"),
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<R, AgentError>>();
+    std::thread::Builder::new()
+        .name(format!("setns-{target_pid}"))
+        .spawn(move || {
+            let result = setns_op_inner(target_pid, f);
+            let _ = tx.send(result);
+        })
+        .map_err(|e| AgentError::Runtime {
+            detail: format!("spawn setns thread: {e}"),
         })?;
-        let target_path = format!("/proc/{target_pid}/ns/mnt");
-        let target_fd = File::open(&target_path).map_err(|e| AgentError::Runtime {
-            detail: format!("open target mnt ns {target_path}: {e}"),
-        })?;
-
-        setns(target_fd.as_fd(), CloneFlags::CLONE_NEWNS).map_err(|e| AgentError::Runtime {
-            detail: format!("setns into target mnt ns (pid={target_pid}): {e}"),
-        })?;
-
-        // From here on, the thread is in the container's mount
-        // namespace. The guard restores on drop.
-        let _guard = MountNsGuard {
-            save_fd: Some(save_fd),
-        };
-        f()
-    })
-    .await
-    .map_err(|e| AgentError::Runtime {
-        detail: format!("setns blocking task panicked: {e}"),
+    rx.await.map_err(|e| AgentError::Runtime {
+        detail: format!("setns thread dropped sender: {e}"),
     })?
+}
+
+fn setns_op_inner<F, R>(target_pid: i32, f: F) -> Result<R, AgentError>
+where
+    F: FnOnce() -> Result<R, AgentError>,
+{
+    let save_fd = File::open("/proc/self/ns/mnt").map_err(|e| AgentError::Runtime {
+        detail: format!("open self mnt ns: {e}"),
+    })?;
+    let target_path = format!("/proc/{target_pid}/ns/mnt");
+    let target_fd = File::open(&target_path).map_err(|e| AgentError::Runtime {
+        detail: format!("open target mnt ns {target_path}: {e}"),
+    })?;
+
+    // Detach this thread's fs_struct from the rest of the
+    // process. Linux requires fs->users == 1 for setns(MNT);
+    // without this we get EINVAL from mntns_install. Safe
+    // because the thread terminates after this op completes.
+    unshare(CloneFlags::CLONE_FS).map_err(|e| AgentError::Runtime {
+        detail: format!("unshare CLONE_FS before setns: {e}"),
+    })?;
+
+    setns(target_fd.as_fd(), CloneFlags::CLONE_NEWNS).map_err(|e| AgentError::Runtime {
+        detail: format!("setns into target mnt ns (pid={target_pid}): {e}"),
+    })?;
+
+    // Guard restores our original mount namespace on drop —
+    // important so that any errno-extracting code (e.g.,
+    // strerror) outside the closure runs in our home ns rather
+    // than the container's. The thread will then terminate.
+    let _guard = MountNsGuard {
+        save_fd: Some(save_fd),
+    };
+    f()
 }
 
 /// RAII guard that restores the original mount namespace of the
