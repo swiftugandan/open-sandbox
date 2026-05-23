@@ -97,6 +97,21 @@ pub async fn drive_io_session<R, S>(
         Some(io_start::Params::ReadFile(params)) => {
             drive_read_file(runtime, stream_id, container_id, params, server_tx).await;
         }
+        Some(io_start::Params::WriteFile(params)) => {
+            drive_write_file(runtime, stream_id, container_id, params, client_frames, server_tx)
+                .await;
+        }
+        Some(io_start::Params::WriteFilesTargz(params)) => {
+            drive_write_files_targz(
+                runtime,
+                stream_id,
+                container_id,
+                params,
+                client_frames,
+                server_tx,
+            )
+            .await;
+        }
         None => {
             send_error(
                 &server_tx,
@@ -449,6 +464,126 @@ async fn drive_read_file<R>(
             };
             send_error(&server_tx, &stream_id, code, &e.to_string()).await;
         }
+    }
+}
+
+async fn drive_write_file<R, S>(
+    runtime: Arc<R>,
+    stream_id: String,
+    container_id: ContainerId,
+    params: open_sandbox_contracts::proxy::WriteFileParams,
+    mut client_frames: S,
+    server_tx: mpsc::Sender<IoServerFrame>,
+) where
+    R: ContainerRuntime,
+    S: Stream<Item = Result<IoClientFrame, AgentError>> + Unpin + Send + 'static,
+{
+    let cwd = if params.cwd.is_empty() {
+        None
+    } else {
+        Some(params.cwd.as_str())
+    };
+    info!(
+        stream_id = %stream_id,
+        path = %params.path,
+        cwd = ?cwd,
+        "io_session.start op=write_file"
+    );
+
+    // Collect stdin chunks until Close{stdin_eof}, EOF, or non-Stdin frame.
+    let mut content: Vec<u8> = Vec::new();
+    while let Some(frame) = client_frames.next().await {
+        let Ok(IoClientFrame { payload: Some(p), .. }) = frame else { break };
+        match p {
+            io_client_frame::Payload::Stdin(bytes) => content.extend_from_slice(&bytes),
+            io_client_frame::Payload::Close(_) => break,
+            io_client_frame::Payload::Signal(_) | io_client_frame::Payload::Start(_) => {
+                send_error(
+                    &server_tx,
+                    &stream_id,
+                    "INVALID_REQUEST",
+                    "only Stdin and Close frames are valid in write_file mode",
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    match runtime
+        .write_file(&container_id, &params.path, cwd, Bytes::from(content))
+        .await
+    {
+        Ok(()) => {
+            let exited = IoServerFrame {
+                stream_id: stream_id.clone(),
+                payload: Some(io_server_frame::Payload::Exited(IoExited {
+                    exit_code: 0,
+                    command_not_found: false,
+                })),
+            };
+            let _ = server_tx.send(exited).await;
+        }
+        Err(e) => send_error(&server_tx, &stream_id, "WRITE_FAILED", &e.to_string()).await,
+    }
+}
+
+async fn drive_write_files_targz<R, S>(
+    runtime: Arc<R>,
+    stream_id: String,
+    container_id: ContainerId,
+    params: open_sandbox_contracts::proxy::WriteFilesTargzParams,
+    mut client_frames: S,
+    server_tx: mpsc::Sender<IoServerFrame>,
+) where
+    R: ContainerRuntime,
+    S: Stream<Item = Result<IoClientFrame, AgentError>> + Unpin + Send + 'static,
+{
+    let cwd = if params.cwd.is_empty() {
+        None
+    } else {
+        Some(params.cwd.as_str())
+    };
+    info!(
+        stream_id = %stream_id,
+        cwd = ?cwd,
+        "io_session.start op=write_files_targz"
+    );
+
+    let mut tarball: Vec<u8> = Vec::new();
+    while let Some(frame) = client_frames.next().await {
+        let Ok(IoClientFrame { payload: Some(p), .. }) = frame else { break };
+        match p {
+            io_client_frame::Payload::Stdin(bytes) => tarball.extend_from_slice(&bytes),
+            io_client_frame::Payload::Close(_) => break,
+            io_client_frame::Payload::Signal(_) | io_client_frame::Payload::Start(_) => {
+                send_error(
+                    &server_tx,
+                    &stream_id,
+                    "INVALID_REQUEST",
+                    "only Stdin and Close frames are valid in write_files_targz mode",
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    match runtime
+        .write_files_targz(&container_id, cwd, Bytes::from(tarball))
+        .await
+    {
+        Ok(()) => {
+            let exited = IoServerFrame {
+                stream_id: stream_id.clone(),
+                payload: Some(io_server_frame::Payload::Exited(IoExited {
+                    exit_code: 0,
+                    command_not_found: false,
+                })),
+            };
+            let _ = server_tx.send(exited).await;
+        }
+        Err(e) => send_error(&server_tx, &stream_id, "WRITE_FAILED", &e.to_string()).await,
     }
 }
 

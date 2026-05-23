@@ -129,6 +129,8 @@ message IoStart {
   oneof params {
     ExecParams exec = 2;
     ReadFileParams read_file = 3;
+    WriteFileParams write_file = 4;
+    WriteFilesTargzParams write_files_targz = 5;
   }
 }
 
@@ -146,6 +148,23 @@ message ExecParams {
 message ReadFileParams {
   string path = 1;
   string cwd = 2;
+}
+
+// Atomic single-file write. The runtime writes to a temp file in
+// the target's directory and renames into place (per agent runtime
+// trait write_file). Caller streams file contents via subsequent
+// `stdin` frames; closing the client stream (or sending an
+// `IoClose { stdin_eof: true }`) signals EOF.
+message WriteFileParams {
+  string path = 1;
+  string cwd = 2;
+}
+
+// Bulk write via gzipped tar archive. Caller streams the tarball
+// via subsequent `stdin` frames; mkdir-and-extract is performed by
+// the runtime (per agent runtime trait write_files_targz).
+message WriteFilesTargzParams {
+  string cwd = 1;
 }
 
 message IoSignal {

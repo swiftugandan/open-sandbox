@@ -1,0 +1,20 @@
+[package]
+name = "open-sandbox-ws-client"
+version = "1.0.0"
+edition = "2024"
+description = "Rust SDK for the Open Sandbox v1.0 streaming exec WebSocket API"
+
+[[bin]]
+name = "opensandbox-exec"
+path = "src/bin/opensandbox-exec.rs"
+
+[dependencies]
+open-sandbox-contracts = { path = "../contracts" }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+prost = "0.13"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+url = "2"
