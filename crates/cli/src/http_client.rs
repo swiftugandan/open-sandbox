@@ -13,9 +13,17 @@ impl Default for ReqwestHttpClient {
 
 impl ReqwestHttpClient {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        // Comp-8: explicit timeouts. Default `reqwest::Client::new()` has
+        // none, so a deadlocked or half-open in-sandbox HTTP server parks
+        // the tunnel worker forever. Total request timeout matches the
+        // proxy's UPSTREAM_TIMEOUT; connect timeout is short since we
+        // always dial loopback.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("reqwest client builder with valid timeouts must succeed");
+        Self { client }
     }
 }
 
