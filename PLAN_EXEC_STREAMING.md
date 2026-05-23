@@ -1632,21 +1632,22 @@ Explicitly out of scope. Document in `SPEC.md` as "v1.1 / additive."
 # Final confidence gate
 
 ```
-Confidence: high (~0.80)
+Confidence: high (~0.85)
 
 Implementation hazards (the ones that move my number):
-  - 12.2 youki PID-capture race window (poll /proc/<nsenter_pid>/
-    task/*/children with 5×10ms backoff is plausible but unspiked).
-    Spike 05 recommended before 12.2 opens.
+  - 12.2 youki PID-capture race: SPIKE 05 RESOLVED. p99 = 484 μs;
+    worst observed = 12 ms (one missed poll). Plan's 5×10ms backoff
+    has ~4× safety margin over worst observed; in practice ~97% of
+    captures happen on the first poll.
+  - 12.2 bollard backpressure: SPIKE 04 RESOLVED. Producer's
+    write_all naturally awaits at ~10 MiB of total chain buffering;
+    no internal unbounded queue. Backpressure propagates through
+    the entire WS → gRPC → tunnel → bollard → cat → pipes chain.
   - 12.2 setns + kill(2) thread affinity within tokio. setns is
-    per-thread; plan needs to specify spawn_blocking or a dedicated
-    thread for the syscall path. To be locked down in 12.2's
-    implementation.
-  - 12.2/12.4 backpressure chain across WS → gRPC → tunnel →
-    runtime is only spike-confirmed on the WS leg (spike 03). The
-    other three hops are plausible but unverified end-to-end.
-    Spike 04 (bollard concurrent stdin/stdout pumping under
-    cancellation) recommended before 12.2 opens.
+    per-thread; the syscall must be invoked from a dedicated thread
+    (or spawn_blocking task with a saved fd). To be locked down in
+    12.2's implementation. Not spike-blocking — well-understood
+    Linux syscall semantics.
   - 12.3 stream_mux concurrency changes preserving HTTP forwarding
     under concurrent IoStream load. No spike; mitigated by
     integration tests in 12.3 + e2e in 12.6.
@@ -1677,21 +1678,17 @@ Platform constraints:
     backend is gated by CI Linux runners.
 
 Known gaps:
-  Two cheap pre-implementation spikes (04 bollard pumping, 05 youki
-  PID-capture race) would each take ~½ day and would close named
-  unknowns in 12.2. Both are recommended before 12.2 opens. They do
-  not block 12.1, which can begin immediately.
-
-  No other blocking gaps. Design doc is the source of truth; spikes
-  01-03 confirm the existing load-bearing assumptions; the DAG is
+  None. Both pre-implementation spikes (04 bollard pumping, 05
+  youki PID-capture race) have been run and both closed their
+  respective unknowns favorably. Design doc is the source of truth;
+  spikes 01-05 confirm all load-bearing assumptions; the DAG is
   acyclic; every sub-module has a concrete acceptance criterion
   including observability requirements; 12.7 covers introductory
   documentation (the project has not shipped, so there is no v0.7
   → v1.0 migration burden).
 ```
 
-This plan revision is `plan/v0.6.2` once committed and tagged
-(supersedes `plan/v0.6.1` — same architecture and decisions; the
-v0.6.2 changes are the no-legacy simplifications: `reserved`
-markers dropped from 12.1, 12.5 deletion pass made aggressive, 12.7
-shrunk from S → XS by dropping the migration framing).
+This plan revision is `plan/v0.6.3` — the v0.6.2 confidence gate
+flagged spikes 04 and 05 as recommended-but-unrun; they have now
+been run and the gate is updated to reflect their positive results.
+Confidence raised from ~0.80 to ~0.85.

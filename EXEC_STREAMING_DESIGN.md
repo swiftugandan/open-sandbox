@@ -537,6 +537,8 @@ chat log; one-line summary below for cross-session continuity.
 | 01 | Does docker exec kill the in-container process when bollard's attached stream is dropped? | `spikes/exec-streaming/spike-01-docker-exec-disconnect/RESULT.md` |
 | 02 | Does killing host-side `nsenter` propagate SIGTERM to the in-namespace child? | `spikes/exec-streaming/spike-02-nsenter-signal-propagation/RESULT.md` |
 | 03 | Does axum's WebSocket `send().await` backpressure cleanly, and how fast does the server notice an abrupt client disconnect? | `spikes/exec-streaming/spike-03-axum-websocket-properties/RESULT.md` |
+| 04 | Does bollard's `start_exec` attached pipeline backpressure end-to-end? | `spikes/exec-streaming/spike-04-bollard-pumping/RESULT.md` |
+| 05 | youki PID-capture race window: how fast does `/proc/<nsenter_pid>/task/*/children` become readable? | `spikes/exec-streaming/spike-05-youki-pid-capture/RESULT.md` |
 
 Spike results are committed alongside this doc so the conclusions are
 auditable. If a spike contradicts an assumption above, this doc is

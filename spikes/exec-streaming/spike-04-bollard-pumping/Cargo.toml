@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "spike-04-bollard-pumping"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "spike04"
+path = "src/main.rs"
+
+[dependencies]
+bollard = "0.18"
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
