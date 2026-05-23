@@ -227,6 +227,7 @@ mod tests {
         let server_handle = tokio::spawn(async move { server.run(listener).await });
 
         let mux_clone = mux.clone();
+        let agent_id_clone = agent_id.clone();
         let agent_handle = tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let response = HttpResponse {
@@ -234,7 +235,7 @@ mod tests {
                     headers: Default::default(),
                     body: b"hello from sandbox".to_vec(),
                 };
-                mux_clone.deliver_response(&req.stream_id, response);
+                mux_clone.deliver_response(&req.stream_id, &agent_id_clone, response);
             }
         });
 
@@ -274,6 +275,7 @@ mod tests {
         let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_clone = captured.clone();
         let mux_clone = mux.clone();
+        let agent_id_clone = agent_id.clone();
         let agent_handle = tokio::spawn(async move {
             if let Some(req) = rx.recv().await {
                 if let Some(tunnel_request::Payload::HttpRequest(http_req)) = &req.payload {
@@ -284,7 +286,7 @@ mod tests {
                     headers: Default::default(),
                     body: vec![],
                 };
-                mux_clone.deliver_response(&req.stream_id, response);
+                mux_clone.deliver_response(&req.stream_id, &agent_id_clone, response);
             }
         });
 
@@ -409,6 +411,7 @@ mod tests {
         let server_handle = tokio::spawn(async move { server.run(listener).await });
 
         let mux_clone = mux.clone();
+        let agent_id_clone = agent_id.clone();
         let agent_handle = tokio::spawn(async move {
             if let Some(req) = rx.recv().await {
                 if let Some(tunnel_request::Payload::HttpRequest(http_req)) = &req.payload {
@@ -425,7 +428,7 @@ mod tests {
                     headers: Default::default(),
                     body: b"created".to_vec(),
                 };
-                mux_clone.deliver_response(&req.stream_id, response);
+                mux_clone.deliver_response(&req.stream_id, &agent_id_clone, response);
             }
         });
 

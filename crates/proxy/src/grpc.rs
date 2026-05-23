@@ -60,6 +60,12 @@ pub struct SandboxIoHandler<S: RoutingStore> {
     /// the check (used in single-process tests where network
     /// isolation suffices).
     internal_token: Option<String>,
+    /// Optional shared-secret token for the agent-side OpenTunnel RPC.
+    /// Comp-2 A1: required at the binary boundary in production so a
+    /// network-reachable attacker cannot register as an arbitrary
+    /// agent_id and hijack routing. None disables the check (single-
+    /// process tests).
+    tunnel_token: Option<String>,
     /// Which RPCs this handler instance accepts. See [`ProxyRole`].
     role: ProxyRole,
 }
@@ -78,6 +84,7 @@ impl<S: RoutingStore> SandboxIoHandler<S> {
             sessions,
             routing,
             internal_token,
+            None,
             ProxyRole::Combined,
         )
     }
@@ -88,6 +95,7 @@ impl<S: RoutingStore> SandboxIoHandler<S> {
         sessions: Arc<IoSessions>,
         routing: Arc<RoutingCache<S>>,
         internal_token: Option<String>,
+        tunnel_token: Option<String>,
         role: ProxyRole,
     ) -> Self {
         Self {
@@ -96,6 +104,7 @@ impl<S: RoutingStore> SandboxIoHandler<S> {
             sessions,
             routing,
             internal_token,
+            tunnel_token,
             role,
         }
     }
@@ -114,6 +123,22 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
                 "OpenTunnel is not served on this proxy listener; \
                  agents must dial the public listener",
             ));
+        }
+        // Comp-2 A1: require a shared-secret tunnel-join token when set.
+        // Without this, a network-reachable attacker can call OpenTunnel
+        // claiming any agent_id (or even spam reconnects) and hijack
+        // routing for that agent's sandboxes.
+        if let Some(expected) = &self.tunnel_token {
+            let got = request
+                .metadata()
+                .get(INTERNAL_AUTH_METADATA_KEY)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "));
+            if got != Some(expected.as_str()) {
+                return Err(Status::unauthenticated(
+                    "missing or invalid tunnel-join token",
+                ));
+            }
         }
         let mut inbound = request.into_inner();
         let (result_tx, outbound_rx) = mpsc::channel::<Result<TunnelRequest, Status>>(32);
@@ -147,18 +172,39 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
                         pool.register(agent_id.clone(), request_tx.clone());
                         registered_agent_id = Some(agent_id);
                     }
+                    // Comp-2 A2: dispatch frames carry stream_id only, but a
+                    // malicious/confused agent could deliver frames for streams
+                    // owned by other agents. Verify carrier ownership in
+                    // deliver_response / deliver_server_frame / fail_stream by
+                    // passing the registered_agent_id. Frames before Ready
+                    // (registered_agent_id == None) are dropped.
                     tunnel_response::Payload::HttpResponse(resp) => {
-                        mux.deliver_response(&msg.stream_id, resp);
+                        let Some(ref agent_id) = registered_agent_id else {
+                            warn!("dropping HttpResponse received before Ready");
+                            continue;
+                        };
+                        mux.deliver_response(&msg.stream_id, agent_id, resp);
                     }
                     tunnel_response::Payload::Close(close) => {
-                        mux.fail_stream(&msg.stream_id, close.reason);
+                        let Some(ref agent_id) = registered_agent_id else {
+                            warn!("dropping Close received before Ready");
+                            continue;
+                        };
+                        mux.fail_stream(&msg.stream_id, agent_id, close.reason);
                     }
                     tunnel_response::Payload::Data(_) => {}
                     tunnel_response::Payload::IoServer(frame) => {
-                        if !sessions.deliver_server_frame(&msg.stream_id, frame).await {
-                            // No session for this stream_id — the
-                            // gateway disconnected or the session
-                            // was already cleaned up. Drop silently.
+                        let Some(ref agent_id) = registered_agent_id else {
+                            warn!("dropping IoServer frame received before Ready");
+                            continue;
+                        };
+                        if !sessions
+                            .deliver_server_frame(&msg.stream_id, agent_id, frame)
+                            .await
+                        {
+                            // No session for this stream_id, or the carrier
+                            // doesn't own it — drop silently (already logged
+                            // in deliver_server_frame when ownership fails).
                         }
                     }
                 }
@@ -433,6 +479,7 @@ pub fn sandbox_io_service<S: RoutingStore + 'static>(
         sessions,
         routing,
         internal_token,
+        None,
         ProxyRole::Combined,
     )
 }
@@ -443,6 +490,7 @@ pub fn sandbox_io_service_with_role<S: RoutingStore + 'static>(
     sessions: Arc<IoSessions>,
     routing: Arc<RoutingCache<S>>,
     internal_token: Option<String>,
+    tunnel_token: Option<String>,
     role: ProxyRole,
 ) -> SandboxIoServiceServer<SandboxIoHandler<S>> {
     SandboxIoServiceServer::new(SandboxIoHandler::with_role(
@@ -451,6 +499,7 @@ pub fn sandbox_io_service_with_role<S: RoutingStore + 'static>(
         sessions,
         routing,
         internal_token,
+        tunnel_token,
         role,
     ))
 }
@@ -617,8 +666,15 @@ mod tests {
     ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
-        let service =
-            sandbox_io_service_with_role(mux, pool, sessions, routing, internal_token, role);
+        let service = sandbox_io_service_with_role(
+            mux,
+            pool,
+            sessions,
+            routing,
+            internal_token,
+            None, // tunnel_token disabled in unit tests
+            role,
+        );
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)

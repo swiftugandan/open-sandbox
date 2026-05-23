@@ -96,16 +96,55 @@ impl StreamMux {
         }
     }
 
-    pub fn deliver_response(&self, stream_id: &str, response: HttpResponse) -> bool {
-        let pending = self.pending.lock().unwrap().remove(stream_id);
+    /// Deliver a response on the given stream. Comp-2 A2: requires
+    /// `from_agent` to match the stream's owning agent — a malicious or
+    /// confused agent cannot inject responses into another agent's session.
+    /// Returns true if the response was forwarded; false if the stream is
+    /// unknown OR the carrier agent doesn't own the stream.
+    pub fn deliver_response(
+        &self,
+        stream_id: &str,
+        from_agent: &AgentId,
+        response: HttpResponse,
+    ) -> bool {
+        let pending = {
+            let mut guard = self.pending.lock().unwrap();
+            match guard.get(stream_id) {
+                Some(p) if p.agent_id == *from_agent => guard.remove(stream_id),
+                Some(_) => {
+                    tracing::warn!(
+                        stream_id = %stream_id,
+                        carrier = %from_agent,
+                        "deliver_response: carrier agent does not own stream; dropping"
+                    );
+                    return false;
+                }
+                None => return false,
+            }
+        };
         match pending {
             Some(p) => p.response_tx.send(Ok(response)).is_ok(),
             None => false,
         }
     }
 
-    pub fn fail_stream(&self, stream_id: &str, reason: String) {
-        if let Some(pending) = self.pending.lock().unwrap().remove(stream_id) {
+    pub fn fail_stream(&self, stream_id: &str, from_agent: &AgentId, reason: String) {
+        let pending = {
+            let mut guard = self.pending.lock().unwrap();
+            match guard.get(stream_id) {
+                Some(p) if p.agent_id == *from_agent => guard.remove(stream_id),
+                Some(_) => {
+                    tracing::warn!(
+                        stream_id = %stream_id,
+                        carrier = %from_agent,
+                        "fail_stream: carrier agent does not own stream; dropping"
+                    );
+                    return;
+                }
+                None => return,
+            }
+        };
+        if let Some(pending) = pending {
             let _ = pending.response_tx.send(Err(ProxyError::UpstreamRejected {
                 stream_id: stream_id.to_string(),
                 reason,
@@ -204,7 +243,7 @@ mod tests {
             headers: Default::default(),
             body: b"ok".to_vec(),
         };
-        mux.deliver_response(&req.stream_id, response);
+        mux.deliver_response(&req.stream_id, &agent_id, response);
     }
 
     #[tokio::test]
@@ -239,7 +278,7 @@ mod tests {
             headers: Default::default(),
             body: b"ok".to_vec(),
         };
-        assert!(mux.deliver_response(&stream_id, response));
+        assert!(mux.deliver_response(&stream_id, &agent_id, response));
 
         let result = handle.await.unwrap().unwrap();
         assert_eq!(result.status_code, 200);
@@ -256,7 +295,45 @@ mod tests {
             headers: Default::default(),
             body: vec![],
         };
-        assert!(!mux.deliver_response("nonexistent", response));
+        assert!(!mux.deliver_response("nonexistent", &AgentId::new(), response));
+    }
+
+    #[tokio::test]
+    async fn deliver_response_from_wrong_agent_is_dropped() {
+        // Comp-2 A2: a response delivered by a different agent than the
+        // pending stream's owner must NOT complete the request.
+        let pool = Arc::new(TunnelPool::new());
+        let owner = AgentId::new();
+        let attacker = AgentId::new();
+        let (tx, mut rx) = mpsc::channel::<TunnelRequest>(32);
+        pool.register(owner.clone(), tx);
+        let mux = Arc::new(StreamMux::new(pool));
+
+        let mux_clone = mux.clone();
+        let owner_clone = owner.clone();
+        let handle = tokio::spawn(async move {
+            mux_clone
+                .send_request(
+                    &owner_clone,
+                    "sandbox-1",
+                    "GET".into(),
+                    "/".into(),
+                    Default::default(),
+                    vec![],
+                )
+                .await
+        });
+
+        let req = rx.recv().await.unwrap();
+        let response = HttpResponse {
+            status_code: 200,
+            headers: Default::default(),
+            body: vec![],
+        };
+        assert!(!mux.deliver_response(&req.stream_id, &attacker, response));
+        // Cleanup so the test doesn't hang on UPSTREAM_TIMEOUT.
+        mux.cancel_stream(&req.stream_id);
+        let _ = handle.await;
     }
 
     #[tokio::test]
@@ -318,7 +395,7 @@ mod tests {
         });
 
         let req = rx.recv().await.unwrap();
-        mux.fail_stream(&req.stream_id, "container not ready".into());
+        mux.fail_stream(&req.stream_id, &agent_id, "container not ready".into());
 
         let result = handle.await.unwrap();
         assert!(matches!(result, Err(ProxyError::UpstreamRejected { .. })));

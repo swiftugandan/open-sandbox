@@ -77,10 +77,32 @@ impl IoSessions {
     /// blocks the tunnel dispatcher, which blocks the agent's
     /// outbound, which blocks the in-container process. That's the
     /// backpressure chain we want.
-    pub async fn deliver_server_frame(&self, stream_id: &str, frame: IoServerFrame) -> bool {
+    /// Forward an `IoServerFrame` from the agent's tunnel into the gateway-
+    /// side outbound stream. Comp-2 A2: requires `from_agent` to match the
+    /// session's owning agent — a malicious or confused agent cannot inject
+    /// frames into another agent's session. Returns true on forward, false
+    /// if the stream is unknown OR the carrier doesn't own it.
+    pub async fn deliver_server_frame(
+        &self,
+        stream_id: &str,
+        from_agent: &AgentId,
+        frame: IoServerFrame,
+    ) -> bool {
         let sender = {
             let guard = self.inner.lock().unwrap();
-            guard.get(stream_id).map(|r| r.server_tx.clone())
+            match guard.get(stream_id) {
+                Some(r) if r.agent_id == *from_agent => Some(r.server_tx.clone()),
+                Some(r) => {
+                    tracing::warn!(
+                        stream_id = %stream_id,
+                        carrier = %from_agent,
+                        owner = %r.agent_id,
+                        "deliver_server_frame: carrier does not own session; dropping"
+                    );
+                    None
+                }
+                None => None,
+            }
         };
         match sender {
             Some(tx) => tx.send(Ok(frame)).await.is_ok(),
@@ -137,17 +159,18 @@ mod tests {
             stream_id: "bogus".into(),
             payload: None,
         };
-        assert!(!s.deliver_server_frame("bogus", frame).await);
+        assert!(!s.deliver_server_frame("bogus", &AgentId::new(), frame).await);
     }
 
     #[tokio::test]
     async fn deliver_to_known_stream_forwards_frame() {
         let s = IoSessions::new();
         let (tx, mut rx) = mpsc::channel(8);
+        let agent_id = AgentId::new();
         s.insert(
             "io-0".into(),
             IoSessionRecord {
-                agent_id: AgentId::new(),
+                agent_id: agent_id.clone(),
                 server_tx: tx,
             },
         );
@@ -158,9 +181,32 @@ mod tests {
                 command_not_found: false,
             })),
         };
-        assert!(s.deliver_server_frame("io-0", frame).await);
+        assert!(s.deliver_server_frame("io-0", &agent_id, frame).await);
         let received = rx.recv().await.unwrap().unwrap();
         assert_eq!(received.stream_id, "io-0");
+    }
+
+    #[tokio::test]
+    async fn deliver_from_wrong_agent_is_dropped() {
+        // Comp-2 A2: a frame delivered by a different agent than the
+        // session's owner must NOT be forwarded.
+        let s = IoSessions::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let owner = AgentId::new();
+        let attacker = AgentId::new();
+        s.insert(
+            "io-0".into(),
+            IoSessionRecord {
+                agent_id: owner,
+                server_tx: tx,
+            },
+        );
+        let frame = IoServerFrame {
+            stream_id: "io-0".into(),
+            payload: None,
+        };
+        assert!(!s.deliver_server_frame("io-0", &attacker, frame).await);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

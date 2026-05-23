@@ -184,6 +184,18 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         )
         .into());
     }
+    // Comp-2 A1: shared-secret token agents present on OpenTunnel. Required on
+    // the public listener so a network-reachable attacker cannot register
+    // themselves as an arbitrary agent_id and hijack routing. Refuse to bind
+    // when missing.
+    let tunnel_token = std::env::var("TUNNEL_JOIN_TOKEN").ok();
+    if tunnel_token.is_none() {
+        return Err("TUNNEL_JOIN_TOKEN must be set so agents calling OpenTunnel \
+                    are authenticated; without it any network-reachable caller \
+                    can register as any agent_id and hijack routing for that \
+                    agent's sandboxes"
+            .into());
+    }
     let (public_role, internal_role) = if split_listeners {
         (ProxyRole::Public, ProxyRole::Internal)
     } else {
@@ -203,6 +215,7 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         sessions.clone(),
         cache.clone(),
         internal_token.clone(),
+        tunnel_token.clone(),
         public_role,
     );
 
@@ -238,6 +251,9 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
             sessions,
             cache.clone(),
             internal_token,
+            // Internal listener does NOT accept OpenTunnel; no token needed
+            // there. Public listener already enforced tunnel_token above.
+            None,
             internal_role,
         );
         info!(internal_grpc = %internal_addr, "proxy: internal listener ready");
@@ -316,7 +332,11 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
 
     let http_client = Arc::new(ReqwestHttpClient::new());
     let forwarder = Arc::new(TunnelForwarder::new(sandbox_manager.clone(), http_client));
-    let proxy_conn = ProxyConnection::new(agent_id, forwarder);
+    // Comp-2 A1: present the bearer token on OpenTunnel. Optional so dev
+    // setups (single-process tests) can omit; production proxies refuse
+    // anonymous tunnels at the binary boundary.
+    let agent_tunnel_token = std::env::var("TUNNEL_JOIN_TOKEN").ok();
+    let proxy_conn = ProxyConnection::with_token(agent_id, forwarder, agent_tunnel_token);
 
     let controller_url = args.controller_url.clone();
     let proxy_url = args.proxy_url.clone();

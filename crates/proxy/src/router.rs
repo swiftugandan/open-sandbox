@@ -192,7 +192,7 @@ mod tests {
             headers: Default::default(),
             body: b"<html>hello</html>".to_vec(),
         };
-        mux.deliver_response(&req.stream_id, response);
+        mux.deliver_response(&req.stream_id, &agent_id, response);
 
         let result = handle.await.unwrap().unwrap();
         assert_eq!(result.status_code, 200);
