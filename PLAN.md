@@ -295,9 +295,10 @@ neither runtime propagates client disconnect to the in-container PID).
    (echo, backpressure, signal, disconnect-kills, idle keepalive,
    long-running >60s, command-not-found, write-then-exec) on the
    docker-compose.full stack, both runtimes.
-7. `module/exec-streaming-7-migration` — `MIGRATION_v0.7_to_v1.0.md`,
-   CHANGELOG, three runnable ws-client examples (echo,
-   long-running-build, interactive-bash), SPEC.md amendment.
+7. `module/exec-streaming-7-docs` — CHANGELOG (first stable release
+   note), `crates/ws-client/README.md`, three runnable examples
+   (echo, long-running-build, interactive-bash), SPEC.md amendment.
+   No migration guide: project has not shipped.
 
 **Closes friction items:** H1 (60s timeout), H2 (no session
 persistence), H3 (disconnect doesn't kill), H4 (write_file shell
@@ -308,9 +309,15 @@ output), M4 (cwd default inconsistency), M5 (stdin utf8 footgun).
 agent API (free byproduct), v1.1 transparent WebSocket forwarding
 (VNC-from-browser), v1.2 desktop sandbox recipe.
 
-Amendment to be tagged `plan/v0.6.1` (revised after pre-implementation
-review found 14 issues — frame envelope over-specification, premature
-PTY in proto, fuzzy first-frame format, missing auth + internal authn,
-absent observability requirements, missing migration sub-module,
-identifier conflation, plus smaller nits — all resolved before
-implementation start).
+Amendment tagged `plan/v0.6.2`. History:
+
+- `plan/v0.6.0` — first draft (unused; deleted after self-review)
+- `plan/v0.6.1` — first review pass; 14 issues fixed (frame envelope
+  over-specification, premature PTY, fuzzy first-frame format,
+  missing auth + internal authn, observability gaps, migration
+  sub-module added, identifier conflation, smaller nits)
+- `plan/v0.6.2` — no-legacy simplifications: `reserved` proto
+  markers dropped (renumber instead), 12.5 deletion pass made
+  aggressive, 12.7 shrunk from migration guide to introductory
+  docs (the project has not shipped — there is no v0.7 to v1.0
+  migration burden)

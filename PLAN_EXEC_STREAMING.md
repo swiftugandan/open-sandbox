@@ -52,9 +52,9 @@
                  both runtimes)
                       │
                       ▼
-                12.7 migration & docs
-                (v0.7 → v1.0 guide, SDK examples,
-                 SPEC update, changelog)
+                12.7 introductory docs
+                (CHANGELOG, SDK examples,
+                 SPEC update, ws-client README)
 ```
 
 **Sequence point at 12.1:** all sub-modules below depend on the
@@ -80,7 +80,7 @@ main
       ├── module/exec-streaming-4-api-gateway-ws      → merged ff after live-verified
       ├── module/exec-streaming-5-controller-cleanup  → merged ff after live-verified
       ├── module/exec-streaming-6-live-e2e            → merged ff after live-verified
-      └── module/exec-streaming-7-migration           → merged ff after live-verified
+      └── module/exec-streaming-7-docs                → merged ff after live-verified
 ```
 
 The integration branch is what merges to `main` at the end as a single
@@ -221,6 +221,11 @@ message IoError {
 
 ## Proto changes — `controller.proto`
 
+Because the project has not shipped, the deleted oneof variants get
+renumbered rather than `reserved`-marked. No legacy binaries exist to
+be protected against field-number reuse; gaps in the proto would just
+prompt future readers to ask "what was here?" with no useful answer.
+
 ```diff
  message ControllerCommand {
    oneof payload {
@@ -229,8 +234,8 @@ message IoError {
      StartSandbox start_sandbox = 3;
      StopSandbox stop_sandbox = 4;
 -    ExecCommand exec = 5;
-+    reserved 5;  // was ExecCommand; now lives on proxy.proto IoStream
-     FetchLogsCommand fetch_logs = 6;
+-    FetchLogsCommand fetch_logs = 6;
++    FetchLogsCommand fetch_logs = 5;
    }
  }
 
@@ -241,16 +246,12 @@ message IoError {
      SandboxStatus sandbox_status = 3;
      ResourceReport resource_report = 4;
 -    ExecResult exec_result = 5;
-+    reserved 5;  // was ExecResult; now flows on the I/O stream
    }
  }
 
 -message ExecCommand { ... }
 -message ExecResult  { ... }
 ```
-
-`reserved` is the correct proto3 idiom — it prevents anyone from
-reusing field 5 with a different meaning later.
 
 ## Proto changes — `api.proto`
 
@@ -336,14 +337,13 @@ cargo build --workspace 2>&1 | grep -c 'error\[E0432\]: unresolved'
 
 ## Risks
 
-- **`reserved 5` interpretation.** Mitigation: tonic emits the
-  reserved annotation; old binaries from v0.7 won't talk to v1.0
-  controllers anyway (semver major), so wire-compat with reserved
-  fields is not a concern.
+None significant. The change is mechanical and well-scoped.
 
 ## Effort
 
-S–M. ~6 hours for proto + regen + crate update + doc amendments.
+S. ~4 hours for proto + regen + crate update + doc amendments.
+(Was S–M with `reserved` markers; without them, the proto changes
+are pure deletion + renumber.)
 
 ---
 
@@ -1249,18 +1249,26 @@ crates/agent/src/controller_client.rs                    [edit — drop ExecComm
 This is a pure removal pass. The work is mechanical: delete the file,
 compile, follow the breakage, delete the call sites.
 
-Expected casualties of the breakage pass (callsite rewrites or
-deletions, not exhaustive — discovered by following compiler errors):
+Expected casualties of the breakage pass (delete outright — the
+project has not shipped, so there is no obligation to preserve test
+coverage that referenced removed surfaces; coverage of the new
+shape lives in 12.4 unit tests and 12.6 e2e scenarios):
 
-- `crates/api/src/tests.rs` — all v0.7 unary exec tests
+- `crates/api/src/tests.rs` — every v0.7 unary exec test
   (`exec_returns_stdout_and_exit_code`, `exec_rejects_unknown_fields`,
   `exec_rejects_both_stdin_and_stdin_b64`,
   `exec_surfaces_command_not_found_in_response_envelope`,
-  `exec_passes_stdin_through`) become invalid because the surface is
-  gone. Delete them; their behavioral coverage moves to 12.4's WS
-  tests and 12.6's e2e scenarios.
+  `exec_passes_stdin_through`). Delete.
 - Controller integration tests that construct `ExecResult` directly
-  for assertions — delete or rewrite.
+  for assertions. Delete.
+- Any `exec_broker_test` files. Delete.
+- The `EXEC_TIMEOUT` constant test, if any. Delete.
+
+No rewrite-to-the-new-shape obligation. If a deleted test was
+exercising behavior the new architecture still has (e.g.,
+"INVALID_REQUEST on unknown fields"), 12.4 covers it in the WS
+context; if 12.4 doesn't, add the coverage there, not as a rewrite
+of the v0.7 test.
 
 ## TDD cycle expectations
 
@@ -1454,122 +1462,118 @@ M. ~2–3 days.
 
 ---
 
-# 12.7 — Migration & documentation
+# 12.7 — Introductory documentation
 
-**Branch:** `module/exec-streaming-7-migration`
-**Depends on:** 12.4 merged (so the new public surface exists),
-  12.5 merged (so removed surface is final), 12.6 green (so the
-  examples actually run).
-**Effort:** S (1 day)
+**Branch:** `module/exec-streaming-7-docs`
+**Depends on:** 12.4 merged (public surface exists), 12.6 green
+  (examples actually run).
+**Effort:** XS (½ day)
 
 ## Purpose
 
-v1.0 is a breaking public API change. v0.7 callers (SDKs, the
-example agent loop in this repo's chat history, any external
-integrators) need a migration path. This sub-module produces the
-caller-facing artifacts: a migration guide, updated example code,
-SPEC.md amendment, and the changelog entry for the v1.0.0 release.
+v1.0 is the first contracts version any external caller will see —
+the project has not shipped, so no migration burden exists. This
+sub-module produces the caller-facing artifacts that introduce the
+streaming API: changelog, SPEC.md amendment, and three runnable
+example binaries that demonstrate the v1.0 shape.
 
-Without this, the amendment leaves users to discover the breakage
-by failing requests.
+The original "migration guide" framing has been dropped — there is
+no v0.7 in production to migrate from. The artifacts are framed as
+documentation of what v1.0 is, not what changed.
 
 ## Files that change
 
 ```
-MIGRATION_v0.7_to_v1.0.md              [NEW]
-CHANGELOG.md                            [NEW or edit if exists]
-SPEC.md                                 [edit — supersede FR-12 wire shape, mark base64 exec response as removed]
-README.md                               [edit if exists — quick-start example uses ws-client]
-crates/ws-client/README.md              [NEW — SDK usage]
-crates/ws-client/examples/echo.rs       [NEW — minimal example]
-crates/ws-client/examples/long-running-build.rs    [NEW — demonstrates v0.7's H1 closure]
-crates/ws-client/examples/interactive-bash.rs      [NEW — demonstrates D5 (exec-as-session)]
-infra/e2e/scenarios/README.md           [NEW — points at examples]
+CHANGELOG.md                                           [NEW]
+SPEC.md                                                [edit — amend FR-12 wire shape; record v1.0]
+crates/ws-client/README.md                             [NEW — SDK shape & usage]
+crates/ws-client/examples/echo.rs                      [NEW — minimal exec session]
+crates/ws-client/examples/long-running-build.rs        [NEW — exec > 60s works (was H1)]
+crates/ws-client/examples/interactive-bash.rs          [NEW — exec-as-session (was H2)]
+infra/e2e/scenarios/README.md                          [NEW — points at examples]
 ```
 
-## MIGRATION doc structure
+No `MIGRATION_v0.7_to_v1.0.md`, no "concrete diffs (before/after)"
+sections, no cookbook framed around v0.7 → v1.0. CHANGELOG simply
+records "v1.0 — first stable contracts release; exec is a streaming
+session over WebSocket; see ws-client examples."
+
+## CHANGELOG.md shape
 
 ```
-# Migrating from v0.7 to v1.0
+# CHANGELOG
 
-## TL;DR
-- POST /v1/sandboxes/{id}/exec  →  WS /v1/sandboxes/{id}/exec
-- POST /v1/sandboxes/{id}/files/read  →  unchanged (REST kept for small reads)
-- POST /v1/sandboxes/{id}/files/write_file  →  unchanged
-- Exec response shape: ExecResponseBody{exit_code,stdout_b64,stderr_b64,error_code?}
-                       →  stream of Frame{kind, payload} terminating in IoExited
-- 60s exec timeout: gone. Sessions live as long as the WebSocket.
-- `error_code: COMMAND_NOT_FOUND` envelope field
-   →  IoExited{exit_code:127, command_not_found:true}
+## v1.0.0 — Streaming exec (first stable release)
 
-## Cookbook
-  ### "Run a command, get the output" — was 1 HTTP call, is now 1 WS session
-  ### "Pipe stdin into a command"   — was 1 HTTP call with stdin_b64
-                                       in JSON, is now stdin frames on the WS
-  ### "Long-running build"          — was impossible (60s ceiling),
-                                       now works
-  ### "Cancel a stuck command"      — was impossible, now WS close
-                                       (or signal frame)
-  ### "Interactive shell session"   — was impossible, now `bash -i`
-                                       held over WS
+Open Sandbox v1.0 is the first contracts version with stability
+guarantees. Earlier `contracts/v0.x` tags were internal development
+milestones and not consumed by external integrators.
 
-## Concrete diffs
-  ### shell with curl (before / after)
-  ### Python `requests` (before / after)
-  ### Rust with ws-client (the new SDK shape)
+### Public surface
+- REST lifecycle: POST/GET/DELETE /v1/sandboxes, GET /v1/sandboxes,
+  POST .../files/write_file, POST .../files/write_files,
+  GET .../files/read
+- WebSocket I/O: WS /v1/sandboxes/{id}/exec, WS .../files/read
+- All endpoints authenticate via Authorization: Bearer <key>
+
+### Architecture
+- Exec is a bidirectional stream-shaped session, not a request/
+  response. Sessions live as long as the WebSocket; ~no built-in
+  per-call timeout.
+- Long-running tasks (builds, training, integration tests) and
+  interactive shells (bash -i, python -i) are first-class via the
+  same primitive.
+- Process lifecycle is connection-bound: closing the WebSocket
+  triggers SIGTERM (grace) then SIGKILL on the in-container PID.
+
+### Reference clients
+- crates/ws-client — Rust SDK with ExecSession API
+- Three runnable examples: echo, long-running-build, interactive-bash
 ```
 
 ## TDD cycle expectations
 
-- **Red:** none — documentation work.
-- **Green:** all examples in MIGRATION compile / run.
-- **Refactor:** verify no stale references to `/exec` POST or
-  `ExecResponseBody` remain in user-facing docs.
-- **E2E:** the three example binaries (`echo`, `long-running-build`,
-  `interactive-bash`) run end-to-end against
-  `docker-compose.full.yml`.
+- **Red:** none — documentation.
+- **Green:** the three example binaries build and pass against the
+  docker-compose.full stack.
+- **Refactor:** verify the docs reference only types and endpoints
+  the v1.0 wire actually has.
+- **E2E:** examples ARE the e2e for this sub-module.
 
 ## Acceptance criterion
 
 ```bash
-# Examples compile.
 cargo build -p ws-client --examples
 
-# Examples run against a live stack.
 docker compose -f infra/e2e/docker-compose.full.yml up -d
 SB=$(curl -s -X POST http://localhost:18081/v1/sandboxes \
         -H 'content-type: application/json' \
         -d '{"image":"alpine"}' | jq -r .sandbox_id)
-cargo run -p ws-client --example echo -- --sandbox $SB
-cargo run -p ws-client --example long-running-build -- --sandbox $SB
-cargo run -p ws-client --example interactive-bash -- --sandbox $SB --once
+cargo run -p ws-client --example echo                 -- --sandbox $SB
+cargo run -p ws-client --example long-running-build    -- --sandbox $SB
+cargo run -p ws-client --example interactive-bash       -- --sandbox $SB --once
 # All three exit 0.
 
-# Migration doc references no removed types.
+# Docs do not reference removed types.
 grep -E 'ExecResponseBody|stdout_b64|/exec POST|EXEC_TIMEOUT' \
-     MIGRATION_v0.7_to_v1.0.md
-# Expected: empty (or only in "removed" sections explicitly).
+     CHANGELOG.md crates/ws-client/README.md
+# Expected: empty.
 ```
 
 ## Smoke test
 
-A docs-only check: render the migration doc and ensure all internal
-links resolve.
-
-```bash
-# If we adopt mdbook later, `mdbook test` would cover this. For v1.0,
-# manual review of the rendered doc is sufficient.
-```
+Render the docs and verify internal links resolve (manual for v1.0;
+`mdbook test` if the project adopts mdbook later).
 
 ## Risks
 
 - **Drift risk:** if 12.4 changes the WS surface late in the cycle,
-  the migration doc and examples have to follow. Mitigation: 12.7
-  runs LAST, after 12.6 green. The surface is frozen by then.
+  the docs and examples follow. Mitigation: 12.7 is last and the
+  surface is frozen by then.
 
 ## Effort
 
-S. ~1 day.
+XS. ~½ day (was S; halved by dropping the migration content).
 
 ---
 
@@ -1592,15 +1596,17 @@ If the amendment proves problematic mid-implementation:
 
 1. The integration branch (`contracts/amendment-exec-streaming`) is
    never merged back to `main` until 12.6 passes. So `main` stays
-   on `contracts/v0.7.0-frozen` and the v0.7 message-shaped exec
-   keeps working.
-2. Sub-module branches are revertible individually. Reverting
-   12.5 (controller cleanup) is the only one that affects the wire
-   protocol — but since the integration branch hasn't merged, no
-   external party has seen v1.0 contracts yet.
+   on `contracts/v0.7.0-frozen` and the existing exec path keeps
+   working for internal dev / testing on `main`.
+2. Sub-module branches are revertible individually.
 3. If 12.6 reveals a design flaw, return to `EXEC_STREAMING_DESIGN.md`
    and amend the design BEFORE touching code; rerun spikes if
    load-bearing assumptions are affected.
+
+Because the project has not shipped, "rollback" is an internal
+concern only — there are no external consumers to coordinate with.
+The bar for amending the design mid-stream is correspondingly
+lower: prefer correctness over speed.
 
 ## What this amendment does NOT address
 
@@ -1626,58 +1632,66 @@ Explicitly out of scope. Document in `SPEC.md` as "v1.1 / additive."
 # Final confidence gate
 
 ```
-Confidence: high
+Confidence: high (~0.80)
 
-Residual risks:
-  - 12.2 is the largest sub-module and touches both runtimes. Spike 01
-    and spike 02 confirmed the load-bearing assumption (both backends
-    need explicit kill plumbing); the implementation path is
-    well-understood but the matrix is wider than any prior amendment.
-    Mitigation: 12.2 is testable against mock proxy frames before any
-    of 12.3/12.4 are done, so it can be developed in isolation with
-    fast iteration.
+Implementation hazards (the ones that move my number):
+  - 12.2 youki PID-capture race window (poll /proc/<nsenter_pid>/
+    task/*/children with 5×10ms backoff is plausible but unspiked).
+    Spike 05 recommended before 12.2 opens.
+  - 12.2 setns + kill(2) thread affinity within tokio. setns is
+    per-thread; plan needs to specify spawn_blocking or a dedicated
+    thread for the syscall path. To be locked down in 12.2's
+    implementation.
+  - 12.2/12.4 backpressure chain across WS → gRPC → tunnel →
+    runtime is only spike-confirmed on the WS leg (spike 03). The
+    other three hops are plausible but unverified end-to-end.
+    Spike 04 (bollard concurrent stdin/stdout pumping under
+    cancellation) recommended before 12.2 opens.
+  - 12.3 stream_mux concurrency changes preserving HTTP forwarding
+    under concurrent IoStream load. No spike; mitigated by
+    integration tests in 12.3 + e2e in 12.6.
+  - 12.6 timing flakiness in scenario suite; mitigated by careful
+    timeout selection and parallel-run avoidance.
 
-  - 12.3's "extend TunnelRequest/TunnelResponse oneofs" approach
-    (Option A) reuses the existing tunnel pump but couples HTTP and
-    I/O variants. If this coupling becomes painful in v1.1
-    (transparent inbound WS forwarding) we may regret the choice
-    and split the pumps. Worth flagging during v1.1 design.
+Architectural choices to flag but not block on:
+  - 12.3's "extend TunnelRequest/TunnelResponse oneofs" (Option A)
+    couples HTTP and I/O variants. If painful in v1.1 (transparent
+    inbound WS forwarding) we may split the pumps. Worth flagging
+    during v1.1 design.
+  - axum WebSocket uses HTTP/1.1 Upgrade. HTTP/2 WebSocket (RFC 8441)
+    is not widely supported. Acceptable for v1.0.
+  - 12.4 default pool size 4 → ~400 concurrent streams. Configurable;
+    not a contract change.
+  - Internal gateway↔proxy authn: separate listener + shared secret
+    for default deployment; mTLS for cross-host topologies. Operational
+    concern, documented but out of contract scope.
 
-  - WebSocket-on-HTTP/1.1 vs HTTP/2: axum's WS is HTTP/1.1 Upgrade.
-    Browsers don't care; SDKs don't care; CLI tools don't care.
-    HTTP/2 WebSocket (RFC 8441) is not widely supported anyway.
-    Acceptable for v1.0.
+Runtime-image requirements (documented in SPEC.md):
+  - Docker backend's signal_exec requires `kill` in the sandbox image.
+    Most base images bundle it; minimal `scratch` images do not.
+    Runtime logs WARN on detection failure and falls back to natural
+    completion. Youki backend bypasses this via syscalls.
 
-  - 12.4 introduces a connection pool to the proxy with default
-    size 4. If actual load exceeds 400 concurrent streams (~100
-    per HTTP/2 channel), gateway must increase pool size or run
-    multiple gateway replicas. Configurable; not a contract change.
-
-  - 12.6 scenarios on youki can only run on Linux. macOS dev iteration
-    on the youki path is limited to cargo check + the existing
-    docker-compose.full.yml stack (which uses docker runtime). The
-    youki live-verified tag will be gated by CI Linux runners.
-
-  - Docker backend's `signal_exec` depends on `kill` being present
-    in the sandbox image. Common base images bundle it; minimal
-    `scratch` images do not. Mitigation: documented in SPEC.md as a
-    sandbox-image requirement alongside the existing `tar`
-    requirement; runtime logs a WARN on detection failure and falls
-    back to letting the process run to natural completion. Youki
-    backend bypasses this via direct syscalls.
-
-  - Internal authn between gateway and proxy uses a shared secret
-    via env var (Layer 2). If the deployment topology evolves to
-    cross-host, mTLS replaces network isolation; the shared-secret
-    layer stays. Operational concern, not contract.
+Platform constraints:
+  - youki suite runs Linux-only. The live-verified tag for the youki
+    backend is gated by CI Linux runners.
 
 Known gaps:
-  None blocking. Design doc is the source of truth; spike results
-  confirm the load-bearing assumptions; the DAG is acyclic; every
-  sub-module has a concrete acceptance criterion including
-  observability requirements; migration sub-module (12.7) covers
-  the user-visible bridge from v0.7 to v1.0.
+  Two cheap pre-implementation spikes (04 bollard pumping, 05 youki
+  PID-capture race) would each take ~½ day and would close named
+  unknowns in 12.2. Both are recommended before 12.2 opens. They do
+  not block 12.1, which can begin immediately.
+
+  No other blocking gaps. Design doc is the source of truth; spikes
+  01-03 confirm the existing load-bearing assumptions; the DAG is
+  acyclic; every sub-module has a concrete acceptance criterion
+  including observability requirements; 12.7 covers introductory
+  documentation (the project has not shipped, so there is no v0.7
+  → v1.0 migration burden).
 ```
 
-This plan revision is `plan/v0.6.1` once committed and tagged
-(supersedes the v0.6.0 pre-review draft).
+This plan revision is `plan/v0.6.2` once committed and tagged
+(supersedes `plan/v0.6.1` — same architecture and decisions; the
+v0.6.2 changes are the no-legacy simplifications: `reserved`
+markers dropped from 12.1, 12.5 deletion pass made aggressive, 12.7
+shrunk from S → XS by dropping the migration framing).
