@@ -148,6 +148,28 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                         };
                         let agent_id = AgentId::from(agent_uuid);
 
+                        // F3: the heartbeat MUST refer to the stream's registered agent.
+                        // A mismatch is treated as a benign protocol drift (could be a
+                        // racy reconnect) and dropped — not stream-fatal.
+                        match registered_agent_id.as_ref() {
+                            Some(reg) if reg == &agent_id => {}
+                            Some(reg) => {
+                                tracing::warn!(
+                                    stream_agent = %reg,
+                                    msg_agent = %agent_id,
+                                    "heartbeat agent_id mismatch; dropping"
+                                );
+                                continue;
+                            }
+                            None => {
+                                tracing::warn!(
+                                    msg_agent = %agent_id,
+                                    "heartbeat before Register; dropping"
+                                );
+                                continue;
+                            }
+                        }
+
                         if let Err(e) = registry.heartbeat(&agent_id).await {
                             let _ = tx.send(Err(Status::not_found(e.to_string()))).await;
                             break;
@@ -169,20 +191,57 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                     }
 
                     agent_message::Payload::SandboxStatus(status) => {
-                        if let Some(ref agent_id) = registered_agent_id {
-                            let sandbox_id =
-                                uuid::Uuid::parse_str(&status.sandbox_id).map(SandboxId::from);
-                            if let Ok(sandbox_id) = sandbox_id {
-                                let state_str = sandbox_state_to_str(status.state());
-                                let error = if status.error_message.is_empty() {
-                                    None
-                                } else {
-                                    Some(status.error_message.as_str())
-                                };
-                                let _ = store
-                                    .save_sandbox_state(&sandbox_id, agent_id, state_str, error)
-                                    .await;
+                        let Some(ref agent_id) = registered_agent_id else {
+                            tracing::warn!("SandboxStatus before Register; dropping");
+                            continue;
+                        };
+                        let Ok(sandbox_id) =
+                            uuid::Uuid::parse_str(&status.sandbox_id).map(SandboxId::from)
+                        else {
+                            continue;
+                        };
+
+                        // F2: only the agent that owns the routing entry may
+                        // update the sandbox's state. A mismatch (or a routing
+                        // entry that no longer exists) is dropped with a warn,
+                        // not stream-fatal — a benign race during failover
+                        // shouldn't tear down a healthy agent stream.
+                        match store.find_routing_entry(&sandbox_id).await {
+                            Ok(Some(entry)) if entry.agent_id == *agent_id => {}
+                            Ok(Some(entry)) => {
+                                tracing::warn!(
+                                    sender = %agent_id,
+                                    owner = %entry.agent_id,
+                                    sandbox = %sandbox_id,
+                                    "SandboxStatus from non-owning agent; dropping"
+                                );
+                                continue;
                             }
+                            Ok(None) => {
+                                tracing::warn!(
+                                    sender = %agent_id,
+                                    sandbox = %sandbox_id,
+                                    "SandboxStatus for sandbox with no routing entry; dropping"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "find_routing_entry failed; dropping SandboxStatus");
+                                continue;
+                            }
+                        }
+
+                        let state_str = sandbox_state_to_str(status.state());
+                        let error = if status.error_message.is_empty() {
+                            None
+                        } else {
+                            Some(status.error_message.as_str())
+                        };
+                        if let Err(e) = store
+                            .save_sandbox_state(&sandbox_id, agent_id, state_str, error)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "save_sandbox_state failed");
                         }
                     }
 
