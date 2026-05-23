@@ -25,7 +25,7 @@ use open_sandbox_controller::management::management_service;
 use open_sandbox_controller::pg_store::PgStore;
 use open_sandbox_controller::token::TokenValidator;
 
-use open_sandbox_proxy::grpc::sandbox_io_service;
+use open_sandbox_proxy::grpc::{ProxyRole, sandbox_io_service_with_role};
 use open_sandbox_proxy::http_server::HttpServer;
 use open_sandbox_proxy::io_sessions::IoSessions;
 use open_sandbox_proxy::pg_store::PgRoutingStore;
@@ -127,15 +127,36 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
     let router = Arc::new(Router::new(cache.clone(), mux.clone()));
 
     // Optional internal authn token for OpenIoStream (gateway-side).
-    // None disables verification — only safe when the proxy is
-    // network-isolated from public traffic (default deployment).
+    // Layered on top of the network-isolation defense provided by
+    // the separate internal listener.
     let internal_token = std::env::var(open_sandbox_contracts::constants::INTERNAL_TOKEN_ENV).ok();
 
-    let grpc_service =
-        sandbox_io_service(mux, tunnel_pool, sessions, cache.clone(), internal_token);
+    // Two-listener split: agents reach the public port for
+    // OpenTunnel only; the api gateway reaches the internal port
+    // for OpenIoStream only. Setting both to the same value
+    // collapses to a single combined listener (development).
+    let split_listeners = args.grpc_port != args.internal_grpc_port;
+    let (public_role, internal_role) = if split_listeners {
+        (ProxyRole::Public, ProxyRole::Internal)
+    } else {
+        info!(
+            grpc_port = args.grpc_port,
+            "proxy: combined listener (development mode); production should set \
+             --internal-grpc-port to a separate, network-isolated port"
+        );
+        (ProxyRole::Combined, ProxyRole::Combined)
+    };
 
     let grpc_addr = format!("0.0.0.0:{}", args.grpc_port);
     let grpc_listener = TcpListener::bind(&grpc_addr).await?;
+    let public_service = sandbox_io_service_with_role(
+        mux.clone(),
+        tunnel_pool.clone(),
+        sessions.clone(),
+        cache.clone(),
+        internal_token.clone(),
+        public_role,
+    );
 
     let http_addr = format!("0.0.0.0:{}", args.http_port);
     let http_listener = TcpListener::bind(&http_addr).await?;
@@ -153,19 +174,53 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         }
     });
 
-    let grpc_handle = tokio::spawn(async move {
+    let public_grpc_handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(grpc_service)
+            .add_service(public_service)
             .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), shutdown_signal())
             .await
     });
 
+    let internal_grpc_handle = if split_listeners {
+        let internal_addr = format!("0.0.0.0:{}", args.internal_grpc_port);
+        let internal_listener = TcpListener::bind(&internal_addr).await?;
+        let internal_service = sandbox_io_service_with_role(
+            mux,
+            tunnel_pool,
+            sessions,
+            cache.clone(),
+            internal_token,
+            internal_role,
+        );
+        info!(internal_grpc = %internal_addr, "proxy: internal listener ready");
+        Some(tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(internal_service)
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(internal_listener),
+                    shutdown_signal(),
+                )
+                .await
+        }))
+    } else {
+        None
+    };
+
     let http_handle = tokio::spawn(async move { http_server.run(http_listener).await });
 
-    tokio::select! {
-        result = grpc_handle => { result??; }
-        result = http_handle => { result?.map_err(|e| e.to_string())?; }
-        () = shutdown_signal() => {}
+    if let Some(internal_handle) = internal_grpc_handle {
+        tokio::select! {
+            result = public_grpc_handle => { result??; }
+            result = internal_handle => { result??; }
+            result = http_handle => { result?.map_err(|e| e.to_string())?; }
+            () = shutdown_signal() => {}
+        }
+    } else {
+        tokio::select! {
+            result = public_grpc_handle => { result??; }
+            result = http_handle => { result?.map_err(|e| e.to_string())?; }
+            () = shutdown_signal() => {}
+        }
     }
 
     info!("proxy shut down");
