@@ -13,6 +13,31 @@ impl PgRoutingStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Proxy-owned schema migrations.
+    ///
+    /// The `routing_entries` table itself is created by the controller's
+    /// migrate(); the proxy only adds the auxiliary index it needs for
+    /// fast subdomain lookups on cache miss. Comp-2 A3: without this
+    /// index `lookup_by_subdomain` is a sequential scan because
+    /// `replace(sandbox_id::text, '-', '')` is a computed expression and
+    /// can't use the primary-key index.
+    ///
+    /// Idempotent — safe to run on every startup. Tolerates being called
+    /// before the controller has run its own migrate() by retrying inside
+    /// the caller (see crates/cli/src/run.rs proxy startup retry loop).
+    pub async fn migrate(&self) -> Result<(), ProxyError> {
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS routing_entries_subdomain_idx
+             ON routing_entries (replace(sandbox_id::text, '-', '') text_pattern_ops)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ProxyError::Internal {
+            detail: format!("create routing_entries_subdomain_idx: {e}"),
+        })?;
+        Ok(())
+    }
 }
 
 impl RoutingStore for PgRoutingStore {

@@ -102,6 +102,33 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
 pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>> {
     info!("proxy starting");
     let pg_pool = sqlx::PgPool::connect(&args.database_url).await?;
+    // Comp-2 A3: proxy owns the routing_entries_subdomain_idx functional
+    // index; the controller owns the table itself. Retry the index
+    // creation since the proxy can race the controller's migrate().
+    let migration_store = PgRoutingStore::new(pg_pool.clone());
+    for attempt in 1..=PROXY_STARTUP_RETRY_ATTEMPTS {
+        match migration_store.migrate().await {
+            Ok(()) => {
+                info!("proxy migrations applied");
+                break;
+            }
+            Err(e) if attempt < PROXY_STARTUP_RETRY_ATTEMPTS => {
+                warn!(
+                    attempt,
+                    max = PROXY_STARTUP_RETRY_ATTEMPTS,
+                    error = %e,
+                    "proxy migration not ready (controller may not have created routing_entries yet), retrying"
+                );
+                tokio::time::sleep(PROXY_STARTUP_RETRY_INTERVAL).await;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "proxy migration failed after {PROXY_STARTUP_RETRY_ATTEMPTS} attempts: {e}"
+                )
+                .into());
+            }
+        }
+    }
     let routing_store = PgRoutingStore::new(pg_pool);
     let cache = Arc::new(RoutingCache::new(routing_store));
 
@@ -144,6 +171,19 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
     // for OpenIoStream only. Setting both to the same value
     // collapses to a single combined listener (development).
     let split_listeners = args.grpc_port != args.internal_grpc_port;
+    // Comp-2 C3: in Combined mode the network-isolation defense is gone, so
+    // OpenIoStream auth depends entirely on the bearer token. Refuse to bind
+    // if the operator hasn't set INTERNAL_TOKEN_ENV.
+    if !split_listeners && internal_token.is_none() {
+        return Err(format!(
+            "{} must be set when running the proxy in Combined mode \
+             (grpc_port == internal_grpc_port); without it OpenIoStream has \
+             zero authentication and any caller on the listener can execute \
+             commands in any sandbox",
+            open_sandbox_contracts::constants::INTERNAL_TOKEN_ENV
+        )
+        .into());
+    }
     let (public_role, internal_role) = if split_listeners {
         (ProxyRole::Public, ProxyRole::Internal)
     } else {
