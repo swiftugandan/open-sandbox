@@ -7,4 +7,8 @@ config:
   open-sandbox:location: fsn1
   open-sandbox:networkCidr: 10.0.0.0/16
   open-sandbox:subnetRange: 10.0.0.0/24
-  open-sandbox:operatorCidrs: '["0.0.0.0/0"]'
+  # Comp-9: operatorCidrs is now config.require() — set explicitly per stack
+  # to the CIDRs that should be allowed to reach controller SSH. Left
+  # unset so `pulumi up` fails closed; uncomment and set to your operator
+  # IPs.
+  # open-sandbox:operatorCidrs: '["1.2.3.4/32"]'

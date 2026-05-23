@@ -16,10 +16,22 @@ const volumeSizeGb = config.getNumber("volumeSizeGb") ?? 20;
 const location = config.get("location") ?? "fsn1";
 const networkCidr = config.get("networkCidr") ?? "10.0.0.0/16";
 const subnetRange = config.get("subnetRange") ?? "10.0.0.0/24";
-const operatorCidrs: string[] = JSON.parse(config.get("operatorCidrs") ?? '["0.0.0.0/0"]');
+// Comp-9: operatorCidrs MUST be set explicitly. Previously defaulted to
+// "0.0.0.0/0", exposing SSH on the controller to the entire internet on
+// any stack that forgot to override.
+const operatorCidrsRaw = config.require("operatorCidrs");
+const operatorCidrs: string[] = JSON.parse(operatorCidrsRaw);
+if (operatorCidrs.includes("0.0.0.0/0")) {
+    pulumi.log.warn(
+        "operatorCidrs contains 0.0.0.0/0 — controller SSH is open to the entire internet. Set a real CIDR or accept the risk explicitly.",
+    );
+}
 const sshPublicKey = config.require("sshPublicKey");
 const cloudflareZoneId = config.get("cloudflareZoneId") ?? "";
-const joinToken = config.getSecret("joinToken") ?? pulumi.output("changeme");
+// Comp-9: joinToken MUST be set via `pulumi config set --secret joinToken ...`.
+// Previously fell back to the literal string "changeme", which workers
+// were provisioned with whenever the operator forgot to set the secret.
+const joinToken = config.requireSecret("joinToken");
 
 const sshKey = createSshKey({ publicKey: sshPublicKey });
 

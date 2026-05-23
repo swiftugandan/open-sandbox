@@ -240,6 +240,24 @@ comp-1 cross-component CLI reconnect-loop follow-up closed here.
 
 ---
 
+## Component 9 — infra (in-crate findings)
+
+8 findings; 2 closed in `review/09-infra` (the two fail-closed wins that don't need a topology decision), 6 deferred to `NEEDS_HUMAN_ATTENTION.md` (TLS source, Postgres password, env passthrough, backups off-volume, binary download hardening, Cloudflare proxied flag). See the comp-9 entry in `NEEDS_HUMAN_ATTENTION.md`.
+
+### [comp-9 · critical] joinToken default `"changeme"` — **closed**
+
+- **Fix:** `config.requireSecret("joinToken")` — `pulumi up` now fails closed if the secret isn't set.
+
+### [comp-9 · high] operatorCidrs default `0.0.0.0/0` — **closed**
+
+- **Fix:** `config.require("operatorCidrs")` + a warn log when the value contains `0.0.0.0/0`. `Pulumi.dev.yaml` no longer ships the unsafe default — the line is commented out so deploys fail closed.
+
+### [comp-9 · DEFERRED] TLS source, Postgres password, env passthrough, backups, binary download, Cloudflare proxied
+
+- All six need topology / operational decisions. Listed in detail in `NEEDS_HUMAN_ATTENTION.md` under the comp-9 entry.
+
+---
+
 ## Component 8 — cli (in-crate findings)
 
 6 findings; 3 closed in `review/08-cli`, 3 deferred (non-ASCII headers, RUST_LOG silent fallback, secret-in-Debug).

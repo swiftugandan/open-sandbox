@@ -73,7 +73,7 @@ Each row gets ticked as it merges. Update this table as components land.
 | 6 | api | fixes-landed; awaiting merge | `review/06-api` | 3 closed (const-time auth, SANDBOX_NOT_FOUND alias, path boundary); 5 deferred. |
 | 7 | ws-client | fixes-landed; awaiting merge | `review/07-ws-client` | 3 closed (TLS feature, Ctrl-C → SIGINT, exit codes); 3 deferred. |
 | 8 | cli | fixes-landed; awaiting merge | `review/08-cli` | 3 closed (reqwest timeouts, /proc/meminfo memory, SIGTERM fallback); 3 deferred. |
-| 9 | infra | not started | — | |
+| 9 | infra | fixes-landed; awaiting merge | `review/09-infra` | 2 closed (joinToken + operatorCidrs fail-closed); 6 deferred (TLS, DB pw, env passthrough, backups, binary download, Cloudflare proxied). |
 
 ## Out of scope for this pass
 
