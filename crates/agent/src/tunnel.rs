@@ -32,6 +32,7 @@ pub struct ForwardResponse {
 pub struct TunnelForwarder<R: ContainerRuntime, H: HttpClient> {
     sandbox_manager: Arc<SandboxManager<R>>,
     http_client: Arc<H>,
+    registry: Arc<crate::exec_registry::ExecRegistry>,
 }
 
 impl<R: ContainerRuntime, H: HttpClient> TunnelForwarder<R, H> {
@@ -39,7 +40,16 @@ impl<R: ContainerRuntime, H: HttpClient> TunnelForwarder<R, H> {
         Self {
             sandbox_manager,
             http_client,
+            registry: Arc::new(crate::exec_registry::ExecRegistry::new()),
         }
+    }
+
+    pub fn sandbox_manager(&self) -> &Arc<SandboxManager<R>> {
+        &self.sandbox_manager
+    }
+
+    pub fn registry(&self) -> &Arc<crate::exec_registry::ExecRegistry> {
+        &self.registry
     }
 
     pub async fn forward(

@@ -1,3 +1,7 @@
+//! Lifecycle-only service trait. Exec and streaming I/O go through
+//! `ProxyClient::open_io_stream`; file ops are unary HTTP handlers
+//! that internally open OpenIoStream with the appropriate op variant.
+
 use open_sandbox_contracts::error::ApiError;
 use open_sandbox_contracts::types::SandboxId;
 
@@ -10,6 +14,7 @@ pub struct SandboxInfo {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRequest {
     pub image: String,
     #[serde(default = "default_cpu")]
@@ -31,39 +36,46 @@ fn default_memory() -> u64 {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct ExecOutput {
-    pub exit_code: i32,
-    #[serde(with = "bytes_as_string")]
-    pub stdout: Vec<u8>,
-    #[serde(with = "bytes_as_string")]
-    pub stderr: Vec<u8>,
-}
-
-mod bytes_as_string {
-    use serde::Serializer;
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&String::from_utf8_lossy(bytes))
-    }
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ExecRequest {
-    pub command: Vec<String>,
-}
-
-pub struct WriteFilesRequest {
-    pub content: Vec<u8>,
-    pub cwd: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
 pub struct WriteFilesResult {
     pub success: bool,
 }
 
+/// Single-file write JSON body. Exactly one of `content` / `content_b64`
+/// MUST be set.
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct ReadFileRequest {
+#[serde(deny_unknown_fields)]
+pub struct WriteFileRequest {
+    pub path: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub content_b64: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+impl WriteFileRequest {
+    pub fn content_bytes(&self) -> Result<Vec<u8>, ApiError> {
+        match (&self.content, &self.content_b64) {
+            (Some(_), Some(_)) | (None, None) => Err(ApiError::InvalidRequest {
+                detail: "exactly one of content or content_b64 must be set".into(),
+            }),
+            (Some(s), None) => Ok(s.clone().into_bytes()),
+            (None, Some(b)) => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(b)
+                    .map_err(|e| ApiError::InvalidRequest {
+                        detail: format!("content_b64 is not valid base64: {e}"),
+                    })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadFileQuery {
     pub path: String,
     #[serde(default)]
     pub cwd: Option<String>,
@@ -80,23 +92,7 @@ pub trait SandboxService: Send + Sync + 'static {
         sandbox_id: &SandboxId,
     ) -> impl Future<Output = Result<SandboxInfo, ApiError>> + Send;
 
+    fn list(&self) -> impl Future<Output = Result<Vec<SandboxInfo>, ApiError>> + Send;
+
     fn delete(&self, sandbox_id: &SandboxId) -> impl Future<Output = Result<(), ApiError>> + Send;
-
-    fn exec(
-        &self,
-        sandbox_id: &SandboxId,
-        request: ExecRequest,
-    ) -> impl Future<Output = Result<ExecOutput, ApiError>> + Send;
-
-    fn write_files(
-        &self,
-        sandbox_id: &SandboxId,
-        request: WriteFilesRequest,
-    ) -> impl Future<Output = Result<WriteFilesResult, ApiError>> + Send;
-
-    fn read_file(
-        &self,
-        sandbox_id: &SandboxId,
-        request: ReadFileRequest,
-    ) -> impl Future<Output = Result<Vec<u8>, ApiError>> + Send;
 }

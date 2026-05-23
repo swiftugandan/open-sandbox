@@ -3,13 +3,13 @@ use std::time::Duration;
 
 use tokio_stream::wrappers::TcpListenerStream;
 
-use open_sandbox_agent_docker::DockerRuntime;
 use open_sandbox::http_client::ReqwestHttpClient;
 use open_sandbox_agent::container::ContainerRuntime;
 use open_sandbox_agent::controller_client::ControllerConnection;
 use open_sandbox_agent::proxy_client::ProxyConnection;
 use open_sandbox_agent::sandbox::SandboxManager;
 use open_sandbox_agent::tunnel::TunnelForwarder;
+use open_sandbox_agent_docker::DockerRuntime;
 use open_sandbox_contracts::controller::{AgentResources, SandboxState};
 use open_sandbox_contracts::types::{AgentId, JoinToken, SandboxId};
 use open_sandbox_controller::grpc::{Controller, CreateSandboxRequest};
@@ -129,10 +129,7 @@ async fn controller_triggers_sandbox_creation_on_real_agent() {
         .await
         .unwrap();
     assert_eq!(exec_output.exit_code, 0);
-    assert_eq!(
-        String::from_utf8_lossy(&exec_output.stdout).trim(),
-        "ready"
-    );
+    assert_eq!(String::from_utf8_lossy(&exec_output.stdout).trim(), "ready");
 
     // Cleanup
     let _ = runtime

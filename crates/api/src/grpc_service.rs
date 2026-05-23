@@ -1,16 +1,19 @@
+//! gRPC client adapter — lifecycle calls to the controller.
+//!
+//! v1.0 removed exec from this path. Streaming I/O (exec, file
+//! read, file write, file write_files) goes through the proxy via
+//! `ProxyClient::open_io_stream`.
+
 use open_sandbox_contracts::api::sandbox_management_service_client::SandboxManagementServiceClient;
 use open_sandbox_contracts::api::{
     CreateSandboxRequest as ProtoCreate, DeleteSandboxRequest as ProtoDelete,
-    ExecSandboxRequest as ProtoExec, GetSandboxRequest as ProtoGet,
+    GetSandboxRequest as ProtoGet, ListSandboxesRequest as ProtoList,
 };
 use open_sandbox_contracts::error::ApiError;
 use open_sandbox_contracts::types::SandboxId;
 use tonic::transport::Channel;
 
-use crate::service::{
-    CreateRequest, ExecOutput, ExecRequest, ReadFileRequest, SandboxInfo, SandboxService,
-    WriteFilesRequest, WriteFilesResult,
-};
+use crate::service::{CreateRequest, SandboxInfo, SandboxService};
 
 pub struct GrpcSandboxService {
     client: SandboxManagementServiceClient<Channel>,
@@ -78,6 +81,25 @@ impl SandboxService for GrpcSandboxService {
         })
     }
 
+    async fn list(&self) -> Result<Vec<SandboxInfo>, ApiError> {
+        let mut client = self.client.clone();
+        let resp = client
+            .list_sandboxes(ProtoList {})
+            .await
+            .map_err(grpc_to_api)?
+            .into_inner();
+        let mut out = Vec::with_capacity(resp.sandboxes.len());
+        for item in resp.sandboxes {
+            out.push(SandboxInfo {
+                sandbox_id: parse_sandbox_id(&item.sandbox_id)?,
+                subdomain: item.subdomain,
+                agent_id: item.agent_id,
+                status: item.status,
+            });
+        }
+        Ok(out)
+    }
+
     async fn delete(&self, sandbox_id: &SandboxId) -> Result<(), ApiError> {
         let mut client = self.client.clone();
         client
@@ -88,102 +110,6 @@ impl SandboxService for GrpcSandboxService {
             .map_err(grpc_to_api)?;
         Ok(())
     }
-
-    async fn exec(
-        &self,
-        sandbox_id: &SandboxId,
-        request: ExecRequest,
-    ) -> Result<ExecOutput, ApiError> {
-        let mut client = self.client.clone();
-        let resp = client
-            .exec_sandbox(ProtoExec {
-                sandbox_id: sandbox_id.to_string(),
-                command: request.command,
-                stdin: vec![],
-            })
-            .await
-            .map_err(grpc_to_api)?
-            .into_inner();
-
-        Ok(ExecOutput {
-            exit_code: resp.exit_code,
-            stdout: resp.stdout,
-            stderr: resp.stderr,
-        })
-    }
-
-    async fn write_files(
-        &self,
-        sandbox_id: &SandboxId,
-        request: WriteFilesRequest,
-    ) -> Result<WriteFilesResult, ApiError> {
-        let cwd = request
-            .cwd
-            .as_deref()
-            .unwrap_or(open_sandbox_contracts::constants::DEFAULT_WRITE_CWD);
-        let exec_req = ExecRequest {
-            command: vec![
-                "sh".into(),
-                "-c".into(),
-                "mkdir -p \"$1\" && tar xzf - -C \"$1\"".into(),
-                "--".into(),
-                cwd.into(),
-            ],
-        };
-        let mut client = self.client.clone();
-        let resp = client
-            .exec_sandbox(ProtoExec {
-                sandbox_id: sandbox_id.to_string(),
-                command: exec_req.command,
-                stdin: request.content,
-            })
-            .await
-            .map_err(grpc_to_api)?
-            .into_inner();
-
-        if resp.exit_code != 0 {
-            return Err(ApiError::ExecFailed {
-                detail: String::from_utf8_lossy(&resp.stderr).into_owned(),
-            });
-        }
-        Ok(WriteFilesResult { success: true })
-    }
-
-    async fn read_file(
-        &self,
-        sandbox_id: &SandboxId,
-        request: ReadFileRequest,
-    ) -> Result<Vec<u8>, ApiError> {
-        let path = match &request.cwd {
-            Some(cwd) => format!(
-                "{}/{}",
-                cwd.trim_end_matches('/'),
-                request.path.trim_start_matches('/')
-            ),
-            None => request.path.clone(),
-        };
-        let mut client = self.client.clone();
-        let resp = client
-            .exec_sandbox(ProtoExec {
-                sandbox_id: sandbox_id.to_string(),
-                command: vec!["cat".into(), "--".into(), path.clone()],
-                stdin: vec![],
-            })
-            .await
-            .map_err(grpc_to_api)?
-            .into_inner();
-
-        if resp.exit_code != 0 {
-            let stderr = String::from_utf8_lossy(&resp.stderr);
-            if stderr.contains("No such file") {
-                return Err(ApiError::FileNotFound { path });
-            }
-            return Err(ApiError::ExecFailed {
-                detail: stderr.into_owned(),
-            });
-        }
-        Ok(resp.stdout)
-    }
 }
 
 fn grpc_to_api(status: tonic::Status) -> ApiError {
@@ -192,9 +118,6 @@ fn grpc_to_api(status: tonic::Status) -> ApiError {
             sandbox_id: status.message().to_string(),
         },
         tonic::Code::Unavailable => ApiError::ControllerUnavailable {
-            detail: status.message().to_string(),
-        },
-        tonic::Code::DeadlineExceeded => ApiError::ExecFailed {
             detail: status.message().to_string(),
         },
         _ => ApiError::Internal {

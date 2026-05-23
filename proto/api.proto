@@ -1,11 +1,15 @@
 syntax = "proto3";
 package open_sandbox.api;
 
+// SandboxManagementService — lifecycle-only RPCs from the API
+// gateway to the controller. Exec was removed in v1.0; streaming
+// I/O (exec, file read) flows through the proxy via
+// SandboxIoService.OpenIoStream — see proxy.proto.
 service SandboxManagementService {
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
   rpc GetSandbox(GetSandboxRequest) returns (GetSandboxResponse);
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
-  rpc ExecSandbox(ExecSandboxRequest) returns (ExecSandboxResponse);
 }
 
 message CreateSandboxRequest {
@@ -42,14 +46,9 @@ message DeleteSandboxResponse {
   bool deleted = 1;
 }
 
-message ExecSandboxRequest {
-  string sandbox_id = 1;
-  repeated string command = 2;
-  bytes stdin = 3;
+message ListSandboxesRequest {
 }
 
-message ExecSandboxResponse {
-  int32 exit_code = 1;
-  bytes stdout = 2;
-  bytes stderr = 3;
+message ListSandboxesResponse {
+  repeated GetSandboxResponse sandboxes = 1;
 }

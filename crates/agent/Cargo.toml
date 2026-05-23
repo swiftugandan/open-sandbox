@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 open-sandbox-contracts = { path = "../contracts" }
+bytes = "1"
 prost-types = "0.13"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tokio-stream = "0.1"
@@ -13,7 +14,6 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-open-sandbox-controller = { path = "../controller" }
 prost-types = "0.13"
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "uuid"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "test-util"] }
+tokio-stream = "0.1"

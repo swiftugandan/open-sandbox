@@ -6,23 +6,21 @@ description = "REST API gateway for the Open Sandbox platform"
 
 [dependencies]
 open-sandbox-contracts = { path = "../contracts" }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+bytes = "1"
+futures-util = "0.3"
 hyper = { version = "1", features = ["full"] }
+prost = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 tonic = "0.12"
 tower = "0.5"
+tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-open-sandbox-controller = { path = "../controller", features = ["testutil"] }
-open-sandbox-agent = { path = "../agent" }
-open-sandbox-agent-docker = { path = "../agent-docker" }
-open-sandbox = { path = "../cli" }
-reqwest = { version = "0.12", features = ["json"] }
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
-tokio-stream = "0.1"
 prost-types = "0.13"
-flate2 = "1"
-tar = "0.4"
+tokio-tungstenite = "0.24"

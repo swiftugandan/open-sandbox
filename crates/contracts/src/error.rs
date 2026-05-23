@@ -53,11 +53,30 @@ pub enum ApiError {
     #[error("controller unavailable: {detail}")]
     ControllerUnavailable { detail: String },
 
-    #[error("exec failed: {detail}")]
-    ExecFailed { detail: String },
+    #[error("proxy unavailable: {detail}")]
+    ProxyUnavailable { detail: String },
 
-    #[error("file not found: {path}")]
-    FileNotFound { path: String },
+    #[error("invalid request: {detail}")]
+    InvalidRequest { detail: String },
+
+    #[error("invalid upload: {detail}")]
+    InvalidUpload { detail: String },
+
+    // v1.0: streaming I/O. ExecFailed and CommandNotFound were
+    // synchronous-exec error variants in v0.x; they have been
+    // replaced by IoExited / IoError frames on the WebSocket
+    // stream itself. ApiError now models only failures that
+    // occur BEFORE the I/O stream is established (upgrade, auth,
+    // sandbox lookup) or runtime-level errors observed by the
+    // gateway between WS upgrade and stream open.
+    #[error("I/O stream failed: {detail}")]
+    IoStreamFailed { detail: String },
+
+    #[error("sandbox {sandbox_id} no longer exists (was deleted or its agent disconnected)")]
+    SandboxGone { sandbox_id: String },
+
+    #[error("file not found: {resolved_path}")]
+    FileNotFound { resolved_path: String },
 
     #[error("internal error: {detail}")]
     Internal { detail: String },
@@ -70,7 +89,11 @@ impl ApiError {
             ApiError::Unauthorized { .. } => "UNAUTHORIZED",
             ApiError::SandboxNotFound { .. } => "SANDBOX_NOT_FOUND",
             ApiError::ControllerUnavailable { .. } => "CONTROLLER_UNAVAILABLE",
-            ApiError::ExecFailed { .. } => "EXEC_FAILED",
+            ApiError::ProxyUnavailable { .. } => "PROXY_UNAVAILABLE",
+            ApiError::InvalidRequest { .. } => "INVALID_REQUEST",
+            ApiError::InvalidUpload { .. } => "INVALID_UPLOAD",
+            ApiError::IoStreamFailed { .. } => "IO_STREAM_FAILED",
+            ApiError::SandboxGone { .. } => "SANDBOX_GONE",
             ApiError::FileNotFound { .. } => "FILE_NOT_FOUND",
             ApiError::Internal { .. } => "INTERNAL_ERROR",
             _ => "UNKNOWN",

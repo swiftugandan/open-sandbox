@@ -3,6 +3,12 @@ package open_sandbox.controller;
 
 import "google/protobuf/timestamp.proto";
 
+// ControllerService — the long-lived bidi stream between each agent
+// and the controller. Carries lifecycle-only traffic in v1.0:
+// registration, heartbeats, sandbox start/stop, status reports,
+// log fetches. Exec is no longer routed through this stream —
+// gateway-originated exec flows through the proxy data plane (see
+// proxy.proto SandboxIoService).
 service ControllerService {
   rpc AgentStream(stream AgentMessage) returns (stream ControllerCommand);
 }
@@ -13,7 +19,8 @@ message AgentMessage {
     Heartbeat heartbeat = 2;
     SandboxStatus sandbox_status = 3;
     ResourceReport resource_report = 4;
-    ExecResult exec_result = 5;
+    // Field 5 was ExecResult in v0.x; removed in v1.0. Exec
+    // results flow on the data-plane I/O stream now.
   }
 }
 
@@ -23,8 +30,8 @@ message ControllerCommand {
     HeartbeatAck heartbeat_ack = 2;
     StartSandbox start_sandbox = 3;
     StopSandbox stop_sandbox = 4;
-    ExecCommand exec = 5;
-    FetchLogsCommand fetch_logs = 6;
+    // Field 5 was ExecCommand in v0.x; removed in v1.0.
+    FetchLogsCommand fetch_logs = 5;
   }
 }
 
@@ -102,24 +109,8 @@ message StopSandbox {
   uint32 timeout_seconds = 2;
 }
 
-message ExecCommand {
-  string sandbox_id = 1;
-  repeated string command = 2;
-  string exec_id = 3;
-  bytes stdin = 4;
-}
-
 message FetchLogsCommand {
   string sandbox_id = 1;
   uint32 tail_lines = 2;
   bool follow = 3;
-}
-
-message ExecResult {
-  string sandbox_id = 1;
-  string exec_id = 2;
-  int32 exit_code = 3;
-  bytes stdout = 4;
-  bytes stderr = 5;
-  string error = 6;
 }

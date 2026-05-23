@@ -27,7 +27,22 @@ pub const METRICS_DEFAULT_PORT: u16 = 9090;
 
 pub const API_DEFAULT_PORT: u16 = 8081;
 
-pub const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+// EXEC_TIMEOUT removed in v1.0 — streaming exec sessions live as
+// long as the WebSocket. Idle WebSocket keepalive uses
+// WS_IDLE_PING_INTERVAL / WS_IDLE_PING_TIMEOUT instead.
+pub const WS_IDLE_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+pub const WS_IDLE_PING_TIMEOUT: Duration = Duration::from_secs(60);
+
+// Default grace period between SIGTERM and SIGKILL when the
+// ExecRegistry cleanup hook fires on stream close. Generous because
+// the in-container process may be a shell with cleanup logic.
+pub const EXEC_KILL_GRACE: Duration = Duration::from_secs(5);
+
+// Env var holding the shared secret the API gateway uses to
+// authenticate to the proxy's internal OpenIoStream listener.
+// Defense in depth alongside network isolation (per D2 / SAD).
+pub const INTERNAL_TOKEN_ENV: &str = "OPEN_SANDBOX_INTERNAL_TOKEN";
 
 pub const PROXY_STARTUP_RETRY_ATTEMPTS: u32 = 15;
 

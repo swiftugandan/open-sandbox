@@ -160,14 +160,15 @@ Reverse tunnel setup:
 
 ### Proxy
 
-**Responsibility.** The proxy is the data plane: it terminates public TLS, routes HTTP requests to the correct agent via reverse tunnels, and manages the tunnel connection pool.
+**Responsibility.** The proxy is the data plane for ALL sandbox I/O: it terminates public TLS, routes inbound public HTTP to the correct agent, and (new in v1.0) accepts gateway-originated streaming I/O sessions (`OpenIoStream`) and bridges them into the same agent tunnel. Two listeners, one tunnel multiplex.
 
 **Internal structure.**
-- `tls_acceptor` — TLS termination with wildcard cert, `rustls` based
-- `router` — extracts sandbox ID from Host header, looks up in routing cache
+- `tls_acceptor` — TLS termination with wildcard cert, `rustls` based (public HTTP path)
+- `router` — extracts sandbox ID from Host header (public HTTP) or from the first `IoStart` frame (I/O streams), looks up in routing cache
 - `routing_cache` — in-memory HashMap fed by Postgres LISTEN/NOTIFY
 - `tunnel_pool` — manages reverse-tunnel gRPC connections from agents, indexed by agent ID
-- `stream_mux` — multiplexes virtual streams over agent tunnels for concurrent requests
+- `stream_mux` — multiplexes virtual streams (both HTTP and I/O) over agent tunnels for concurrent requests
+- `io_session_router` (new v1.0) — accepts `OpenIoStream` calls from the gateway on the internal listener, validates the shared-secret token, looks up the sandbox's agent, allocates a `stream_id`, and bridges the gateway's frames as `io_client` / `io_server` payloads on the agent's tunnel
 - `metrics` — Prometheus endpoint
 
 **State.**
@@ -188,10 +189,12 @@ Reverse tunnel setup:
 **Contracts consumed.**
 - `RoutingEntry` (from Postgres, written by controller): sandbox_id → agent_id
 - `TunnelStream` (from agents): the reverse-tunnel gRPC bidi stream
+- `IoClientFrame` (from gateway via `OpenIoStream`): streaming I/O session frames
 
 **Contracts produced.**
-- `TunnelRequest` (to agents via tunnel): encapsulated HTTP request for a sandbox
-- HTTP responses (to end users): proxied sandbox responses or error pages (502, 504)
+- `TunnelRequest` (to agents via tunnel): `HttpRequest` or `IoClientFrame` payload
+- HTTP responses (to public clients): proxied sandbox responses or error pages (502, 504)
+- `IoServerFrame` (to gateway): streaming I/O session responses
 
 ---
 
@@ -217,12 +220,14 @@ Reverse tunnel setup:
 - Controller connection lost: agent enters reconnection backoff. Existing sandboxes continue running. New commands cannot be received. Heartbeats stop — controller will eventually mark agent dead if reconnection takes too long.
 - Proxy tunnel lost: agent enters reconnection backoff. Sandbox traffic is unavailable until tunnel is re-established. Sandboxes themselves are unaffected.
 - Container runtime error: individual sandbox operations may fail (e.g., image pull failure, CNI plugin error, libcontainer syscall failure). Agent reports errors per-sandbox rather than globally. No daemon to fail — runtime errors are per-operation.
+- Exec command-not-found: when the underlying OCI runtime (runc/crun/youki) cannot resolve the executable, the agent's exec wrapper detects the runtime-specific diagnostic pattern (e.g. `"executable file not found in $PATH"`, OCI runtime error code `OCI_ERR_NOT_FOUND`), sets `ExecResult.command_not_found = true`, places the diagnostic in `stderr` (not `stdout`), and returns `exit_code: 127`. This is distinct from a process that ran and exited 127 of its own accord (`command_not_found` is false in that case).
+- File-not-found on read: the agent resolves the requested path against the supplied `cwd` (or `/home` default), then reads it. If the path does not exist, the returned `AgentError::Runtime` includes the **resolved absolute path** in its detail; the API maps this to `ApiError::FileNotFound { resolved_path }` → HTTP 404. Callers do not need a second round-trip to learn what path the agent actually looked at.
 - Agent crash: OCI containers continue running (kernel manages namespaces/cgroups). On restart, agent reconnects and reconciles its sandbox list with libcontainer's state directory.
 - Agent graceful shutdown: on receiving SIGTERM or SIGINT, the agent stops and removes all managed containers before exiting. The `shutdown_signal()` function handles both signals, ensuring cleanup in both interactive (Ctrl+C) and Docker/systemd (SIGTERM) environments. This prevents orphaned containers from accumulating across agent restarts.
 
 **Observability surface.**
 - Prometheus metrics: `agent_sandboxes_running`, `agent_tunnel_active`, `agent_controller_connected` (gauge), `agent_forwarded_requests_total`, `agent_runtime_errors_total` (by type: `lifecycle`, `exec`, `image_pull`, `cni`)
-- Structured JSON logs: sandbox lifecycle events, connection state changes, Docker operations. Key tracing events: controller connection/registration, sandbox start/stop commands received and status reported, exec command received, image pull start/complete, container started
+- Structured JSON logs: sandbox lifecycle events, connection state changes, Docker operations. Key tracing events: controller connection/registration, sandbox start/stop commands received and status reported, exec command received, image pull start/complete, container started. Exec log lines carry the full command vector (`cmd.argv` field, joined for readability), `cwd` (resolved), `stdin_len`, `sandbox_id`, and `exec_id` — sufficient to identify which command failed from a single log line without correlating events.
 
 **Contracts consumed.**
 - `ControllerCommand` (from controller): StartSandbox, StopSandbox, Exec, FetchLogs
@@ -279,18 +284,30 @@ Reverse tunnel setup:
 **Responsibility.** The API gateway is the external control plane: it accepts REST requests from AI agents and operators, authenticates them, and translates them into gRPC calls to the controller. It never touches the data plane (sandbox HTTP traffic) — that remains the proxy's domain.
 
 **Internal structure.**
-- `http_server` — axum-based HTTP server handling REST endpoints
-- `auth` — extracts and validates API key from `Authorization: Bearer <key>` header
-- `controller_client` — tonic gRPC client for unary RPCs to the controller's `SandboxManagementService`
-- `handlers` — per-endpoint logic: create sandbox, get status, delete sandbox, exec command, write files, read files
+- `http_server` — axum-based HTTP+WebSocket server handling REST lifecycle endpoints AND streaming I/O endpoints
+- `auth` — extracts and validates API key from `Authorization: Bearer <key>` header (validated on REST request OR on WebSocket upgrade before the socket is established)
+- `controller_client` — tonic gRPC client for unary RPCs to the controller's `SandboxManagementService` (lifecycle)
+- `proxy_client` (new v1.0) — held-open gRPC client pool (default 4 channels) to the proxy's `SandboxIoService.OpenIoStream` for streaming I/O sessions
+- `ws_exec` / `ws_read_file` (new v1.0) — WebSocket handlers that translate frames between the public WebSocket and the proxy-side gRPC stream
+- `frame` (new v1.0) — frame codec: WebSocket binary message ↔ `IoClientFrame` / `IoServerFrame`, with a `| 1 byte kind | payload |` envelope
+- `handlers` — per-REST-endpoint logic: create sandbox, get/list sandboxes, delete sandbox, write_file, write_files, read (unary GET for small files)
 
-**Endpoints.**
+**Endpoints (v1.0).**
+
+*REST (unary, lifecycle + small file ops):*
 - `POST /v1/sandboxes` — create a sandbox (image, cpu, memory, env, exposed_port) → returns sandbox_id + subdomain URL
+- `GET /v1/sandboxes` — list all sandboxes; returns array of `{sandbox_id, subdomain, agent_id, status}`
 - `GET /v1/sandboxes/:id` — get sandbox status + metadata
 - `DELETE /v1/sandboxes/:id` — stop and remove a sandbox
-- `POST /v1/sandboxes/:id/exec` — execute a command, returns stdout/stderr/exit_code
-- `POST /v1/sandboxes/:id/files/write` — upload tar.gz, extracted into sandbox filesystem
-- `POST /v1/sandboxes/:id/files/read` — read a file, returns octet-stream
+- `POST /v1/sandboxes/:id/files/write_files` — upload tar.gz, extracted into sandbox filesystem. Empty or malformed body returns HTTP 400 `INVALID_UPLOAD`.
+- `POST /v1/sandboxes/:id/files/write_file` — JSON single-file write. Body: `{path, content?: string, content_b64?: string, cwd?: string}` (exactly one of `content`/`content_b64`). Atomic temp+rename inside the target directory.
+- `GET /v1/sandboxes/:id/files/read?path=...&cwd=...` — read a file (unary GET, suitable for small files). 404 includes the resolved absolute path in the error message.
+
+*WebSocket (streaming, bidirectional):*
+- `WS /v1/sandboxes/:id/exec` — streaming exec session. First client message is a binary frame `kind=0x00 start` carrying a proto-encoded `IoStart` with `ExecParams`. Subsequent client frames: stdin (0x01), signal (0x02), stdin_eof (0x03). Server frames: started (0x15), stdout (0x11), stderr (0x12), exited (0x13), error (0x14). Session lifetime = WebSocket lifetime; closing the socket triggers SIGTERM + grace + SIGKILL on the in-container PID.
+- `WS /v1/sandboxes/:id/files/read?path=...&cwd=...` — streaming file read for large files. Same frame envelope; server emits stdout frames until file is fully read, then `IoExited`.
+
+Authentication is `Authorization: Bearer <api_key>` on both REST requests and the WebSocket Upgrade request. Failed auth returns HTTP 401 (REST) or rejects the upgrade with HTTP 401 (WebSocket) before the socket is established. Idle WebSocket sessions are kept alive by gateway-initiated ping every `WS_IDLE_PING_INTERVAL` (30s); peer-gone after `WS_IDLE_PING_TIMEOUT` (60s) triggers cleanup.
 
 **State.**
 - Persistent: none. The API gateway is stateless — all state lives in Postgres via the controller.
@@ -306,10 +323,11 @@ Reverse tunnel setup:
 - Structured JSON logs: request log (method, path, status, duration), auth events
 
 **Contracts consumed.**
-- `SandboxManagementService` gRPC (from controller): unary RPCs for sandbox lifecycle and command execution
+- `SandboxManagementService` gRPC (from controller): unary RPCs for sandbox lifecycle
+- `SandboxIoService.OpenIoStream` gRPC (from proxy, v1.0): bidirectional streaming I/O sessions. Authenticated via shared-secret token in gRPC metadata; default deployment uses a separate internal-only listener on the proxy.
 
 **Contracts produced.**
-- REST API responses (to clients): JSON for sandbox metadata, exec output; octet-stream for file reads; standard HTTP error codes. All error responses — including framework-level rejections (malformed JSON, missing fields) — use a consistent `{"error": "...", "error_code": "..."}` envelope. Request payloads are validated at the API boundary before forwarding to downstream services. Read-file on a non-existent path returns HTTP 404 with `FILE_NOT_FOUND` error code, detected by inspecting `cat` stderr for "No such file" pattern.
+- REST API responses (to clients): JSON for sandbox metadata, exec output (base64-encoded stdout/stderr per RFC 4648), octet-stream for file reads, standard HTTP error codes. All error responses — including framework-level rejections (malformed JSON, missing fields, unknown fields) — use a consistent `{"error": "...", "error_code": "..."}` envelope. Request payloads are validated at the API boundary before forwarding to downstream services (empty command, conflicting `content`/`content_b64`, unknown fields, empty/malformed tar.gz upload all rejected at the boundary). Read-file on a non-existent path returns HTTP 404 with `FILE_NOT_FOUND` error code AND the resolved absolute path in the error message. Command-not-found is detected on the agent side (runtime error pattern) and surfaced as HTTP 200 with `error_code: COMMAND_NOT_FOUND` in the response envelope alongside `exit_code: 127` — the response itself is well-formed because the exec request was well-formed; the error code disambiguates the runtime miss.
 
 ---
 

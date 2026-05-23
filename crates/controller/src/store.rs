@@ -61,6 +61,9 @@ pub trait ControllerStore: Send + Sync {
         &self,
         sandbox_id: &SandboxId,
     ) -> impl Future<Output = Result<Option<RoutingEntry>, ControllerError>> + Send;
+    fn list_routing_entries(
+        &self,
+    ) -> impl Future<Output = Result<Vec<RoutingEntry>, ControllerError>> + Send;
     fn remove_routing_entry(
         &self,
         sandbox_id: &SandboxId,

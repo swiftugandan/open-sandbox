@@ -1,22 +1,31 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use open_sandbox_contracts::error::AgentError;
-use open_sandbox_contracts::proxy::tunnel_request;
-use open_sandbox_contracts::proxy::tunnel_response;
-use open_sandbox_contracts::proxy::tunnel_service_client::TunnelServiceClient;
-use open_sandbox_contracts::proxy::{HttpResponse, TunnelReady, TunnelResponse};
-use open_sandbox_contracts::types::AgentId;
+use open_sandbox_contracts::proxy::sandbox_io_service_client::SandboxIoServiceClient;
+use open_sandbox_contracts::proxy::{
+    HttpResponse, IoClientFrame, IoServerFrame, TunnelReady, TunnelResponse, io_client_frame,
+    tunnel_request, tunnel_response,
+};
+use open_sandbox_contracts::types::{AgentId, SandboxId};
 
 use crate::container::ContainerRuntime;
+use crate::io_stream::drive_io_session;
 use crate::tunnel::{ForwardRequest, HttpClient, TunnelForwarder};
 
 pub struct ProxyConnection<R: ContainerRuntime, H: HttpClient> {
     agent_id: AgentId,
     forwarder: Arc<TunnelForwarder<R, H>>,
 }
+
+/// Live IoStream sessions keyed by proxy-assigned stream_id. Holds
+/// the sender side of the per-session client-frames channel that
+/// drive_io_session reads from.
+type IoSessions = Arc<Mutex<HashMap<String, mpsc::Sender<IoClientFrame>>>>;
 
 impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, H> {
     pub fn new(agent_id: AgentId, forwarder: Arc<TunnelForwarder<R, H>>) -> Self {
@@ -35,7 +44,7 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
             .await
             .map_err(|_| AgentError::TunnelDisconnected)?;
 
-        let mut client = TunnelServiceClient::new(channel);
+        let mut client = SandboxIoServiceClient::new(channel);
 
         let (outbound_tx, outbound_rx) = mpsc::channel(32);
         let outbound_stream = ReceiverStream::new(outbound_rx);
@@ -57,7 +66,9 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
             .await
             .map_err(|_| AgentError::TunnelDisconnected)?;
 
+        let io_sessions: IoSessions = Arc::new(Mutex::new(HashMap::new()));
         let forwarder = self.forwarder.clone();
+
         while let Ok(Some(req)) = inbound.message().await {
             let stream_id = req.stream_id.clone();
             let Some(payload) = req.payload else {
@@ -103,9 +114,132 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
                     let _ = outbound_tx.send(resp).await;
                 }
                 tunnel_request::Payload::Data(_) | tunnel_request::Payload::Close(_) => {}
+                tunnel_request::Payload::IoClient(io_frame) => {
+                    handle_io_client_frame(&forwarder, &io_sessions, &outbound_tx, io_frame).await;
+                }
             }
         }
 
         Err(AgentError::TunnelDisconnected)
+    }
+}
+
+async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + 'static>(
+    forwarder: &Arc<TunnelForwarder<R, H>>,
+    io_sessions: &IoSessions,
+    outbound_tx: &mpsc::Sender<TunnelResponse>,
+    io_frame: IoClientFrame,
+) {
+    let stream_id = io_frame.stream_id.clone();
+
+    // If this is the first frame (Start), spawn the per-session
+    // drive_io_session task. Otherwise route to the existing session.
+    let is_start = matches!(io_frame.payload, Some(io_client_frame::Payload::Start(_)));
+
+    if is_start {
+        let start_inner = match &io_frame.payload {
+            Some(io_client_frame::Payload::Start(s)) => s,
+            _ => unreachable!(),
+        };
+
+        let sandbox_id = match uuid::Uuid::parse_str(&start_inner.sandbox_id).map(SandboxId::from) {
+            Ok(id) => id,
+            Err(_) => {
+                let _ = outbound_tx
+                    .send(io_error_response(
+                        &stream_id,
+                        "INVALID_REQUEST",
+                        "invalid sandbox_id",
+                    ))
+                    .await;
+                return;
+            }
+        };
+
+        let container_id = match forwarder.sandbox_manager().container_id_for(&sandbox_id) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = outbound_tx
+                    .send(io_error_response(
+                        &stream_id,
+                        "SANDBOX_NOT_FOUND",
+                        &e.to_string(),
+                    ))
+                    .await;
+                return;
+            }
+        };
+
+        let (in_tx, in_rx) = mpsc::channel::<IoClientFrame>(32);
+        let (server_tx, mut server_rx) = mpsc::channel::<IoServerFrame>(32);
+
+        io_sessions
+            .lock()
+            .unwrap()
+            .insert(stream_id.clone(), in_tx.clone());
+
+        // Forward the initial Start frame.
+        let _ = in_tx.send(io_frame).await;
+
+        // Spawn the driver.
+        let runtime = forwarder.sandbox_manager().runtime().clone();
+        let registry = forwarder.registry().clone();
+        let client_stream = ReceiverStream::new(in_rx).map(Ok::<_, AgentError>);
+        let stream_id_for_drive = stream_id.clone();
+        tokio::spawn(drive_io_session(
+            runtime,
+            registry,
+            stream_id_for_drive,
+            sandbox_id,
+            container_id,
+            client_stream,
+            server_tx,
+        ));
+
+        // Spawn the outbound wrapper: server_rx → TunnelResponse::IoServer.
+        let outbound = outbound_tx.clone();
+        let sessions = io_sessions.clone();
+        let stream_id_for_pump = stream_id.clone();
+        tokio::spawn(async move {
+            while let Some(server_frame) = server_rx.recv().await {
+                let resp = TunnelResponse {
+                    stream_id: stream_id_for_pump.clone(),
+                    payload: Some(tunnel_response::Payload::IoServer(server_frame)),
+                };
+                if outbound.send(resp).await.is_err() {
+                    break;
+                }
+            }
+            // Session ended — remove from registry.
+            sessions.lock().unwrap().remove(&stream_id_for_pump);
+        });
+    } else {
+        // Subsequent frame: route to existing session.
+        let tx = io_sessions.lock().unwrap().get(&stream_id).cloned();
+        match tx {
+            Some(t) => {
+                let _ = t.send(io_frame).await;
+            }
+            None => {
+                // No session — silently drop. Could log at debug.
+            }
+        }
+    }
+}
+
+fn io_error_response(stream_id: &str, code: &str, detail: &str) -> TunnelResponse {
+    TunnelResponse {
+        stream_id: stream_id.to_string(),
+        payload: Some(tunnel_response::Payload::IoServer(IoServerFrame {
+            stream_id: stream_id.to_string(),
+            payload: Some(
+                open_sandbox_contracts::proxy::io_server_frame::Payload::Error(
+                    open_sandbox_contracts::proxy::IoError {
+                        code: code.to_string(),
+                        detail: detail.to_string(),
+                    },
+                ),
+            ),
+        })),
     }
 }
