@@ -157,6 +157,9 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
 
         tokio::spawn(async move {
             let mut registered_agent_id: Option<AgentId> = None;
+            // Comp-2 B1: remember our generation so cleanup only affects the
+            // tunnel we registered (not any later reconnect that took over).
+            let mut my_generation: Option<crate::tunnel_pool::TunnelGeneration> = None;
 
             while let Ok(Some(msg)) = inbound.message().await {
                 let Some(payload) = msg.payload else {
@@ -169,8 +172,9 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
                             break;
                         };
                         let agent_id = AgentId::from(agent_uuid);
-                        pool.register(agent_id.clone(), request_tx.clone());
+                        let generation = pool.register(agent_id.clone(), request_tx.clone());
                         registered_agent_id = Some(agent_id);
+                        my_generation = Some(generation);
                     }
                     // Comp-2 A2: dispatch frames carry stream_id only, but a
                     // malicious/confused agent could deliver frames for streams
@@ -210,10 +214,13 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
                 }
             }
 
-            if let Some(agent_id) = registered_agent_id {
-                mux.cancel_agent_streams(&agent_id);
-                sessions.cancel_agent_streams(&agent_id);
-                pool.remove(&agent_id);
+            // Comp-2 B1: scope all cleanup to our specific generation so a
+            // newer tunnel for the same AgentId (an agent reconnect that
+            // overwrote our pool entry) is left intact.
+            if let (Some(agent_id), Some(generation)) = (registered_agent_id, my_generation) {
+                mux.cancel_agent_streams_at_generation(&agent_id, generation);
+                sessions.cancel_agent_streams_at_generation(&agent_id, generation);
+                pool.remove_if_current(&agent_id, generation);
             }
         });
 
@@ -333,7 +340,7 @@ async fn dispatch_io_stream<S: RoutingStore + 'static>(
     };
     let agent_id = route.agent_id;
 
-    let agent_sender = match pool.get_sender(&agent_id) {
+    let (agent_sender, generation) = match pool.get_sender_with_generation(&agent_id) {
         Some(s) => s,
         None => {
             let _ = server_tx
@@ -351,6 +358,9 @@ async fn dispatch_io_stream<S: RoutingStore + 'static>(
         IoSessionRecord {
             agent_id: agent_id.clone(),
             server_tx: server_tx.clone(),
+            // Comp-2 B1: stamp the session with the tunnel generation so an
+            // old-tunnel cleanup can't kill it after the agent reconnects.
+            generation,
         },
     );
 

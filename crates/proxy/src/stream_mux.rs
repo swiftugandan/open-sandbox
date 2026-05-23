@@ -9,11 +9,14 @@ use open_sandbox_contracts::error::ProxyError;
 use open_sandbox_contracts::proxy::{HttpRequest, HttpResponse, TunnelRequest, tunnel_request};
 use open_sandbox_contracts::types::AgentId;
 
-use crate::tunnel_pool::TunnelPool;
+use crate::tunnel_pool::{TunnelGeneration, TunnelPool};
 
 pub struct PendingStream {
     pub response_tx: oneshot::Sender<Result<HttpResponse, ProxyError>>,
     pub agent_id: AgentId,
+    /// Tunnel generation the request was sent on. Comp-2 B1: scope
+    /// cancel_agent_streams to a specific generation.
+    pub generation: TunnelGeneration,
 }
 
 pub struct StreamMux {
@@ -45,12 +48,11 @@ impl StreamMux {
         headers: HashMap<String, String>,
         body: Vec<u8>,
     ) -> Result<HttpResponse, ProxyError> {
-        let sender =
-            self.pool
-                .get_sender(agent_id)
-                .ok_or_else(|| ProxyError::TunnelUnavailable {
-                    agent_id: agent_id.to_string(),
-                })?;
+        let (sender, generation) = self.pool.get_sender_with_generation(agent_id).ok_or_else(
+            || ProxyError::TunnelUnavailable {
+                agent_id: agent_id.to_string(),
+            },
+        )?;
 
         let stream_id = self.next_stream_id();
         let (response_tx, response_rx) = oneshot::channel();
@@ -60,6 +62,7 @@ impl StreamMux {
             PendingStream {
                 response_tx,
                 agent_id: agent_id.clone(),
+                generation,
             },
         );
 
@@ -156,11 +159,18 @@ impl StreamMux {
         self.pending.lock().unwrap().remove(stream_id);
     }
 
-    pub fn cancel_agent_streams(&self, agent_id: &AgentId) {
+    /// Cancel only pending streams opened on a specific tunnel generation —
+    /// Comp-2 B1. Pending requests sent on the agent's newer reconnect tunnel
+    /// (a higher generation) are left intact.
+    pub fn cancel_agent_streams_at_generation(
+        &self,
+        agent_id: &AgentId,
+        generation: TunnelGeneration,
+    ) {
         self.pending
             .lock()
             .unwrap()
-            .retain(|_, p| p.agent_id != *agent_id);
+            .retain(|_, p| !(p.agent_id == *agent_id && p.generation == generation));
     }
 
     pub fn pending_count(&self) -> usize {

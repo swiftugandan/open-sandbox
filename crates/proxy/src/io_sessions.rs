@@ -20,12 +20,19 @@ use tonic::Status;
 use open_sandbox_contracts::proxy::IoServerFrame;
 use open_sandbox_contracts::types::AgentId;
 
+use crate::tunnel_pool::TunnelGeneration;
+
 pub struct IoSessionRecord {
     pub agent_id: AgentId,
     /// Sender to the gateway-side outbound stream (the response
     /// stream of OpenIoStream). The proxy pushes `IoServerFrame`s
     /// here that arrive from the agent.
     pub server_tx: mpsc::Sender<Result<IoServerFrame, Status>>,
+    /// Tunnel generation this session was opened on. Comp-2 B1: scope
+    /// cancel_agent_streams to a specific tunnel generation so an old
+    /// OpenTunnel task's late cleanup doesn't kill sessions opened on the
+    /// agent's reconnected tunnel.
+    pub generation: TunnelGeneration,
 }
 
 pub struct IoSessions {
@@ -120,13 +127,18 @@ impl IoSessions {
         }
     }
 
-    /// When an agent disconnects, terminate all sessions routing
-    /// through it. The gateway sees an Unavailable status on each.
-    pub fn cancel_agent_streams(&self, agent_id: &AgentId) {
+    /// When an agent's tunnel disconnects, terminate all sessions opened on
+    /// that specific generation. Comp-2 B1: sessions opened on a newer
+    /// generation (an agent reconnect) are NOT canceled.
+    pub fn cancel_agent_streams_at_generation(
+        &self,
+        agent_id: &AgentId,
+        generation: TunnelGeneration,
+    ) {
         let mut guard = self.inner.lock().unwrap();
         let stream_ids: Vec<String> = guard
             .iter()
-            .filter(|(_, r)| r.agent_id == *agent_id)
+            .filter(|(_, r)| r.agent_id == *agent_id && r.generation == generation)
             .map(|(k, _)| k.clone())
             .collect();
         for sid in stream_ids {
@@ -172,6 +184,7 @@ mod tests {
             IoSessionRecord {
                 agent_id: agent_id.clone(),
                 server_tx: tx,
+                generation: 1,
             },
         );
         let frame = IoServerFrame {
@@ -199,6 +212,7 @@ mod tests {
             IoSessionRecord {
                 agent_id: owner,
                 server_tx: tx,
+                generation: 1,
             },
         );
         let frame = IoServerFrame {
@@ -210,34 +224,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_agent_streams_fails_only_that_agents_sessions() {
+    async fn cancel_only_cancels_matching_generation() {
+        // Comp-2 B1: an old-tunnel cleanup must not kill sessions opened on a
+        // later (reconnected) tunnel for the same AgentId.
         let s = IoSessions::new();
-        let agent_a = AgentId::new();
-        let agent_b = AgentId::new();
-        let (tx_a, mut rx_a) = mpsc::channel(8);
-        let (tx_b, mut rx_b) = mpsc::channel(8);
+        let agent = AgentId::new();
+        let (tx_old, mut rx_old) = mpsc::channel(8);
+        let (tx_new, mut rx_new) = mpsc::channel(8);
         s.insert(
-            "io-a".into(),
+            "io-old".into(),
             IoSessionRecord {
-                agent_id: agent_a.clone(),
-                server_tx: tx_a,
+                agent_id: agent.clone(),
+                server_tx: tx_old,
+                generation: 1,
             },
         );
         s.insert(
-            "io-b".into(),
+            "io-new".into(),
             IoSessionRecord {
-                agent_id: agent_b.clone(),
-                server_tx: tx_b,
+                agent_id: agent.clone(),
+                server_tx: tx_new,
+                generation: 2,
             },
         );
 
-        s.cancel_agent_streams(&agent_a);
+        // Old tunnel disconnect cancels only generation 1.
+        s.cancel_agent_streams_at_generation(&agent, 1);
 
-        let received_a = rx_a.try_recv().unwrap();
-        assert!(received_a.is_err());
-
-        // B still alive.
+        assert!(rx_old.try_recv().unwrap().is_err());
+        assert!(rx_new.try_recv().is_err()); // new still alive
         assert_eq!(s.len(), 1);
-        assert!(rx_b.try_recv().is_err()); // nothing yet
     }
 }
