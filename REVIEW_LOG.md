@@ -240,6 +240,36 @@ comp-1 cross-component CLI reconnect-loop follow-up closed here.
 
 ---
 
+## Component 4 — agent-docker (in-crate findings)
+
+8 findings; 5 closed in `review/04-agent-docker`, 3 deferred (image-pull retry, signal_exec stream drain, inspect_exec/exit_code conflation).
+
+### [comp-4 · critical] PID=0 silent fallback broke spike-01 invariant — **closed**
+
+- **Fix:** inpid_rx timeout bumped 1s→5s and fails loud with AgentError::Internal rather than silently returning pid=0.
+
+### [comp-4 · critical] read_file unbounded — **closed**
+
+- **Fix:** `MAX_READ_BYTES = 256 MiB`; oversize returns Runtime error.
+
+### [comp-4 · high] create_and_start container leak on failure — **closed**
+
+- **Fix:** force_remove rollback helper runs on every error path between create_container and the final Ok.
+
+### [comp-4 · high] write_file/write_files_targz silent stdin send error — **closed**
+
+- **Fix:** stdin sends now `Err`-propagate; tmp file cleaned up.
+
+### [comp-4 · med] write_file orphan tmp file on mv failure — **closed**
+
+- **Fix:** cleanup_tmp_file helper called on mv error.
+
+### [comp-4 · DEFERRED] Image pull retry, signal_exec stream drain, inspect_exec conflation
+
+- See `NEEDS_HUMAN_ATTENTION.md`.
+
+---
+
 ## Cross-component findings
 
 ### [comp-1 · high] CLI agent runtime has no reconnect loop

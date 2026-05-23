@@ -27,6 +27,11 @@ const LABEL_MANAGED_BY_VALUE: &str = "open-sandbox-agent";
 const LABEL_SANDBOX_ID: &str = "open-sandbox.sandbox-id";
 const NANOCPUS_PER_MILLICPU: i64 = 1_000_000;
 
+/// Hard cap on `read_file` output. Comp-4: without this, a request for a
+/// multi-gigabyte file inside the sandbox grows Vec<u8> until the agent
+/// OOMs and tears down every sandbox on the host.
+pub const MAX_READ_BYTES: usize = 256 * 1024 * 1024;
+
 pub struct DockerRuntime {
     client: bollard::Docker,
 }
@@ -35,6 +40,41 @@ impl DockerRuntime {
     pub fn connect() -> Result<Self, AgentError> {
         let client = bollard::Docker::connect_with_local_defaults().map_err(runtime_err)?;
         Ok(Self { client })
+    }
+
+    /// Best-effort force-remove used by create_and_start rollback paths.
+    /// Comp-4: errors here are logged but never propagated — the caller
+    /// surfaces the original failure to the controller.
+    async fn force_remove(&self, container_id: &str) {
+        let opts = RemoveContainerOptions {
+            force: true,
+            v: true,
+            ..Default::default()
+        };
+        if let Err(e) = self.client.remove_container(container_id, Some(opts)).await {
+            warn!(container_id, error = %e, "rollback remove_container failed");
+        }
+    }
+
+    /// Best-effort cleanup of a `.opensb.<uuid>.tmp` file left behind when a
+    /// write_file step fails. Comp-4: previously orphans accumulated in the
+    /// container's target directory.
+    async fn cleanup_tmp_file(&self, container_id: &ContainerId, tmp_path: &str) {
+        let rm = self
+            .start_exec(
+                container_id,
+                ExecStart {
+                    command: vec!["rm".into(), "-f".into(), tmp_path.to_string()],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await;
+        if let Ok(handle) = rm {
+            if let Err(e) = drain_to_exit(handle).await {
+                warn!(tmp = %tmp_path, error = %e, "tmp file cleanup failed");
+            }
+        }
     }
 }
 
@@ -76,18 +116,35 @@ impl ContainerRuntime for DockerRuntime {
             .await
             .map_err(runtime_err)?;
 
-        self.client
+        // Comp-4: any failure between create_container and the final Ok must
+        // remove the orphaned container, or repeated retries leave dead
+        // entries piling up under the `sandbox-<uuid>` name and a future
+        // recreate hits a name collision.
+        if let Err(e) = self
+            .client
             .start_container::<String>(&created.id, None)
             .await
-            .map_err(runtime_err)?;
+            .map_err(runtime_err)
+        {
+            self.force_remove(&created.id).await;
+            return Err(e);
+        }
 
-        let inspect = self
-            .client
-            .inspect_container(&created.id, None)
-            .await
-            .map_err(runtime_err)?;
+        let inspect = match self.client.inspect_container(&created.id, None).await {
+            Ok(i) => i,
+            Err(e) => {
+                self.force_remove(&created.id).await;
+                return Err(runtime_err(e));
+            }
+        };
 
-        let host_port = extract_host_port(&inspect, port_hint.as_deref())?;
+        let host_port = match extract_host_port(&inspect, port_hint.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.force_remove(&created.id).await;
+                return Err(e);
+            }
+        };
         info!(container_id = %created.id, sandbox_id = %sandbox_id_str, host_port, "container started");
 
         Ok(ContainerInfo {
@@ -362,17 +419,30 @@ impl ContainerRuntime for DockerRuntime {
             });
         });
 
-        // Wait briefly for the wrapper to emit OPENSB_INPID. If it
-        // doesn't arrive (sender dropped or 1s elapsed) we fall back
-        // to 0 — the ExecRegistry cleanup hook becomes a no-op for
-        // this exec. Better than the v0.7.x bug of using a host PID
-        // that resolves to the wrong (or no) process inside the
-        // container's PID namespace.
-        let in_container_pid = tokio::time::timeout(Duration::from_secs(1), inpid_rx)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
+        // Wait for the wrapper to emit OPENSB_INPID. Comp-4: bumped from
+        // 1s to 5s to tolerate cold containers and cgroup-throttled
+        // shells. If the marker still doesn't arrive, fail loud rather
+        // than silently returning pid=0 — a pid=0 ExecHandle makes
+        // signal_exec a no-op, breaking the spike-01 guarantee that the
+        // agent kills the in-container PID on client disconnect.
+        let in_container_pid = match tokio::time::timeout(Duration::from_secs(5), inpid_rx).await {
+            Ok(Ok(pid)) if pid > 0 => pid,
+            Ok(Ok(pid)) => {
+                return Err(AgentError::Internal {
+                    detail: format!(
+                        "OPENSB_INPID wrapper reported invalid pid={pid}; refusing to start exec"
+                    ),
+                });
+            }
+            Ok(Err(_)) | Err(_) => {
+                return Err(AgentError::Internal {
+                    detail:
+                        "OPENSB_INPID marker not received within 5s; refusing to start exec \
+                         (would break disconnect-driven kill)"
+                            .into(),
+                });
+            }
+        };
 
         Ok(ExecHandle {
             exec_id,
@@ -459,11 +529,20 @@ impl ContainerRuntime for DockerRuntime {
             )
             .await?;
 
-        // Drain stdout fully; ignore stdin.
+        // Drain stdout fully; ignore stdin. Comp-4: cap the accumulated
+        // bytes at MAX_READ_BYTES so a `cat /dev/zero` or a huge in-sandbox
+        // file can't OOM the agent process.
         let mut handle = handle;
         drop(handle.stdin);
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = handle.stdout.recv().await {
+            if buf.len().saturating_add(chunk.len()) > MAX_READ_BYTES {
+                return Err(AgentError::Runtime {
+                    detail: format!(
+                        "read_file output exceeds {MAX_READ_BYTES}-byte cap"
+                    ),
+                });
+            }
             buf.extend_from_slice(&chunk);
         }
         // Also drain stderr to allow the exec to terminate cleanly.
@@ -534,9 +613,16 @@ impl ContainerRuntime for DockerRuntime {
             )
             .await?;
         let mut writer = writer;
-        // Push content as a single chunk (caller's responsibility
-        // to keep payload reasonable for unary write_file).
-        let _ = writer.stdin.send(content).await;
+        // Comp-4: check the stdin send — previously `let _ = ...` silently
+        // dropped data on pipe error, leaving an empty file with exit 0
+        // (tee exits cleanly on no-input). Surface the failure instead.
+        if let Err(e) = writer.stdin.send(content).await {
+            // Clean up the half-written tmp file before returning.
+            self.cleanup_tmp_file(id, &temp).await;
+            return Err(AgentError::Runtime {
+                detail: format!("write_file tee stdin send failed: {e}"),
+            });
+        }
         drop(writer.stdin); // signal EOF
         // Drain stdout (tee echoes content) and stderr.
         while writer.stdout.recv().await.is_some() {}
@@ -548,6 +634,7 @@ impl ContainerRuntime for DockerRuntime {
             detail: "write_file tee exec terminated without exit info".into(),
         })?;
         if info.exit_code != 0 {
+            self.cleanup_tmp_file(id, &temp).await;
             return Err(AgentError::Runtime {
                 detail: format!(
                     "write_file tee exit={} stderr={}",
@@ -568,7 +655,13 @@ impl ContainerRuntime for DockerRuntime {
                 },
             )
             .await?;
-        drain_to_exit(mv).await?;
+        // Comp-4: on mv failure, remove the orphan tmp file so a sandbox
+        // doing repeated failing writes can't accumulate garbage in the
+        // target dir until the container is destroyed.
+        if let Err(e) = drain_to_exit(mv).await {
+            self.cleanup_tmp_file(id, &temp).await;
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -612,7 +705,12 @@ impl ContainerRuntime for DockerRuntime {
             )
             .await?;
         let mut extract = extract;
-        let _ = extract.stdin.send(tarball).await;
+        // Comp-4: same silent-stdin-error fix as write_file.
+        if let Err(e) = extract.stdin.send(tarball).await {
+            return Err(AgentError::Runtime {
+                detail: format!("write_files_targz tar stdin send failed: {e}"),
+            });
+        }
         drop(extract.stdin);
         while extract.stdout.recv().await.is_some() {}
         let mut stderr = Vec::new();
