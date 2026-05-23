@@ -144,6 +144,64 @@ finding, the merged commit, and any deferred follow-up.
 
 ---
 
+## Component 2 — proxy (in-crate findings)
+
+10 findings surfaced; 8 fixes landed on `review/02-proxy`, 3 deferred to
+`NEEDS_HUMAN_ATTENTION.md` (TLS source decision, head-of-line architecture
+choice, try_send disconnect notification strategy). Cross-component
+follow-up (proxy LISTEN side for comp-1 F4) was IN scope here and is now
+closed.
+
+### [comp-2 · critical] A1: OpenTunnel had no authentication — **closed**
+
+- **Fix:** Bearer-token check on OpenTunnel via `TUNNEL_JOIN_TOKEN`. `SandboxIoHandler` takes a `tunnel_token`; constant-secret compare (single string match is OK since the token is constant; if we move to per-agent tokens we'll need constant-time compare). `run_proxy` refuses to bind without the env var. Agent side (`crates/agent/src/proxy_client.rs`) sends `authorization: Bearer <token>` via `ProxyConnection::with_token`.
+
+### [comp-2 · critical] A2: Cross-agent frame injection on sequential stream IDs — **closed**
+
+- **Fix:** `StreamMux::deliver_response` / `fail_stream` and `IoSessions::deliver_server_frame` now require the caller to pass the carrier `AgentId` and verify it matches the stream's owner before forwarding. Pre-Ready frames on OpenTunnel are dropped.
+
+### [comp-2 · critical] C3: Combined-mode proxy had no auth — **closed**
+
+- **Fix:** `run_proxy` now refuses to start in Combined mode (single listener) unless `INTERNAL_TOKEN_ENV` is set.
+
+### [comp-2 · critical] A6/B3/C1/C6: Routing cache had no invalidation — **closed**
+
+- **Fix:** Proxy LISTENs on `routing_changed` and parses `{op:insert|remove,...}` payloads, calling `cache.insert` / `cache.remove_by_sandbox_id` in real time. OpenTunnel cleanup also calls `cache.remove_for_agent`, but only when the cleanup ran for the still-current tunnel generation. 30s periodic refresh remains as fallback for missed notifications.
+
+### [comp-2 · high] B1: Tunnel reconnect race wiped new sessions — **closed**
+
+- **Fix:** TunnelPool now stamps each registration with an opaque `TunnelGeneration`. `IoSessionRecord` and `PendingStream` capture the generation at creation. `cancel_agent_streams_at_generation` only cancels streams from that generation; `pool.remove_if_current` only removes when the live entry's generation still matches. An old-tunnel cleanup never touches a reconnected tunnel.
+
+### [comp-2 · high] B6: req.collect() OOM vector — **closed**
+
+- **Fix:** `MAX_REQUEST_BODY_BYTES = 50 MiB` cap via `http_body_util::Limited`. Oversized bodies return 413.
+
+### [comp-2 · high] A3: LIKE-without-index sequential scan — **closed**
+
+- **Fix:** `PgRoutingStore::migrate()` creates `routing_entries_subdomain_idx` (functional index on `replace(sandbox_id::text,'-','')` with `text_pattern_ops`). Wired into `run_proxy` with the existing PG-not-ready retry loop.
+
+### [comp-2 · med] A4: Case-sensitive subdomain lookup — **closed**
+
+- **Fix:** `Router::extract_sandbox_id` lowercases before returning.
+
+### [comp-2 · med] A5: Hop-by-hop headers forwarded — **closed**
+
+- **Fix:** RFC 7230 §6.1 hop-by-hop headers stripped, including any header listed in the `Connection` header.
+
+### [comp-2 · med] C4: ProxyError → all 502 collapsed — **closed**
+
+- **Fix:** Per-variant mapping: `RoutingMiss → 404`, `UpstreamTimeout → 504`, `TunnelUnavailable / UpstreamRejected / Internal → 502`.
+
+### [comp-2 · med] B4: No HTTP/2 keepalive on OpenTunnel server — **closed**
+
+- **Fix:** `http2_keepalive_interval=15s`, `http2_keepalive_timeout=20s` on the public listener. Catches a frozen-but-TCP-alive agent within ~35s.
+
+### [comp-2 · DEFERRED] B2 (head-of-line blocking), C5 (TLS), C2 (try_send drops disconnect)
+
+- See `NEEDS_HUMAN_ATTENTION.md` — all three need a design decision (per-session pump model, cert source, disconnect-notification strategy) before I can implement.
+
+---
+
 ## Cross-component findings
 
 ### [comp-1 · high] CLI agent runtime has no reconnect loop

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -13,6 +13,25 @@ use open_sandbox_contracts::error::ProxyError;
 
 use crate::router::Router;
 use crate::routing_store::RoutingStore;
+
+/// Hard cap on the size of a public HTTP request body the proxy will buffer
+/// before forwarding to the agent. Without this, a single 10 GiB POST OOMs
+/// the proxy and takes down every tunnel. Comp-2 B6.
+pub const MAX_REQUEST_BODY_BYTES: usize = 50 * 1024 * 1024;
+
+/// Hop-by-hop headers per RFC 7230 §6.1; the proxy must strip these on each
+/// hop rather than forwarding them. Comp-2 A5. The Connection header is
+/// stripped separately along with any headers it names.
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
 pub struct HttpServer<S: RoutingStore + 'static> {
     router: Arc<Router<S>>,
@@ -64,18 +83,44 @@ async fn handle_request<S: RoutingStore + 'static>(
         .path_and_query()
         .map_or("/".to_string(), |pq| pq.to_string());
 
+    // Comp-2 A5: strip hop-by-hop headers per RFC 7230 §6.1 before forwarding,
+    // including any header named by Connection. Forwarding Transfer-Encoding /
+    // Upgrade / Proxy-Authorization enables request smuggling and leaks the
+    // proxy's credential to the in-sandbox app.
+    let connection_headers: Vec<String> = req
+        .headers()
+        .get("connection")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut headers = HashMap::new();
     for (name, value) in req.headers() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if HOP_BY_HOP_HEADERS.contains(&lower.as_str()) {
+            continue;
+        }
+        if connection_headers.iter().any(|h| *h == lower) {
+            continue;
+        }
         if let Ok(v) = value.to_str() {
             headers.insert(name.to_string(), v.to_string());
         }
     }
 
-    let body = req
+    // Comp-2 B6: cap the body size so a single oversized POST cannot OOM the
+    // proxy. Per RFC 9110 §15.5.14, 413 is the right response.
+    let body = match Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES)
         .collect()
         .await
-        .map(|collected| collected.to_bytes().to_vec())
-        .unwrap_or_default();
+    {
+        Ok(collected) => collected.to_bytes().to_vec(),
+        Err(_) => return Ok(payload_too_large()),
+    };
 
     match router
         .route_request(&host, method, uri, headers, body)
@@ -94,13 +139,41 @@ async fn handle_request<S: RoutingStore + 'static>(
                 .body(Full::new(Bytes::from(resp.body)))
                 .expect("fresh builder"))
         }
-        Err(_) => Ok(bad_gateway()),
+        // Comp-2 C4: map ProxyError variants to distinct HTTP statuses so
+        // consumers can distinguish 'no such sandbox' from 'agent dead' from
+        // 'upstream slow'.
+        Err(ProxyError::RoutingMiss { .. }) => Ok(not_found()),
+        Err(ProxyError::UpstreamTimeout { .. }) => Ok(gateway_timeout()),
+        Err(ProxyError::TunnelUnavailable { .. })
+        | Err(ProxyError::UpstreamRejected { .. })
+        | Err(_) => Ok(bad_gateway()),
     }
 }
 
 fn bad_gateway() -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::BAD_GATEWAY)
+        .body(Full::new(Bytes::new()))
+        .expect("fresh builder")
+}
+
+fn not_found() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Full::new(Bytes::new()))
+        .expect("fresh builder")
+}
+
+fn gateway_timeout() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::GATEWAY_TIMEOUT)
+        .body(Full::new(Bytes::new()))
+        .expect("fresh builder")
+}
+
+fn payload_too_large() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
         .body(Full::new(Bytes::new()))
         .expect("fresh builder")
 }
@@ -154,6 +227,7 @@ mod tests {
         let server_handle = tokio::spawn(async move { server.run(listener).await });
 
         let mux_clone = mux.clone();
+        let agent_id_clone = agent_id.clone();
         let agent_handle = tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let response = HttpResponse {
@@ -161,7 +235,7 @@ mod tests {
                     headers: Default::default(),
                     body: b"hello from sandbox".to_vec(),
                 };
-                mux_clone.deliver_response(&req.stream_id, response);
+                mux_clone.deliver_response(&req.stream_id, &agent_id_clone, response);
             }
         });
 
@@ -187,7 +261,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_server_returns_502_for_unknown_sandbox() {
+    async fn http_server_strips_hop_by_hop_headers() {
+        // Comp-2 A5: hop-by-hop headers MUST NOT be forwarded to the agent.
+        let sandbox_id = SandboxId::new();
+        let agent_id = AgentId::new();
+        let (router, mux, mut rx) = setup_router_with_agent(&sandbox_id, &agent_id);
+
+        let server = HttpServer::new(router);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move { server.run(listener).await });
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+        let mux_clone = mux.clone();
+        let agent_id_clone = agent_id.clone();
+        let agent_handle = tokio::spawn(async move {
+            if let Some(req) = rx.recv().await {
+                if let Some(tunnel_request::Payload::HttpRequest(http_req)) = &req.payload {
+                    *captured_clone.lock().unwrap() = Some(http_req.headers.clone());
+                }
+                let response = HttpResponse {
+                    status_code: 200,
+                    headers: Default::default(),
+                    body: vec![],
+                };
+                mux_clone.deliver_response(&req.stream_id, &agent_id_clone, response);
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let host = format!("{}.sandbox.example.com", sandbox_id.subdomain());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let _ = client
+            .post(format!("http://{addr}/"))
+            .header("host", &host)
+            .header("connection", "keep-alive, x-private")
+            .header("proxy-authorization", "Bearer s3cret")
+            .header("transfer-encoding", "chunked")
+            .header("upgrade", "websocket")
+            .header("x-private", "should-also-be-stripped")
+            .header("x-safe", "passthrough")
+            .body("hi")
+            .send()
+            .await
+            .unwrap();
+
+        agent_handle.await.unwrap();
+        let captured = captured.lock().unwrap().clone().unwrap();
+        for header in [
+            "connection",
+            "proxy-authorization",
+            "transfer-encoding",
+            "upgrade",
+            "x-private", // named via Connection
+        ] {
+            assert!(
+                !captured.keys().any(|k| k.eq_ignore_ascii_case(header)),
+                "hop-by-hop header {header} must not be forwarded: {captured:?}"
+            );
+        }
+        assert!(captured.keys().any(|k| k.eq_ignore_ascii_case("x-safe")));
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_server_rejects_oversized_body_with_413() {
+        // Comp-2 B6: bodies above MAX_REQUEST_BODY_BYTES get 413, not OOM.
+        let sandbox_id = SandboxId::new();
+        let agent_id = AgentId::new();
+        let (router, _mux, _rx) = setup_router_with_agent(&sandbox_id, &agent_id);
+
+        let server = HttpServer::new(router);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move { server.run(listener).await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let oversize = vec![b'x'; MAX_REQUEST_BODY_BYTES + 1];
+        let host = format!("{}.sandbox.example.com", sandbox_id.subdomain());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let resp = client
+            .post(format!("http://{addr}/"))
+            .header("host", &host)
+            .body(oversize)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 413);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_server_returns_404_for_unknown_sandbox() {
+        // Comp-2 C4: RoutingMiss → 404 (was 502). Distinct from agent-dead
+        // (502) so CDNs / health checks can stop retrying when the sandbox
+        // genuinely doesn't exist.
         let store = InMemoryRoutingStore::new();
         let cache = Arc::new(RoutingCache::new(store));
         let pool = Arc::new(TunnelPool::new());
@@ -213,7 +393,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), 502);
+        assert_eq!(resp.status(), 404);
 
         server_handle.abort();
     }
@@ -231,6 +411,7 @@ mod tests {
         let server_handle = tokio::spawn(async move { server.run(listener).await });
 
         let mux_clone = mux.clone();
+        let agent_id_clone = agent_id.clone();
         let agent_handle = tokio::spawn(async move {
             if let Some(req) = rx.recv().await {
                 if let Some(tunnel_request::Payload::HttpRequest(http_req)) = &req.payload {
@@ -247,7 +428,7 @@ mod tests {
                     headers: Default::default(),
                     body: b"created".to_vec(),
                 };
-                mux_clone.deliver_response(&req.stream_id, response);
+                mux_clone.deliver_response(&req.stream_id, &agent_id_clone, response);
             }
         });
 

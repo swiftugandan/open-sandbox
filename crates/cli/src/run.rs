@@ -102,6 +102,37 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
 pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>> {
     info!("proxy starting");
     let pg_pool = sqlx::PgPool::connect(&args.database_url).await?;
+    // Comp-2 A3: proxy owns the routing_entries_subdomain_idx functional
+    // index; the controller owns the table itself. Retry the index
+    // creation since the proxy can race the controller's migrate().
+    let migration_store = PgRoutingStore::new(pg_pool.clone());
+    for attempt in 1..=PROXY_STARTUP_RETRY_ATTEMPTS {
+        match migration_store.migrate().await {
+            Ok(()) => {
+                info!("proxy migrations applied");
+                break;
+            }
+            Err(e) if attempt < PROXY_STARTUP_RETRY_ATTEMPTS => {
+                warn!(
+                    attempt,
+                    max = PROXY_STARTUP_RETRY_ATTEMPTS,
+                    error = %e,
+                    "proxy migration not ready (controller may not have created routing_entries yet), retrying"
+                );
+                tokio::time::sleep(PROXY_STARTUP_RETRY_INTERVAL).await;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "proxy migration failed after {PROXY_STARTUP_RETRY_ATTEMPTS} attempts: {e}"
+                )
+                .into());
+            }
+        }
+    }
+    // Hold a second store handle for the LISTEN subscriber below. The
+    // PgListener needs its own dedicated connection (LISTEN occupies the
+    // session) but borrows from the same pool.
+    let listener_store = PgRoutingStore::new(pg_pool.clone());
     let routing_store = PgRoutingStore::new(pg_pool);
     let cache = Arc::new(RoutingCache::new(routing_store));
 
@@ -144,6 +175,31 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
     // for OpenIoStream only. Setting both to the same value
     // collapses to a single combined listener (development).
     let split_listeners = args.grpc_port != args.internal_grpc_port;
+    // Comp-2 C3: in Combined mode the network-isolation defense is gone, so
+    // OpenIoStream auth depends entirely on the bearer token. Refuse to bind
+    // if the operator hasn't set INTERNAL_TOKEN_ENV.
+    if !split_listeners && internal_token.is_none() {
+        return Err(format!(
+            "{} must be set when running the proxy in Combined mode \
+             (grpc_port == internal_grpc_port); without it OpenIoStream has \
+             zero authentication and any caller on the listener can execute \
+             commands in any sandbox",
+            open_sandbox_contracts::constants::INTERNAL_TOKEN_ENV
+        )
+        .into());
+    }
+    // Comp-2 A1: shared-secret token agents present on OpenTunnel. Required on
+    // the public listener so a network-reachable attacker cannot register
+    // themselves as an arbitrary agent_id and hijack routing. Refuse to bind
+    // when missing.
+    let tunnel_token = std::env::var("TUNNEL_JOIN_TOKEN").ok();
+    if tunnel_token.is_none() {
+        return Err("TUNNEL_JOIN_TOKEN must be set so agents calling OpenTunnel \
+                    are authenticated; without it any network-reachable caller \
+                    can register as any agent_id and hijack routing for that \
+                    agent's sandboxes"
+            .into());
+    }
     let (public_role, internal_role) = if split_listeners {
         (ProxyRole::Public, ProxyRole::Internal)
     } else {
@@ -163,6 +219,7 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         sessions.clone(),
         cache.clone(),
         internal_token.clone(),
+        tunnel_token.clone(),
         public_role,
     );
 
@@ -182,8 +239,62 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         }
     });
 
+    // Comp-2 A6/B3/C1: LISTEN on routing_changed and invalidate cache
+    // entries in real time. The 30s periodic refresh stays as a fallback
+    // for when the LISTEN connection drops or notifications are lost.
+    let cache_for_listener = cache.clone();
+    tokio::spawn(async move {
+        use open_sandbox_proxy::pg_store::RoutingChange;
+        loop {
+            let mut listener = match listener_store.routing_changed_listener().await {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!(error = %e, "routing_changed listener connect failed; will retry");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            info!("subscribed to routing_changed notifications");
+            loop {
+                match listener.recv().await {
+                    Ok(notification) => {
+                        let payload = notification.payload();
+                        match RoutingChange::parse(payload) {
+                            Some(RoutingChange::Insert {
+                                sandbox_id,
+                                agent_id,
+                            }) => {
+                                // Refresh the entry with the new (sandbox_id, agent_id)
+                                // pairing — handles both freshly-inserted routes and
+                                // agent reassignment.
+                                cache_for_listener.insert(sandbox_id, agent_id);
+                            }
+                            Some(RoutingChange::Remove { sandbox_id }) => {
+                                cache_for_listener.remove_by_sandbox_id(&sandbox_id);
+                            }
+                            None => {
+                                warn!(payload = %payload, "unrecognized routing_changed payload");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "routing_changed recv failed; reconnecting");
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+
     let public_grpc_handle = tokio::spawn(async move {
+        // Comp-2 B4: HTTP/2 keepalive pings detect a frozen-but-TCP-alive
+        // agent within the documented spike-03 budget. Without these the
+        // proxy's inbound loop on a hung agent sits in message().await
+        // until OS TCP timeouts (hours).
         tonic::transport::Server::builder()
+            .http2_keepalive_interval(Some(Duration::from_secs(15)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(20)))
             .add_service(public_service)
             .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), shutdown_signal())
             .await
@@ -198,6 +309,9 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
             sessions,
             cache.clone(),
             internal_token,
+            // Internal listener does NOT accept OpenTunnel; no token needed
+            // there. Public listener already enforced tunnel_token above.
+            None,
             internal_role,
         );
         info!(internal_grpc = %internal_addr, "proxy: internal listener ready");
@@ -276,7 +390,11 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
 
     let http_client = Arc::new(ReqwestHttpClient::new());
     let forwarder = Arc::new(TunnelForwarder::new(sandbox_manager.clone(), http_client));
-    let proxy_conn = ProxyConnection::new(agent_id, forwarder);
+    // Comp-2 A1: present the bearer token on OpenTunnel. Optional so dev
+    // setups (single-process tests) can omit; production proxies refuse
+    // anonymous tunnels at the binary boundary.
+    let agent_tunnel_token = std::env::var("TUNNEL_JOIN_TOKEN").ok();
+    let proxy_conn = ProxyConnection::with_token(agent_id, forwarder, agent_tunnel_token);
 
     let controller_url = args.controller_url.clone();
     let proxy_url = args.proxy_url.clone();

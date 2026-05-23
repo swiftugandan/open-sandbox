@@ -24,7 +24,11 @@ impl<S: RoutingStore> Router<S> {
         if subdomain.len() != 12 || !subdomain.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
-        Some(subdomain.to_string())
+        // Comp-2 A4: subdomain lookups against routing_entries compare against the
+        // lowercase hex form of the UUID. Normalize here so a browser that
+        // uppercases the Host (or a manually-typed URL with caps) still hits
+        // the route.
+        Some(subdomain.to_ascii_lowercase())
     }
 
     pub async fn route_request(
@@ -85,6 +89,17 @@ mod tests {
     fn extract_sandbox_id_returns_none_for_empty() {
         let id = Router::<InMemoryRoutingStore>::extract_sandbox_id("");
         assert!(id.is_none());
+    }
+
+    #[test]
+    fn extract_sandbox_id_normalizes_uppercase_to_lowercase() {
+        // Comp-2 A4: routing_entries stores the canonical lowercase hex form.
+        // The proxy must lowercase the subdomain before lookup so an
+        // uppercased Host still routes.
+        let id = Router::<InMemoryRoutingStore>::extract_sandbox_id(
+            "ABC123DEF456.sandbox.example.com",
+        );
+        assert_eq!(id, Some("abc123def456".to_string()));
     }
 
     #[test]
@@ -177,7 +192,7 @@ mod tests {
             headers: Default::default(),
             body: b"<html>hello</html>".to_vec(),
         };
-        mux.deliver_response(&req.stream_id, response);
+        mux.deliver_response(&req.stream_id, &agent_id, response);
 
         let result = handle.await.unwrap().unwrap();
         assert_eq!(result.status_code, 200);

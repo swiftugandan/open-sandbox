@@ -20,6 +20,10 @@ use crate::tunnel::{ForwardRequest, HttpClient, TunnelForwarder};
 pub struct ProxyConnection<R: ContainerRuntime, H: HttpClient> {
     agent_id: AgentId,
     forwarder: Arc<TunnelForwarder<R, H>>,
+    /// Optional bearer token presented to OpenTunnel. Comp-2 A1: the proxy's
+    /// public listener requires this in production so a network-reachable
+    /// attacker cannot register as an arbitrary agent_id and hijack routing.
+    tunnel_token: Option<String>,
 }
 
 /// Live IoStream sessions keyed by proxy-assigned stream_id. Holds
@@ -29,9 +33,18 @@ type IoSessions = Arc<Mutex<HashMap<String, mpsc::Sender<IoClientFrame>>>>;
 
 impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, H> {
     pub fn new(agent_id: AgentId, forwarder: Arc<TunnelForwarder<R, H>>) -> Self {
+        Self::with_token(agent_id, forwarder, None)
+    }
+
+    pub fn with_token(
+        agent_id: AgentId,
+        forwarder: Arc<TunnelForwarder<R, H>>,
+        tunnel_token: Option<String>,
+    ) -> Self {
         Self {
             agent_id,
             forwarder,
+            tunnel_token,
         }
     }
 
@@ -49,8 +62,20 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
         let (outbound_tx, outbound_rx) = mpsc::channel(32);
         let outbound_stream = ReceiverStream::new(outbound_rx);
 
+        let mut tunnel_request = tonic::Request::new(outbound_stream);
+        if let Some(token) = &self.tunnel_token {
+            let value = format!("Bearer {token}")
+                .parse()
+                .map_err(|e: tonic::metadata::errors::InvalidMetadataValue| {
+                    AgentError::Internal {
+                        detail: e.to_string(),
+                    }
+                })?;
+            tunnel_request.metadata_mut().insert("authorization", value);
+        }
+
         let response = client
-            .open_tunnel(outbound_stream)
+            .open_tunnel(tunnel_request)
             .await
             .map_err(|_| AgentError::TunnelDisconnected)?;
         let mut inbound = response.into_inner();
