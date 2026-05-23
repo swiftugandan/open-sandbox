@@ -207,106 +207,180 @@ cancels, the agent learns of the disconnect promptly and can act.
 **Verification:** standard tonic behavior, documented. No spike needed
 unless we see weird latency.
 
-## Open questions for the user
+## Decisions
 
-These shape the work and need a decision before code is written:
+Six design questions, decided 2026-05-23. Structural purity is the
+guide. Two of these revise earlier pragmatic leans — flagged where
+relevant.
 
-1. **Multiplex protocol: extend `proxy.proto` or new `sandbox_io.proto`?**
+### D1. Multiplex protocol home: extend `proxy.proto`
 
-   Extending `proxy.proto` reuses the existing message types
-   (`StreamClose`, `DataChunk`) and the agent's existing tunnel client.
-   But it conflates "HTTP forwarder" semantics into a thing that is no
-   longer HTTP-specific.
+Proto files in this repo follow *one file per hosting component*:
+`controller.proto` is what the controller speaks, `proxy.proto` is what
+the proxy speaks, `api.proto` is what the gateway speaks. The proxy is
+still the proxy — it is just growing more verbs. A new
+`sandbox_io.proto` would imply a second channel exists when
+structurally there is one (the agent's reverse tunnel, gaining frame
+types).
 
-   New `sandbox_io.proto` is honest about the new role. Requires a new
-   service definition, new agent client. Cost is one new file plus the
-   agent learning two clients.
+The *service name* inside `proxy.proto` is broadened to reflect the
+generalised role (e.g. `TunnelService` → `SandboxIoService` or
+equivalent if the existing service name is HTTP-specific). The file
+stays put.
 
-   **Lean:** new file. Honest naming matters and the new file is small.
+### D2. Gateway ↔ proxy connection: held-open multiplex
 
-2. **API gateway → proxy: held-open multiplex or one stream per session?**
+*Revising the earlier "one-per-session" lean — that was pragmatic, not
+pure.*
 
-   Held-open avoids per-request handshake cost; adds liveness/reconnect
-   logic in the gateway.
+The agent ↔ proxy connection is already held-open and multiplexed.
+The gateway ↔ controller connection is already held-open. The
+gateway ↔ proxy connection mirrors that shape — one (or a small pool
+of) long-lived bidi gRPC connections, each incoming I/O request opens
+a new stream on the existing multiplex. The gateway is a long-lived
+service; its backend connections should be too.
 
-   One-per-session is simpler; pays a connection setup per exec.
+The "reconnect logic cost" raised earlier is a non-cost — the gateway
+already implements that for its controller connection. It is a tonic
+primitive.
 
-   **Lean:** one-per-session for v0.8.0. Optimize later if a benchmark
-   shows the per-call cost matters.
+This preserves the streaming-over-stream invariant end-to-end: caller
+WebSocket frame → gateway-internal stream → proxy multiplex stream →
+agent reverse-tunnel stream → runtime. No impedance jumps in the
+middle.
 
-3. **Stream-to-HTTP surface: SSE, chunked transfer, or HTTP/2 trailers?**
+### D3. Public streaming surface: WebSocket
 
-   SSE: one-way, line-based, easy in browsers, awkward for binary.
-   Chunked: universal, works with curl, but you have to invent a frame
-   format to distinguish stdout / stderr / exit / signal.
-   HTTP/2 trailers: nice for exit_code at the end, but client support
-   is patchy and many HTTP libraries don't expose them.
+*Revising the earlier "chunked transfer with custom framing" lean — it
+was inventing a sub-protocol when a standard one exists.*
 
-   **Lean:** chunked transfer with a length-delimited frame format.
-   First byte is frame type (`stdout`, `stderr`, `exit`, `signal`),
-   next four bytes are length, then payload. Same machinery later
-   serves `fetch_logs`.
+The honest shape of streaming exec is bidirectional framed messaging:
+stdin and signal frames flow caller→server while stdout/stderr/exit
+frames flow server→caller, concurrently. Candidates evaluated:
 
-4. **Signals: in-band frame or side channel?**
+| Option | Outcome |
+| ------ | ------- |
+| SSE | One-way, eliminated |
+| Chunked + custom frame format | Technically works but requires concurrent request-write + response-read on one HTTP exchange (poor client support); forces an invented frame format |
+| gRPC + grpc-web | Most honest about underlying shape but splits the public API into REST + gRPC surfaces — two mental models for the same product |
+| **WebSocket** | **Chosen** |
 
-   In-band: one stream per exec, `Signal` frames go in the same stream
-   as `Stdin`. Structurally cleanest.
+WebSocket is HTTP-native (upgrade from `GET`), bidi by construction,
+frames have opcodes built in (we use binary frames with a 1-byte
+type prefix: stdin/stdout/stderr/signal/exit), universally supported
+(curl, browsers, every language), and connection close = stream close
+gives clean disconnect semantics matching the spike-01/02 cleanup
+path.
 
-   Side channel: separate control stream alongside the I/O stream.
-   Avoids any "did the stdin queue block the signal" question.
+Lifecycle endpoints (`POST /v1/sandboxes`, `GET`, `DELETE`,
+`GET /v1/sandboxes/{id}`) stay REST because they are unary
+RPC-shaped. Two surfaces because two different shapes — which is
+honest. The I/O endpoints become:
 
-   **Lean:** in-band, but signal frames go on the *control* sub-queue
-   not the stdin queue. One stream, two logical queues, no blocking
-   concern.
+- `GET /v1/sandboxes/{id}/exec` with `Upgrade: websocket`
+- `GET /v1/sandboxes/{id}/files/read?path=…` with `Upgrade: websocket`
+  (or remain REST since reads are unary-ish — TBD during impl, but
+  WebSocket is the default choice for any I/O endpoint)
+- `POST /v1/sandboxes/{id}/files/write_file` — stays REST (unary)
+- `POST /v1/sandboxes/{id}/files/write_files` — stays REST (unary)
 
-5. **Is "Session" a primitive, or is exec the session?**
+axum has first-class WebSocket support so no new dependency is needed.
 
-   I do not want to add a `Session` abstraction (env + cwd carried
-   between calls). The right shape is: one long-lived streaming exec
-   of the caller's chosen shell. Anything you would put in a session,
-   you put in the shell. Confirm this before baking in.
+### D4. Signals: in-band on the same stream
 
-   **Lean:** no Session primitive. Exec is the session.
+A session IS a stream. Splitting signals onto a side channel would
+break the invariant "one stream = one session, one close terminates
+it" and create ambiguous teardown semantics.
 
-6. **Backward compatibility policy.**
+The structural worry that motivated a side-channel option ("stdin can
+backpressure-block; signals would queue behind it") assumed signals
+share a queue with stdin. They do not have to. Stdin is one
+application-level frame type; signals are another. The receiver
+dispatches by frame type on arrival; the sender writes signals
+directly without waiting on the stdin queue. Same stream, distinct
+dispatch paths.
 
-   This is the largest contract amendment the project has seen. Every
-   prior amendment has been a breaking minor or major. The current
-   contracts version is `v0.7.0`. The change here removes the
-   message-shaped exec entirely — that is a major-version reshape.
+### D5. No `Session` primitive — exec IS the session
 
-   **Lean:** `v1.0.0`. Has the project deliberately held v1.0.0 back,
-   or is it just that no amendment has been big enough to claim it?
+A long-lived streaming exec of the user's chosen shell IS the
+stateful workspace. The shell process holds env, cwd, history,
+aliases, functions. That is what shells exist for.
+
+Adding a platform-level `Session` resource would mean:
+
+- A new resource type (CRUD, lifecycle, expiry)
+- Platform-side state to persist (where? controller? agent? for how
+  long?)
+- An arbitrary boundary on what the session contains (env? cwd?
+  umask? exported functions? shell history?)
+- A reinvention of the Unix shell concept at the API layer
+
+None of that exists if a session is just a WebSocket exec of the
+caller's chosen shell. The shell does all the work; the platform does
+none. When the WebSocket closes, the shell exits, state evaporates.
+Lifecycle is naturally connection-bound, which the spike results made
+desirable anyway.
+
+For one-shot commands: short streaming exec per command, no shell
+needed. Same primitive serves both patterns.
+
+### D6. Version: v1.0.0
+
+After the streaming-exec amendment, no remaining structural reshape
+is on the horizon. Every other known item (M3 inspect endpoint, L3
+public URL, future log streaming, TCP exposure) is additive on top of
+the right shape, not a reshape of it. Multi-tenancy and TCP exposure
+(NG-6, NG-2) remain non-goals; if they later require ID-scoping or
+data-plane reshape, v2.0 is the honest move at that time.
+
+Staying at v0.8 would sandbag — it implies more major breakage is
+coming when our actual posture after streaming exec is "additive
+evolution from here." v1.0 forces the discipline of additive-only
+afterward, which is a feature, not a constraint.
+
+v1.0 also forces a few productive side-effects:
+
+- SPEC.md open-questions section must be resolved or moved to
+  non-goals
+- The API gets a formal stability statement
+- SDKs can publish with confidence
+
+This will be the project's first v1.0.0.
 
 ## Implementation scope (rough)
 
 Not for sign-off here — for cost honesty. This is approximately 3–5×
 the v0.7.0 amendment.
 
-- **Proto:** new `sandbox_io.proto` (or extended `proxy.proto`) with
-  stream-typed exec/file verbs. Wire format for the data-plane frames.
+- **Proto:** extend `proxy.proto` (D1) with stream-typed exec/file
+  verbs. Broaden the service name if currently HTTP-specific. Define
+  the application-level frame envelope shared by exec and (future) log
+  streaming: `kind` (stdin/stdout/stderr/signal/exit), payload bytes.
 - **Agent:** `ContainerRuntime` trait reshape from
-  `exec(options) -> output` to `exec(streams) -> streams`. Both
-  backends (docker, youki) implement streaming exec. Both backends
-  implement first-class WriteFile / ReadFile (no shell helpers).
-- **Proxy:** gains an "originate session" path. The API gateway opens
-  a stream to the proxy; the proxy multiplexes it into the agent's
-  reverse tunnel; the agent dispatches to its runtime.
-- **API gateway:** new client connection to the proxy. New
-  streaming HTTP endpoints (`/exec`, `/files/write_file`,
-  `/files/read`) that surface the multiplex as chunked-transfer
-  framed responses.
+  `exec(options) -> output` to `exec(streams) -> streams`, plus the
+  new `kill_exec(container, pid, grace)` method that both backends
+  implement. New `ExecRegistry<StreamId, ExecRecord>` (HashMap +
+  async cancellation hook) wired to stream close — per spike 01/02,
+  required for both runtimes. Both backends implement first-class
+  `WriteFile` / `ReadFile` (no shell helpers — H4 fix).
+- **Proxy:** gains an "originate session" path. Existing reverse
+  tunnel to the agent remains; the proxy now accepts gateway-side
+  streams and multiplexes them into the agent's tunnel by sandbox id.
+- **API gateway:** new held-open gRPC connection(s) to the proxy
+  (D2). New WebSocket endpoints (D3) for streaming I/O:
+  `GET /v1/sandboxes/{id}/exec` (Upgrade: websocket) and similar.
+  REST endpoints retained for lifecycle and unary writes.
 - **Controller:** delete the exec broker entirely. Delete the
   `EXEC_TIMEOUT` constant. Delete `ExecCommand`/`ExecResult` from the
-  agent stream proto. Controller shrinks.
+  agent stream proto. Controller shrinks; NFR-PERF-2 improves.
 - **Tests:** unit tests do not cover stream lifetime semantics well.
   Live e2e is the only meaningful verification — needs scripted
-  cancellation, slow-client backpressure, signal-injection, and
-  disconnect-kills-process scenarios.
+  cancellation, slow-client backpressure, signal injection, and
+  disconnect-kills-process scenarios across both runtimes.
 
-Per the protocol: this will live on `contracts/amendment-exec-streaming`
-with a `v1.0.0-frozen` tag on contract freeze, then per-module loops
-for proxy, agent, controller, api, and CLI consumers.
+Per the protocol: this lives on `contracts/amendment-exec-streaming`
+with a `v1.0.0-frozen` tag on contract freeze (D6), then per-module
+loops for proxy, agent, controller, api, and CLI consumers.
 
 ## Consolidated friction snapshot (rounds 2–3)
 
