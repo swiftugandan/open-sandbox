@@ -43,6 +43,21 @@ use crate::exec_registry::{ExecRecord, ExecRegistry, on_stream_closed};
 /// of magnitude as bollard's typical chunk and the WS framing budget.
 const READ_FILE_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Hard cap on the total bytes a client may upload via a single
+/// write_file / write_files_targz session. Comp-3 B5: without this, a
+/// hostile / buggy client streaming a multi-gigabyte tarball OOMs the
+/// agent process and tears down every sandbox on the host.
+const MAX_WRITE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Valid POSIX signal range (1..=31 standard + 34..=64 real-time).
+/// Comp-3 A6: clients send `signum: u32` over the IoSignal frame; we
+/// gate the value before forwarding to the runtime so neither shell
+/// interpolation quirks nor `kill -0` liveness probes leak through as
+/// "kill the process" semantics.
+fn is_valid_signum(signum: u32) -> bool {
+    (1..=31).contains(&signum) || (34..=64).contains(&signum)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_io_session<R, S>(
     runtime: Arc<R>,
@@ -270,6 +285,19 @@ async fn pump_exec_session<R, S>(
         tokio::select! {
             info = &mut exited_pinned => break Some(info),
             Some(sig) = signal_rx.recv() => {
+                // Comp-3 A6: validate signum range BEFORE forwarding to the
+                // runtime. `as i32` would wrap large u32s to negative; both
+                // backends shell-interpolate the integer into kill(1), so a
+                // bogus value either gets rejected with confusing errors or
+                // (e.g. signum=0) becomes a no-op liveness probe.
+                if !is_valid_signum(sig.signum) {
+                    warn!(
+                        stream_id = %stream_id,
+                        signum = sig.signum,
+                        "rejecting out-of-range signum; dropping signal"
+                    );
+                    continue;
+                }
                 if let Err(e) = runtime
                     .signal_exec(&container_id, in_container_pid, sig.signum as i32)
                     .await
@@ -295,7 +323,7 @@ async fn pump_exec_session<R, S>(
     // terminated, no more client frames are meaningful.
     demux_handle.abort();
 
-    let terminal_frame = match exit_outcome {
+    let (terminal_frame, needs_kill) = match exit_outcome {
         Some(Ok(info)) => {
             // Drain output pumps before emitting Exited so any
             // buffered stdout/stderr bytes reach the client first.
@@ -309,39 +337,67 @@ async fn pump_exec_session<R, S>(
                 command_not_found = info.command_not_found,
                 "exec_registry.exec_exited"
             );
-            IoServerFrame {
-                stream_id: stream_id.clone(),
-                payload: Some(io_server_frame::Payload::Exited(IoExited {
-                    exit_code: info.exit_code,
-                    command_not_found: info.command_not_found,
-                })),
-            }
+            (
+                Some(IoServerFrame {
+                    stream_id: stream_id.clone(),
+                    payload: Some(io_server_frame::Payload::Exited(IoExited {
+                        exit_code: info.exit_code,
+                        command_not_found: info.command_not_found,
+                    })),
+                }),
+                // Comp-3 A2: process exited naturally; no signal needed and
+                // skipping cleanup avoids EXEC_KILL_GRACE-second wasted sleep
+                // before the inevitable-no-op SIGKILL.
+                false,
+            )
         }
         Some(Err(_)) => {
             // Runtime dropped the sender without sending — treat as
             // an internal runtime error.
             stdout_handle.abort();
             stderr_handle.abort();
-            IoServerFrame {
-                stream_id: stream_id.clone(),
-                payload: Some(io_server_frame::Payload::Error(IoErrorMsg {
-                    code: "RUNTIME_ERROR".into(),
-                    detail: "runtime exited without sending exit info".into(),
-                })),
-            }
+            (
+                Some(IoServerFrame {
+                    stream_id: stream_id.clone(),
+                    payload: Some(io_server_frame::Payload::Error(IoErrorMsg {
+                        code: "RUNTIME_ERROR".into(),
+                        detail: "runtime exited without sending exit info".into(),
+                    })),
+                }),
+                // Runtime is in an unknown state; SIGTERM/SIGKILL the PID to
+                // be safe.
+                true,
+            )
         }
         None => {
-            // Close from client. Emit nothing; the cleanup hook will
-            // SIGTERM/SIGKILL the in-container PID.
-            cleanup(&*runtime, &registry, &stream_id).await;
+            // Comp-3 C6: client requested end-of-session. Emit a terminal
+            // frame so the gateway doesn't see "stream ended without
+            // terminal frame" and synthesize a 500. The agent then
+            // SIGTERM/SIGKILLs the in-container PID via the cleanup hook.
             stdout_handle.abort();
             stderr_handle.abort();
-            return;
+            (
+                Some(IoServerFrame {
+                    stream_id: stream_id.clone(),
+                    payload: Some(io_server_frame::Payload::Error(IoErrorMsg {
+                        code: "CANCELLED".into(),
+                        detail: "client-initiated close".into(),
+                    })),
+                }),
+                true,
+            )
         }
     };
 
-    let _ = server_tx.send(terminal_frame).await;
-    cleanup(&*runtime, &registry, &stream_id).await;
+    if let Some(frame) = terminal_frame {
+        let _ = server_tx.send(frame).await;
+    }
+    if needs_kill {
+        cleanup(&*runtime, &registry, &stream_id).await;
+    } else {
+        // Natural exit: drop the registry entry without sending signals.
+        registry.remove(&stream_id);
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -523,6 +579,7 @@ async fn drive_write_file<R, S>(
     );
 
     // Collect stdin chunks until Close{stdin_eof}, EOF, or non-Stdin frame.
+    // Comp-3 B5: cap at MAX_WRITE_BYTES so a client can't OOM the agent.
     let mut content: Vec<u8> = Vec::new();
     while let Some(frame) = client_frames.next().await {
         let Ok(IoClientFrame {
@@ -532,7 +589,21 @@ async fn drive_write_file<R, S>(
             break;
         };
         match p {
-            io_client_frame::Payload::Stdin(bytes) => content.extend_from_slice(&bytes),
+            io_client_frame::Payload::Stdin(bytes) => {
+                if content.len().saturating_add(bytes.len()) > MAX_WRITE_BYTES {
+                    send_error(
+                        &server_tx,
+                        &stream_id,
+                        "PAYLOAD_TOO_LARGE",
+                        &format!(
+                            "write_file body exceeds {MAX_WRITE_BYTES}-byte cap"
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                content.extend_from_slice(&bytes);
+            }
             io_client_frame::Payload::Close(_) => break,
             io_client_frame::Payload::Signal(_) | io_client_frame::Payload::Start(_) => {
                 send_error(
@@ -596,7 +667,21 @@ async fn drive_write_files_targz<R, S>(
             break;
         };
         match p {
-            io_client_frame::Payload::Stdin(bytes) => tarball.extend_from_slice(&bytes),
+            io_client_frame::Payload::Stdin(bytes) => {
+                if tarball.len().saturating_add(bytes.len()) > MAX_WRITE_BYTES {
+                    send_error(
+                        &server_tx,
+                        &stream_id,
+                        "PAYLOAD_TOO_LARGE",
+                        &format!(
+                            "write_files_targz body exceeds {MAX_WRITE_BYTES}-byte cap"
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                tarball.extend_from_slice(&bytes);
+            }
             io_client_frame::Payload::Close(_) => break,
             io_client_frame::Payload::Signal(_) | io_client_frame::Payload::Start(_) => {
                 send_error(

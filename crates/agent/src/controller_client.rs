@@ -120,47 +120,60 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
 
             match payload {
                 controller_command::Payload::HeartbeatAck(_) => {}
+                // Comp-3 A5: spawn start/stop dispatch into separate tasks
+                // so a slow image pull or graceful shutdown can't head-of-line
+                // block unrelated commands (the inbound loop must keep
+                // pumping heartbeat acks and other tenants' lifecycle
+                // commands without waiting for an in-flight stop).
                 controller_command::Payload::StartSandbox(start) => {
                     let sandbox_id_str = start.sandbox_id.clone();
                     info!(sandbox_id = %sandbox_id_str, "received start command");
-                    let state = sandbox_manager.start_sandbox(start).await;
-                    let (state_val, error_msg) = match state {
-                        Ok(s) => (s as i32, String::new()),
-                        Err(e) => (
-                            open_sandbox_contracts::controller::SandboxState::Failed as i32,
-                            e.to_string(),
-                        ),
-                    };
-                    let status = AgentMessage {
-                        payload: Some(agent_message::Payload::SandboxStatus(SandboxStatus {
-                            sandbox_id: sandbox_id_str.clone(),
-                            state: state_val,
-                            error_message: error_msg,
-                        })),
-                    };
-                    let _ = status_tx.send(status).await;
-                    info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
+                    let sandbox_manager = sandbox_manager.clone();
+                    let status_tx = status_tx.clone();
+                    tokio::spawn(async move {
+                        let state = sandbox_manager.start_sandbox(start).await;
+                        let (state_val, error_msg) = match state {
+                            Ok(s) => (s as i32, String::new()),
+                            Err(e) => (
+                                open_sandbox_contracts::controller::SandboxState::Failed as i32,
+                                e.to_string(),
+                            ),
+                        };
+                        let status = AgentMessage {
+                            payload: Some(agent_message::Payload::SandboxStatus(SandboxStatus {
+                                sandbox_id: sandbox_id_str.clone(),
+                                state: state_val,
+                                error_message: error_msg,
+                            })),
+                        };
+                        let _ = status_tx.send(status).await;
+                        info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
+                    });
                 }
                 controller_command::Payload::StopSandbox(stop) => {
                     let sandbox_id_str = stop.sandbox_id.clone();
                     info!(sandbox_id = %sandbox_id_str, "received stop command");
-                    let state = sandbox_manager.stop_sandbox(stop).await;
-                    let (state_val, error_msg) = match state {
-                        Ok(s) => (s as i32, String::new()),
-                        Err(e) => (
-                            open_sandbox_contracts::controller::SandboxState::Failed as i32,
-                            e.to_string(),
-                        ),
-                    };
-                    let status = AgentMessage {
-                        payload: Some(agent_message::Payload::SandboxStatus(SandboxStatus {
-                            sandbox_id: sandbox_id_str.clone(),
-                            state: state_val,
-                            error_message: error_msg,
-                        })),
-                    };
-                    let _ = status_tx.send(status).await;
-                    info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
+                    let sandbox_manager = sandbox_manager.clone();
+                    let status_tx = status_tx.clone();
+                    tokio::spawn(async move {
+                        let state = sandbox_manager.stop_sandbox(stop).await;
+                        let (state_val, error_msg) = match state {
+                            Ok(s) => (s as i32, String::new()),
+                            Err(e) => (
+                                open_sandbox_contracts::controller::SandboxState::Failed as i32,
+                                e.to_string(),
+                            ),
+                        };
+                        let status = AgentMessage {
+                            payload: Some(agent_message::Payload::SandboxStatus(SandboxStatus {
+                                sandbox_id: sandbox_id_str.clone(),
+                                state: state_val,
+                                error_message: error_msg,
+                            })),
+                        };
+                        let _ = status_tx.send(status).await;
+                        info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
+                    });
                 }
                 controller_command::Payload::RegisterResponse(_) => {}
                 // ExecCommand was removed from the controller stream in v1.0;

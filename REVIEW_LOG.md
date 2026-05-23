@@ -202,6 +202,44 @@ closed.
 
 ---
 
+## Component 3 — agent (core) (in-crate findings)
+
+14 distinct findings; 7 closed in `review/03-agent-core`, 7 deferred to
+`NEEDS_HUMAN_ATTENTION.md` (head-of-line multiplexing, spawn cleanup,
+ExecRegistry-stop wiring, keepalive direction choice, C2 cross-component to
+controller, C3 cross-component to api, defensive C5 dup-stream-id). The
+comp-1 cross-component CLI reconnect-loop follow-up closed here.
+
+### [comp-3 · critical] A1/B2/C1: Agent had no reconnect — **closed**
+
+- **Fix:** `cli/run.rs::run_agent` now wraps `ControllerConnection::run` and `ProxyConnection::run` in independent reconnect loops using the previously-unused `ExponentialBackoff`. Each loop runs forever; only a real `shutdown_signal()` triggers the sandbox-stop cleanup. The agent process stays alive across any number of controller/proxy blips, restoring the BYO-agents-dial-out promise that sandboxes outlive control-plane flaps.
+
+### [comp-3 · high] A5: Serial dispatch of StartSandbox blocked unrelated stops — **closed**
+
+- **Fix:** `controller_client.rs` now `tokio::spawn`s each StartSandbox/StopSandbox into its own task. A 90-second cold image pull on sandbox A can no longer head-of-line block an urgent StopSandbox on sandbox B.
+
+### [comp-3 · high] B5: write_file / write_files_targz unbounded body — **closed**
+
+- **Fix:** `MAX_WRITE_BYTES = 256 MiB`; oversize bodies emit `IoError(PAYLOAD_TOO_LARGE)` and abort the session. Previously a multi-gigabyte tarball would OOM the agent.
+
+### [comp-3 · high] A2: cleanup() ran SIGTERM/SIGKILL after natural exit — **closed**
+
+- **Fix:** Natural-exit path removes the registry entry directly and skips the signal sequence. Only client-initiated Close and unexpected runtime-drop paths still call `cleanup()`. Eliminates the EXEC_KILL_GRACE-second wasted delay and doubled runtime API load under churn.
+
+### [comp-3 · med] A6: signum forwarded with no validation — **closed**
+
+- **Fix:** `is_valid_signum()` checks POSIX 1..=31 + real-time 34..=64 before forwarding to the runtime. Closes wraparound (`u32 as i32`) and `kill -0` no-op vectors.
+
+### [comp-3 · med] C6: client-initiated Close emitted no terminal frame — **closed**
+
+- **Fix:** The close_rx branch now emits `IoError(CANCELLED)` before running cleanup. The api gateway no longer sees "stream ended without terminal frame" for successful user-cancels.
+
+### [comp-3 · DEFERRED] A3/B1, A4, B3, B6, C2, C3, C5
+
+- See `NEEDS_HUMAN_ATTENTION.md` for the seven deferred items — A3/B1 (HoL blocking, paired with comp-2 B2), A4 (spawn-handle abort), B3 (ExecRegistry-stop wiring), B6 (keepalive direction), C2 (controller-side state propagation), C3 (api-side string alias), C5 (defensive dup stream_id).
+
+---
+
 ## Cross-component findings
 
 ### [comp-1 · high] CLI agent runtime has no reconnect loop
