@@ -95,6 +95,55 @@ Format per entry: `## [comp-N · severity] short title` with `Source`, `File`, `
 
 ---
 
+## Component 1 — controller (in-crate findings)
+
+10 findings landed as fixes on `review/01-controller`; each entry below names the
+finding, the merged commit, and any deferred follow-up.
+
+### [comp-1 · critical] F1: Management gRPC has no authz / no pagination — **closed**
+
+- **Fix:** API-key interceptor on the management gRPC. `CONTROLLER_ADMIN_TOKEN` required at startup or the controller refuses to bind. Constant-time token compare. Server-side cap of 1000 on `ListSandboxes`.
+- **Deferred to `contracts/v1.0.2`:** per-sandbox ownership (multi-tenancy) — CLAUDE.md flags this as an open SPEC question. Proper pagination needs a `max_results` + continuation token field on `ListSandboxesRequest` (currently empty).
+
+### [comp-1 · critical] F2: SandboxStatus from non-owning agent overwrites state — **closed**
+
+- **Fix:** Heartbeat / SandboxStatus handlers in agent_stream now reject messages whose sandbox routing entry doesn't belong to the stream's `registered_agent_id`. Drop with `tracing::warn`, stream survives.
+
+### [comp-1 · critical] F3: Heartbeat handler ignored `hb.agent_id` mismatch — **closed**
+
+- **Fix:** Heartbeat branch verifies `hb.agent_id == registered_agent_id`; mismatch is dropped. Test `heartbeat_with_mismatched_agent_id_is_ignored` exercises a pre-registered peer B to expose the bug then assert no `record_heartbeat(B)` call lands.
+
+### [comp-1 · critical] F4: `pg_notify` never emitted — **closed**
+
+- **Fix:** Every routing-table mutation in `PgStore` now emits `pg_notify('routing_changed', payload)` inside the same transaction as the write. Payload schema: `{"op":"insert|remove","sandbox_id":"…","agent_id":"…"}`. Channel exported as `pg_store::ROUTING_CHANGED_CHANNEL`.
+- **Deferred to comp-2 (proxy):** wire the LISTEN side in `crates/proxy` so the cache is invalidated immediately rather than on the 60s periodic refresh.
+
+### [comp-1 · high] F5: Scheduler never debited capacity on assign — **closed**
+
+- **Fix:** New `ControllerStore::try_assign_sandbox` (atomic reserve + insert routing) and `release_sandbox` (atomic release + delete) trait methods. `PgStore` uses `SELECT … FOR UPDATE` to serialize concurrent assigns. Scheduler retries across candidates when one races out. Migration adds `cpu_millicores`, `memory_bytes` columns to the `sandboxes` table to persist reservations across restarts.
+
+### [comp-1 · high] F6: Heartbeat liveness was in-process only — **closed**
+
+- **Fix:** `record_heartbeat` and `dead_agents` are now store methods. `PgStore` writes `last_heartbeat_at TIMESTAMPTZ` on every heartbeat and queries by interval for dead-agent detection. Liveness survives controller restart and is visible across replicas. `HeartbeatMonitor` reduced to a thin async wrapper over the store.
+
+### [comp-1 · high] F7: `mark_agent_dead` was not atomic — **closed**
+
+- **Fix:** New `ControllerStore::mark_agent_dead_atomic` trait method. `PgStore` wraps the state update and routing-entry deletion in a single sqlx transaction. `FailNextStore` test helper simulates the txn aborting so the registry's atomicity contract is verified in unit tests.
+
+### [comp-1 · high] F8: `create_sandbox` orphaned routing entry on `send_command` failure — **closed**
+
+- **Fix:** `Controller::create_sandbox` calls `release_sandbox` (the F5-introduced atomic release) when `send_command` returns an error. A failed rollback is escalated via `tracing::error` but the original send error is surfaced to the caller.
+
+### [comp-1 · high] F9: `sweep_dead_agents` discarded `mark_agent_dead` errors — **closed**
+
+- **Fix:** Now matches on the error variant — `Ok` or `AgentNotFound` (idempotent) drives the in-memory cleanup; transient `Database` errors are logged and the in-memory state is preserved so the next sweep retries. After F6 the in-memory map is gone, but the retry semantics carry over via the PG `last_heartbeat_at` + `state='active'` filter.
+
+### [comp-1 · medium] F10: All `ControllerError` flattened to `Status::internal` — **closed**
+
+- **Fix:** New `controller_error_to_status` helper in `crates/controller/src/error_status.rs` maps per-variant (`InvalidToken→Unauthenticated`, `NoAvailableAgents→ResourceExhausted`, `AgentNotFound→FailedPrecondition`, `Database/Internal→Internal`). Required `#[non_exhaustive]` wildcard logs via `tracing::warn` so the comp-0 finding doesn't silently recur.
+
+---
+
 ## Cross-component findings
 
 ### [comp-1 · high] CLI agent runtime has no reconnect loop
