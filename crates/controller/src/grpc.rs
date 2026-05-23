@@ -13,7 +13,6 @@ use open_sandbox_contracts::controller::{
 use open_sandbox_contracts::error::ControllerError;
 use open_sandbox_contracts::types::{AgentId, JoinToken, SandboxId};
 
-use crate::exec_broker::ExecBroker;
 use crate::heartbeat::HeartbeatMonitor;
 use crate::registry::{AgentRegistry, RegistrationResult};
 use crate::scheduler::{SandboxAssignment, SandboxRequirements, Scheduler};
@@ -67,7 +66,6 @@ pub struct GrpcHandler<S: ControllerStore> {
     registry: Arc<AgentRegistry<S>>,
     heartbeat_monitor: Arc<HeartbeatMonitor>,
     connections: Arc<AgentConnections>,
-    exec_broker: Arc<ExecBroker>,
     store: Arc<S>,
 }
 
@@ -85,7 +83,6 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
         let registry = self.registry.clone();
         let heartbeat_monitor = self.heartbeat_monitor.clone();
         let connections = self.connections.clone();
-        let exec_broker = self.exec_broker.clone();
         let store = self.store.clone();
 
         tokio::spawn(async move {
@@ -170,10 +167,6 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                         }
                     }
 
-                    agent_message::Payload::ExecResult(result) => {
-                        let _ = exec_broker.deliver(result);
-                    }
-
                     agent_message::Payload::SandboxStatus(status) => {
                         if let Some(ref agent_id) = registered_agent_id {
                             let sandbox_id = uuid::Uuid::parse_str(&status.sandbox_id)
@@ -213,7 +206,6 @@ pub struct Controller<S: ControllerStore> {
     pub(crate) heartbeat_monitor: Arc<HeartbeatMonitor>,
     pub(crate) scheduler: Arc<Scheduler<S>>,
     pub(crate) connections: Arc<AgentConnections>,
-    pub(crate) exec_broker: Arc<ExecBroker>,
 }
 
 impl<S: ControllerStore + 'static> Controller<S> {
@@ -222,18 +214,12 @@ impl<S: ControllerStore + 'static> Controller<S> {
         let heartbeat_monitor = Arc::new(HeartbeatMonitor::new());
         let scheduler = Arc::new(Scheduler::new(store));
         let connections = Arc::new(AgentConnections::new());
-        let exec_broker = Arc::new(ExecBroker::new());
         Self {
             registry,
             heartbeat_monitor,
             scheduler,
             connections,
-            exec_broker,
         }
-    }
-
-    pub fn exec_broker(&self) -> Arc<ExecBroker> {
-        self.exec_broker.clone()
     }
 
     pub fn grpc_service(&self) -> ControllerServiceServer<GrpcHandler<S>> {
@@ -241,7 +227,6 @@ impl<S: ControllerStore + 'static> Controller<S> {
             registry: self.registry.clone(),
             heartbeat_monitor: self.heartbeat_monitor.clone(),
             connections: self.connections.clone(),
-            exec_broker: self.exec_broker.clone(),
             store: self.scheduler.store_arc(),
         })
     }

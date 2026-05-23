@@ -82,15 +82,28 @@ pub struct AgentArgs {
 
 #[derive(Parser, Debug, Clone)]
 pub struct ApiArgs {
-    /// HTTP listen port for the REST API
+    /// HTTP listen port for the REST + WebSocket API
     #[arg(long, default_value_t = open_sandbox_contracts::constants::API_DEFAULT_PORT, env = "OPEN_SANDBOX_API_PORT")]
     pub port: u16,
 
-    /// Controller gRPC address
+    /// Controller gRPC address (lifecycle RPCs)
     #[arg(
         long,
         default_value = "http://127.0.0.1:50051",
         env = "OPEN_SANDBOX_CONTROLLER_URL"
     )]
     pub controller_url: String,
+
+    /// Proxy gRPC address (streaming I/O via OpenIoStream)
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:50052",
+        env = "OPEN_SANDBOX_PROXY_URL"
+    )]
+    pub proxy_url: String,
+
+    /// Bearer API key callers must present to the gateway.
+    /// In production, set via env. Test default included for dev only.
+    #[arg(long, env = "OPEN_SANDBOX_API_KEY")]
+    pub api_key: String,
 }

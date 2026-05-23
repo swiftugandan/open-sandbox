@@ -4,31 +4,23 @@ use tonic::{Request, Response, Status};
 
 use open_sandbox_contracts::api::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxRequest, ExecSandboxResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
     sandbox_management_service_server::{SandboxManagementService, SandboxManagementServiceServer},
 };
-use open_sandbox_contracts::controller::{
-    ControllerCommand, ExecCommand, StopSandbox, controller_command,
-};
+use open_sandbox_contracts::controller::{ControllerCommand, StopSandbox, controller_command};
 use open_sandbox_contracts::types::SandboxId;
 
-use crate::exec_broker::ExecBroker;
 use crate::grpc::{Controller, CreateSandboxRequest as InternalCreateRequest};
 use crate::scheduler::SandboxRequirements;
 use crate::store::ControllerStore;
 
 pub struct ManagementHandler<S: ControllerStore> {
     controller: Arc<Controller<S>>,
-    exec_broker: Arc<ExecBroker>,
 }
 
 impl<S: ControllerStore + 'static> ManagementHandler<S> {
-    pub fn new(controller: Arc<Controller<S>>, exec_broker: Arc<ExecBroker>) -> Self {
-        Self {
-            controller,
-            exec_broker,
-        }
+    pub fn new(controller: Arc<Controller<S>>) -> Self {
+        Self { controller }
     }
 }
 
@@ -154,62 +146,6 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
-    async fn exec_sandbox(
-        &self,
-        request: Request<ExecSandboxRequest>,
-    ) -> Result<Response<ExecSandboxResponse>, Status> {
-        let req = request.into_inner();
-        let sandbox_id = parse_id(&req.sandbox_id)?;
-
-        let entry = self
-            .controller
-            .find_routing_entry(&sandbox_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let entry = entry.ok_or_else(|| Status::not_found(req.sandbox_id.clone()))?;
-
-        let exec_id = uuid::Uuid::new_v4().to_string();
-        let rx = self.exec_broker.register(exec_id.clone());
-
-        let command = ControllerCommand {
-            payload: Some(controller_command::Payload::Exec(ExecCommand {
-                sandbox_id: sandbox_id.to_string(),
-                command: req.command,
-                exec_id: exec_id.clone(),
-                stdin: req.stdin,
-                cwd: req.cwd,
-            })),
-        };
-        self.controller
-            .connections
-            .send_command(&entry.agent_id, command)
-            .await
-            .map_err(|e| {
-                self.exec_broker.cancel(&exec_id);
-                Status::internal(e.to_string())
-            })?;
-
-        let result = tokio::time::timeout(open_sandbox_contracts::constants::EXEC_TIMEOUT, rx)
-            .await
-            .map_err(|_| {
-                self.exec_broker.cancel(&exec_id);
-                Status::deadline_exceeded("exec timeout")
-            })?
-            .map_err(|_| Status::internal("exec result channel closed"))?;
-
-        if !result.error.is_empty() {
-            return Err(Status::internal(result.error));
-        }
-
-        Ok(Response::new(ExecSandboxResponse {
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            command_not_found: result.command_not_found,
-        }))
-    }
-
     async fn list_sandboxes(
         &self,
         _request: Request<ListSandboxesRequest>,
@@ -249,7 +185,6 @@ fn parse_id(id: &str) -> Result<SandboxId, Status> {
 
 pub fn management_service<S: ControllerStore + 'static>(
     controller: Arc<Controller<S>>,
-    exec_broker: Arc<ExecBroker>,
 ) -> SandboxManagementServiceServer<ManagementHandler<S>> {
-    SandboxManagementServiceServer::new(ManagementHandler::new(controller, exec_broker))
+    SandboxManagementServiceServer::new(ManagementHandler::new(controller))
 }

@@ -15,14 +15,17 @@ use open_sandbox_agent::sandbox::SandboxManager;
 use open_sandbox_agent::tunnel::TunnelForwarder;
 
 use open_sandbox_api::grpc_service::GrpcSandboxService;
+use open_sandbox_api::proxy_client::{DEFAULT_POOL_SIZE, ProxyClientPool};
 use open_sandbox_api::router::build_router;
+use open_sandbox_api::state::ApiState;
 use open_sandbox_controller::grpc::Controller;
 use open_sandbox_controller::management::management_service;
 use open_sandbox_controller::pg_store::PgStore;
 use open_sandbox_controller::token::TokenValidator;
 
-use open_sandbox_proxy::grpc::tunnel_service;
+use open_sandbox_proxy::grpc::sandbox_io_service;
 use open_sandbox_proxy::http_server::HttpServer;
+use open_sandbox_proxy::io_sessions::IoSessions;
 use open_sandbox_proxy::pg_store::PgRoutingStore;
 use open_sandbox_proxy::router::Router;
 use open_sandbox_proxy::routing_cache::RoutingCache;
@@ -61,7 +64,7 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
 
     let controller = Arc::new(Controller::new(pg_store, validator));
     let agent_service = controller.grpc_service();
-    let mgmt_service = management_service(controller.clone(), controller.exec_broker());
+    let mgmt_service = management_service(controller.clone());
 
     let addr = format!("0.0.0.0:{}", args.grpc_port);
     let listener = TcpListener::bind(&addr).await?;
@@ -118,9 +121,24 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
 
     let tunnel_pool = Arc::new(TunnelPool::new());
     let mux = Arc::new(StreamMux::new(tunnel_pool.clone()));
+    let sessions = Arc::new(IoSessions::new());
     let router = Arc::new(Router::new(cache.clone(), mux.clone()));
 
-    let grpc_service = tunnel_service(mux, tunnel_pool);
+    // Optional internal authn token for OpenIoStream (gateway-side).
+    // None disables verification — only safe when the proxy is
+    // network-isolated from public traffic (default deployment).
+    let internal_token = std::env::var(
+        open_sandbox_contracts::constants::INTERNAL_TOKEN_ENV,
+    )
+    .ok();
+
+    let grpc_service = sandbox_io_service(
+        mux,
+        tunnel_pool,
+        sessions,
+        cache.clone(),
+        internal_token,
+    );
 
     let grpc_addr = format!("0.0.0.0:{}", args.grpc_port);
     let grpc_listener = TcpListener::bind(&grpc_addr).await?;
@@ -245,12 +263,36 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
 }
 
 pub async fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
-    info!(controller = %args.controller_url, "api gateway starting");
-    let service = GrpcSandboxService::connect(&args.controller_url)
-        .await
-        .map_err(|e| format!("failed to connect to controller: {e}"))?;
+    info!(
+        controller = %args.controller_url,
+        proxy = %args.proxy_url,
+        "api gateway starting"
+    );
 
-    let router = build_router(Arc::new(service));
+    let lifecycle = Arc::new(
+        GrpcSandboxService::connect(&args.controller_url)
+            .await
+            .map_err(|e| format!("failed to connect to controller: {e}"))?,
+    );
+
+    let internal_token = std::env::var(
+        open_sandbox_contracts::constants::INTERNAL_TOKEN_ENV,
+    )
+    .ok();
+
+    let proxy = Arc::new(
+        ProxyClientPool::connect(&args.proxy_url, DEFAULT_POOL_SIZE, internal_token)
+            .await
+            .map_err(|e| format!("failed to connect to proxy: {e}"))?,
+    );
+
+    let state = Arc::new(ApiState {
+        lifecycle,
+        proxy,
+        api_key: args.api_key,
+    });
+
+    let router = build_router(state);
     let addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&addr).await?;
     info!(addr = %addr, "api gateway ready");
