@@ -202,6 +202,22 @@ This needs an SPEC amendment and live testing on the Linux dev env. Block on you
 - **Summary:** write_file sends the entire upload as one `IoClientFrame::Stdin(bytes)` proto message. tonic's default 4 MiB codec cap fails uploads larger than that with a cryptic ResourceExhausted. Same applies to write_files (gzip tarballs >4 MiB).
 - **Recommended next step:** chunk the Stdin pushes at 64 KiB (matching the read-side chunking). ~25 LOC. Could also raise codec limits on both sides as a less-clean workaround. Tell me which.
 
+## [comp-7 · decision] ws-client read-timeout / stale-connection detection
+
+- **Blocker class:** `decision`
+- **Source:** comp-7 review
+- **File:** `crates/ws-client/src/lib.rs:208` (`ExecSession::next_frame`)
+- **Summary:** the client never times out a `next_frame().await`. Server-initiated pings keep the connection alive when the server is healthy, but a middle-box silent drop (NAT/LB idle timeout with no FIN/RST) parks the client indefinitely.
+- **Recommended next step:** decide between (a) client sends its own keepalive every 15s + tracks last-server-frame timestamp, declares dead after 60s; (b) configurable per-session `read_timeout` and let the caller drive a watchdog. Tell me which and I'll ship.
+
+## [comp-7 · decision] ws-client frame size limits
+
+- **Blocker class:** `decision`
+- **Source:** comp-7 review
+- **File:** `crates/ws-client/src/lib.rs:141` (`connect_async`)
+- **Summary:** tokio-tungstenite defaults to max_message_size=64 MiB, max_frame_size=16 MiB; the api side has no coordinated cap. A single stdout chunk >16 MiB silently closes the client.
+- **Recommended next step:** decide the contracted per-frame upper bound (recommend 1 MiB matching typical WS gateway defaults), document in the contracts crate, and set the same on both sides. I can ship once you decide.
+
 ## [comp-9 · decision] Production deployment story (TLS, secrets, backups, observability)
 
 - **Blocker class:** `decision`

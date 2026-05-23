@@ -71,7 +71,7 @@ Each row gets ticked as it merges. Update this table as components land.
 | 4 | agent-docker | fixes-landed; awaiting merge | `review/04-agent-docker` | 5 closed (PID fail-loud, read cap, create rollback, stdin error, tmp cleanup); 3 deferred in NEEDS_HUMAN_ATTENTION. |
 | 5 | agent-youki | audit-only; all deferred | `review/05-agent-youki` | macOS can't compile (procfs Linux-only). All 8 findings logged to NEEDS_HUMAN_ATTENTION; biggest is OCI hardening (caps/seccomp/userns/readonly_rootfs) which needs SPEC decisions. |
 | 6 | api | fixes-landed; awaiting merge | `review/06-api` | 3 closed (const-time auth, SANDBOX_NOT_FOUND alias, path boundary); 5 deferred. |
-| 7 | ws-client | not started | — | |
+| 7 | ws-client | fixes-landed; awaiting merge | `review/07-ws-client` | 3 closed (TLS feature, Ctrl-C → SIGINT, exit codes); 3 deferred. |
 | 8 | cli | not started | — | |
 | 9 | infra | not started | — | |
 
