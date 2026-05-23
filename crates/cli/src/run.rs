@@ -129,6 +129,10 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
             }
         }
     }
+    // Hold a second store handle for the LISTEN subscriber below. The
+    // PgListener needs its own dedicated connection (LISTEN occupies the
+    // session) but borrows from the same pool.
+    let listener_store = PgRoutingStore::new(pg_pool.clone());
     let routing_store = PgRoutingStore::new(pg_pool);
     let cache = Arc::new(RoutingCache::new(routing_store));
 
@@ -232,6 +236,54 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
             if let Err(e) = cache_refresh.refresh().await {
                 warn!(error = %e, "routing cache refresh failed");
             }
+        }
+    });
+
+    // Comp-2 A6/B3/C1: LISTEN on routing_changed and invalidate cache
+    // entries in real time. The 30s periodic refresh stays as a fallback
+    // for when the LISTEN connection drops or notifications are lost.
+    let cache_for_listener = cache.clone();
+    tokio::spawn(async move {
+        use open_sandbox_proxy::pg_store::RoutingChange;
+        loop {
+            let mut listener = match listener_store.routing_changed_listener().await {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!(error = %e, "routing_changed listener connect failed; will retry");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            info!("subscribed to routing_changed notifications");
+            loop {
+                match listener.recv().await {
+                    Ok(notification) => {
+                        let payload = notification.payload();
+                        match RoutingChange::parse(payload) {
+                            Some(RoutingChange::Insert {
+                                sandbox_id,
+                                agent_id,
+                            }) => {
+                                // Refresh the entry with the new (sandbox_id, agent_id)
+                                // pairing — handles both freshly-inserted routes and
+                                // agent reassignment.
+                                cache_for_listener.insert(sandbox_id, agent_id);
+                            }
+                            Some(RoutingChange::Remove { sandbox_id }) => {
+                                cache_for_listener.remove_by_sandbox_id(&sandbox_id);
+                            }
+                            None => {
+                                warn!(payload = %payload, "unrecognized routing_changed payload");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "routing_changed recv failed; reconnecting");
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 

@@ -92,6 +92,20 @@ impl<S: RoutingStore> RoutingCache<S> {
         self.cache.lock().unwrap().remove(subdomain);
     }
 
+    /// Drop the cache entry for a given full SandboxId. Comp-2 A6/B3: called
+    /// from the LISTEN handler when the controller emits a remove
+    /// notification.
+    pub fn remove_by_sandbox_id(&self, sandbox_id: &SandboxId) {
+        self.cache.lock().unwrap().remove(&sandbox_id.subdomain());
+    }
+
+    /// Drop every cache entry routing through a given agent. Comp-2 A6/B3/C6:
+    /// called from the OpenTunnel cleanup path so stale routes pointing at a
+    /// disconnected agent are not served between periodic refreshes.
+    pub fn remove_for_agent(&self, agent_id: &AgentId) {
+        self.cache.lock().unwrap().retain(|_, v| v.agent_id != *agent_id);
+    }
+
     pub fn len(&self) -> usize {
         self.cache.lock().unwrap().len()
     }
@@ -135,6 +149,28 @@ mod tests {
         cache.insert(sandbox_id.clone(), AgentId::new());
         cache.remove_by_subdomain(&sandbox_id.subdomain());
         assert!(cache.lookup(&sandbox_id.subdomain()).is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_for_agent_drops_only_that_agents_entries() {
+        // Comp-2 A6/C6: agent disconnect invalidates its routes; sibling
+        // agents' routes must remain.
+        let store = InMemoryRoutingStore::new();
+        let cache = RoutingCache::new(store);
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+        let sb_a1 = SandboxId::new();
+        let sb_a2 = SandboxId::new();
+        let sb_b1 = SandboxId::new();
+        cache.insert(sb_a1.clone(), agent_a.clone());
+        cache.insert(sb_a2.clone(), agent_a.clone());
+        cache.insert(sb_b1.clone(), agent_b.clone());
+
+        cache.remove_for_agent(&agent_a);
+
+        assert!(cache.lookup(&sb_a1.subdomain()).is_none());
+        assert!(cache.lookup(&sb_a2.subdomain()).is_none());
+        assert!(cache.lookup(&sb_b1.subdomain()).is_some());
     }
 
     #[tokio::test]

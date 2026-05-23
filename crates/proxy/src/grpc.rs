@@ -154,6 +154,7 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
         let pool = self.pool.clone();
         let mux = self.mux.clone();
         let sessions = self.sessions.clone();
+        let routing = self.routing.clone();
 
         tokio::spawn(async move {
             let mut registered_agent_id: Option<AgentId> = None;
@@ -220,7 +221,14 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
             if let (Some(agent_id), Some(generation)) = (registered_agent_id, my_generation) {
                 mux.cancel_agent_streams_at_generation(&agent_id, generation);
                 sessions.cancel_agent_streams_at_generation(&agent_id, generation);
-                pool.remove_if_current(&agent_id, generation);
+                // Comp-2 A6/C6: only evict cache entries if our tunnel was
+                // still the current one. If the agent reconnected on a newer
+                // generation, the new tunnel's cache entries must be
+                // preserved.
+                let was_current = pool.remove_if_current(&agent_id, generation);
+                if was_current {
+                    routing.remove_for_agent(&agent_id);
+                }
             }
         });
 
