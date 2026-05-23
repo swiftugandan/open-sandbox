@@ -38,7 +38,45 @@ Recommended: drop the line, document the streaming variant as a
 v1.1 ergonomic; revisit when there's a concrete consumer that
 needs > 64 MiB single-file reads.
 
-## P2 — youki file ops via `cat`/`tee`/`tar` instead of setns syscalls
+## P2 — single proxy gRPC listener (restore the two-listener split)
+
+The proxy currently binds ONE TCP port (`crates/cli/src/run.rs`)
+hosting both:
+
+- `OpenTunnel` — agent ingress, must reach the public internet.
+- `OpenIoStream` — gateway egress to proxy, must be reachable
+  ONLY by the api gateway process.
+
+Plan called for a separate internal-only listener on its own
+port (e.g. 50053) as the **primary** defense. The bearer-token
+check in `OpenIoStream` is currently the only guard; if an
+attacker reaches the public proxy port and exfiltrates the
+shared secret, they can dispatch `IoStart` frames against any
+sandbox.
+
+**Resolution sketch:**
+
+- Split `run_proxy` to bind two `tonic::Server`s:
+  - public listener (existing): only the `OpenTunnel` service
+  - internal listener (new): only the `OpenIoStream` service,
+    bound to a separate port and (in production) a separate
+    interface or loopback-only
+- `docker-compose.full.yml` and the operator-facing
+  configuration grow a `PROXY_INTERNAL_PORT` knob.
+- The api gateway's `ProxyClientPool` reads the new port from
+  config; existing `INTERNAL_TOKEN` bearer check stays as
+  defense-in-depth.
+- A test scenario that attempts `OpenIoStream` against the
+  public port should be rejected at the listener level
+  (connection refused / no such service), not by the bearer
+  check.
+
+This is the highest-impact security fix in the v1.0.1 batch —
+without it, deployments that don't enforce network isolation
+between proxy and untrusted callers rely on a single shared
+secret.
+
+## P3 — youki file ops via `cat`/`tee`/`tar` instead of setns syscalls
 
 `crates/agent-youki/src/lib.rs` implements `read_file`,
 `write_file`, and `write_files_targz` by invoking
@@ -68,18 +106,12 @@ and then perform direct file syscalls in the agent's process.
   scenario that runs in a distroless sandbox image (no `sh`,
   `cat`, `tar`).
 
-## P3 (deferred, tracked here for visibility) — gaps acknowledged but not closed for v1.0.1
+## P4 (deferred, tracked here for visibility) — gaps acknowledged but not closed for v1.0.1
 
 These came up in the audit but were explicitly accepted as
 v1.0 limitations (operator-resolvable for now). Listed here so
 future sessions know they exist.
 
-- **Single proxy gRPC listener.** `OpenTunnel` (agent ingress)
-  and `OpenIoStream` (gateway egress to proxy) share one TCP
-  port. Plan called for a separate internal-only port as the
-  primary defense; the bearer-token check is currently the only
-  guard. Restoring the two-listener split is a `crates/cli/src/run.rs`
-  change plus a docker-compose port edit.
 - **Prometheus metrics.** Eleven metrics were specified across
   agent and gateway; none are implemented. The metrics surface
   itself (HTTP `/metrics` endpoint, `prometheus` crate) is also
