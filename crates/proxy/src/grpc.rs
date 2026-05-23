@@ -268,13 +268,19 @@ async fn dispatch_io_stream<S: RoutingStore + 'static>(
     };
     let sandbox_id = SandboxId::from(sandbox_uuid);
 
-    let route = match routing.lookup(&sandbox_id.subdomain()) {
-        Some(r) => r,
-        None => {
+    let route = match routing.lookup_or_fetch(&sandbox_id.subdomain()).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
             let _ = server_tx
                 .send(Err(Status::not_found(format!(
                     "sandbox {sandbox_id} not in routing table"
                 ))))
+                .await;
+            return;
+        }
+        Err(e) => {
+            let _ = server_tx
+                .send(Err(Status::internal(format!("routing lookup failed: {e}"))))
                 .await;
             return;
         }
