@@ -245,3 +245,59 @@ Amended with friction-fixes module (image pull, state tracking, validation, shut
 **Acceptance criterion:** Container stays alive with `sleep infinity` entrypoint, exec works on any base image. Runtime exec errors return structured error, not stderr bytes. `docker stop` agent triggers container cleanup. Agent logs show lifecycle events. Read non-existent file returns HTTP 404 `FILE_NOT_FOUND`.
 
 Amended with ops-resilience-observability-api-feedback module. Tagged `plan/v0.5.0`.
+
+### Module 12: `exec-streaming` (major architectural amendment — v1.0)
+
+**Depends on:** `contracts/v0.7.0-frozen`
+**Target version:** `contracts/v1.0.0-frozen`
+**Integration branch:** `contracts/amendment-exec-streaming`
+
+**Source of truth:** [`EXEC_STREAMING_DESIGN.md`](./EXEC_STREAMING_DESIGN.md)
+(design + decisions + spike confirmations + forward trajectory).
+**Detailed plan:** [`PLAN_EXEC_STREAMING.md`](./PLAN_EXEC_STREAMING.md)
+(six sub-modules, branches, exact file lists, type signatures, TDD
+cycle expectations, acceptance criteria, smoke tests, risks, effort,
+final confidence gate).
+
+**Scope (high-level):** Reshape exec from a message exchange routed
+through the control plane (controller's ExecBroker + EXEC_TIMEOUT +
+agent stream ExecCommand/ExecResult) into a stream-shaped session on
+the data plane (proxy's tunnel multiplex), exposed publicly as
+WebSocket. Adds first-class file ops in both runtime backends
+(replacing v0.7's shell helpers) and an agent-side `ExecRegistry`
+with explicit kill-on-disconnect plumbing (required by spikes 01+02:
+neither runtime propagates client disconnect to the in-container PID).
+
+**Six sub-modules** (see `PLAN_EXEC_STREAMING.md` for full detail):
+
+1. `module/exec-streaming-1-contracts-proto` — extend `proxy.proto`,
+   remove `ExecCommand`/`ExecResult`/`ExecSandbox*`, freeze
+   `contracts/v1.0.0-frozen`.
+2. `module/exec-streaming-2-agent-runtime` — reshape
+   `ContainerRuntime` trait (start_exec → ExecHandle, add
+   signal_exec, first-class read/write_file), add `ExecRegistry`,
+   both backends.
+3. `module/exec-streaming-3-proxy-originate` — proxy gains
+   `OpenIoStream` RPC and routes gateway-originated streams into
+   the agent tunnel by sandbox_id.
+4. `module/exec-streaming-4-api-gateway-ws` — held-open gRPC pool
+   to proxy; WebSocket endpoints for streaming I/O with idle
+   ping/pong keepalive.
+5. `module/exec-streaming-5-controller-cleanup` — delete exec broker,
+   EXEC_TIMEOUT, message-shaped exec types from controller +
+   controller.proto + api.proto.
+6. `module/exec-streaming-6-live-e2e` — eight scripted scenarios
+   (echo, backpressure, signal, disconnect-kills, idle keepalive,
+   long-running >60s, command-not-found, write-then-exec) on the
+   docker-compose.full stack, both runtimes.
+
+**Closes friction items:** H1 (60s timeout), H2 (no session
+persistence), H3 (disconnect doesn't kill), H4 (write_file shell
+helper leaks to logs), M1 (no signals/cancel), M2 (no streaming
+output), M4 (cwd default inconsistency), M5 (stdin utf8 footgun).
+
+**Forward trajectory unlocked** (documented in design doc): computer-use
+agent API (free byproduct), v1.1 transparent WebSocket forwarding
+(VNC-from-browser), v1.2 desktop sandbox recipe.
+
+Amendment to be tagged `plan/v0.6.0`.
