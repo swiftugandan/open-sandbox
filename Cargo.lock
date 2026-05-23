@@ -2164,10 +2164,9 @@ dependencies = [
 name = "open-sandbox-agent"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "open-sandbox-contracts",
- "open-sandbox-controller",
  "prost-types",
- "sqlx",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -2180,6 +2179,7 @@ name = "open-sandbox-agent-docker"
 version = "0.1.0"
 dependencies = [
  "bollard",
+ "bytes",
  "futures",
  "open-sandbox-agent",
  "open-sandbox-contracts",
@@ -2192,6 +2192,7 @@ dependencies = [
 name = "open-sandbox-agent-youki"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "flate2",
  "futures-util",
  "libcontainer",

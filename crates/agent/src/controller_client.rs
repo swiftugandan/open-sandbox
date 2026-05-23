@@ -8,8 +8,7 @@ use open_sandbox_contracts::constants::HEARTBEAT_INTERVAL;
 use open_sandbox_contracts::controller::controller_command;
 use open_sandbox_contracts::controller::controller_service_client::ControllerServiceClient;
 use open_sandbox_contracts::controller::{
-    AgentMessage, AgentResources, ExecResult, Heartbeat, RegisterRequest, SandboxStatus,
-    agent_message,
+    AgentMessage, AgentResources, Heartbeat, RegisterRequest, SandboxStatus, agent_message,
 };
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::{AgentId, JoinToken};
@@ -164,59 +163,8 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                     info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
                 }
                 controller_command::Payload::RegisterResponse(_) => {}
-                controller_command::Payload::Exec(exec) => {
-                    info!(
-                        sandbox_id = %exec.sandbox_id,
-                        exec_id = %exec.exec_id,
-                        cmd.argv = exec.command.join(" "),
-                        cmd.cwd = %exec.cwd,
-                        cmd.stdin_len = exec.stdin.len(),
-                        "received exec command"
-                    );
-                    let mgr = sandbox_manager.clone();
-                    let tx = status_tx.clone();
-                    tokio::spawn(async move {
-                        let sandbox_id = uuid::Uuid::parse_str(&exec.sandbox_id)
-                            .map(open_sandbox_contracts::types::SandboxId::from);
-                        let options = crate::container::ExecOptions {
-                            command: exec.command,
-                            stdin: exec.stdin,
-                            cwd: exec.cwd,
-                        };
-                        let result = match sandbox_id {
-                            Ok(sid) => mgr.exec_sandbox(&sid, options).await,
-                            Err(_) => {
-                                Err(open_sandbox_contracts::error::AgentError::SandboxNotFound {
-                                    sandbox_id: exec.sandbox_id.clone(),
-                                })
-                            }
-                        };
-                        let exec_result = match result {
-                            Ok(output) => ExecResult {
-                                sandbox_id: exec.sandbox_id,
-                                exec_id: exec.exec_id,
-                                exit_code: output.exit_code,
-                                stdout: output.stdout,
-                                stderr: output.stderr,
-                                error: String::new(),
-                                command_not_found: output.command_not_found,
-                            },
-                            Err(e) => ExecResult {
-                                sandbox_id: exec.sandbox_id,
-                                exec_id: exec.exec_id,
-                                exit_code: -1,
-                                stdout: vec![],
-                                stderr: vec![],
-                                error: e.to_string(),
-                                command_not_found: false,
-                            },
-                        };
-                        let msg = AgentMessage {
-                            payload: Some(agent_message::Payload::ExecResult(exec_result)),
-                        };
-                        let _ = tx.send(msg).await;
-                    });
-                }
+                // ExecCommand was removed from the controller stream in v1.0;
+                // exec is now routed via the proxy data plane.
                 controller_command::Payload::FetchLogs(_) => {}
             }
         }

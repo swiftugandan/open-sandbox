@@ -7,7 +7,7 @@ use open_sandbox_contracts::controller::{SandboxState, StartSandbox, StopSandbox
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
-use crate::container::{ContainerConfig, ContainerId, ContainerRuntime, ExecOutput};
+use crate::container::{ContainerConfig, ContainerId, ContainerRuntime};
 
 fn parse_sandbox_id(raw: &str) -> Result<SandboxId, AgentError> {
     uuid::Uuid::parse_str(raw)
@@ -118,22 +118,19 @@ impl<R: ContainerRuntime> SandboxManager<R> {
             })
     }
 
-    pub async fn exec_sandbox(
-        &self,
-        sandbox_id: &SandboxId,
-        options: crate::container::ExecOptions,
-    ) -> Result<ExecOutput, AgentError> {
-        let entry = self
-            .sandboxes
+    /// Look up the container ID for a sandbox. Used by the
+    /// proxy-side IO stream router (`io_stream::drive_io_session`)
+    /// to dispatch into the runtime. Returns the same
+    /// `SandboxNotFound` error as the rest of this manager.
+    pub fn container_id_for(&self, sandbox_id: &SandboxId) -> Result<ContainerId, AgentError> {
+        self.sandboxes
             .lock()
             .unwrap()
             .get(sandbox_id)
-            .cloned()
+            .map(|e| e.container_id.clone())
             .ok_or_else(|| AgentError::SandboxNotFound {
                 sandbox_id: sandbox_id.to_string(),
-            })?;
-
-        self.runtime.exec(&entry.container_id, options).await
+            })
     }
 
     pub async fn reconcile(&self) -> Result<Vec<SandboxEntry>, AgentError> {
@@ -311,7 +308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_sandbox_runs_command() {
+    async fn container_id_for_returns_id_for_running_sandbox() {
         let runtime = Arc::new(MockContainerRuntime::new());
         let manager = SandboxManager::new(runtime);
         let sandbox_id = SandboxId::new();
@@ -321,66 +318,16 @@ mod tests {
             .await
             .unwrap();
 
-        let output = manager
-            .exec_sandbox(
-                &sandbox_id,
-                crate::container::ExecOptions {
-                    command: vec!["echo".into(), "hello".into()],
-                    stdin: vec![],
-                    cwd: String::new(),
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(output.exit_code, 0);
-        assert_eq!(output.stdout, b"echo hello");
+        let cid = manager.container_id_for(&sandbox_id).unwrap();
+        assert!(!cid.0.is_empty());
     }
 
     #[tokio::test]
-    async fn exec_sandbox_pipes_stdin() {
-        let runtime = Arc::new(MockContainerRuntime::new());
-        let manager = SandboxManager::new(runtime);
-        let sandbox_id = SandboxId::new();
-
-        manager
-            .start_sandbox(start_cmd(&sandbox_id, "nginx:latest"))
-            .await
-            .unwrap();
-
-        let stdin_data = b"tar-data-here".to_vec();
-        let output = manager
-            .exec_sandbox(
-                &sandbox_id,
-                crate::container::ExecOptions {
-                    command: vec!["tar".into(), "xzf".into(), "-".into()],
-                    stdin: stdin_data,
-                    cwd: String::new(),
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(output.exit_code, 0);
-        assert_eq!(output.stdout, b"received 13 bytes");
-    }
-
-    #[tokio::test]
-    async fn exec_sandbox_unknown_returns_error() {
+    async fn container_id_for_unknown_sandbox_errs() {
         let runtime = Arc::new(MockContainerRuntime::new());
         let manager = SandboxManager::new(runtime);
 
-        let result = manager
-            .exec_sandbox(
-                &SandboxId::new(),
-                crate::container::ExecOptions {
-                    command: vec!["echo".into()],
-                    stdin: vec![],
-                    cwd: String::new(),
-                },
-            )
-            .await;
-
+        let result = manager.container_id_for(&SandboxId::new());
         assert!(matches!(result, Err(AgentError::SandboxNotFound { .. })));
     }
 

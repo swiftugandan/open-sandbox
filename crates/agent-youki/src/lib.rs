@@ -9,9 +9,12 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use bytes::Bytes;
 use open_sandbox_agent::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOptions, ExecOutput,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, EXEC_CHANNEL_CAPACITY,
+    ExecExitInfo, ExecHandle, ExecStart, detect_command_not_found,
 };
+use open_sandbox_contracts::constants::DEFAULT_WRITE_CWD;
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
@@ -261,27 +264,242 @@ impl ContainerRuntime for YoukiRuntime {
             .collect())
     }
 
-    async fn exec(
+    async fn start_exec(
         &self,
         id: &ContainerId,
-        options: ExecOptions,
-    ) -> Result<ExecOutput, AgentError> {
+        start: ExecStart,
+    ) -> Result<ExecHandle, AgentError> {
         let container_id = id.0.clone();
         let state_dir = self.state_dir();
+        exec::start_exec_streaming(&container_id, &state_dir, start).await
+    }
 
-        tokio::task::spawn_blocking(move || {
-            exec::exec_in_container(
-                &container_id,
-                &state_dir,
-                options.command,
-                options.stdin,
-                &options.cwd,
+    async fn signal_exec(
+        &self,
+        id: &ContainerId,
+        in_container_pid: i32,
+        signum: i32,
+    ) -> Result<(), AgentError> {
+        if in_container_pid <= 0 {
+            return Ok(());
+        }
+        let container_id = id.0.clone();
+        let state_dir = self.state_dir();
+        exec::signal_in_container(&container_id, &state_dir, in_container_pid, signum).await
+    }
+
+    async fn read_file(
+        &self,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+    ) -> Result<Bytes, AgentError> {
+        let resolved = resolve_path(path, cwd);
+
+        let handle = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec!["cat".into(), "--".into(), resolved.clone()],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
             )
-        })
-        .await
-        .map_err(|e| AgentError::Runtime {
-            detail: format!("exec task panicked: {e}"),
-        })?
+            .await?;
+        let mut handle = handle;
+        drop(handle.stdin);
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = handle.stdout.recv().await {
+            buf.extend_from_slice(&chunk);
+        }
+        let mut stderr: Vec<u8> = Vec::new();
+        while let Some(chunk) = handle.stderr.recv().await {
+            stderr.extend_from_slice(&chunk);
+        }
+        let info = handle.exited.await.map_err(|_| AgentError::Runtime {
+            detail: "read_file exec terminated without exit info".into(),
+        })?;
+        if info.exit_code != 0 {
+            let stderr_text = String::from_utf8_lossy(&stderr);
+            if stderr_text.contains("No such file") || stderr_text.contains("not found") {
+                return Err(AgentError::Runtime {
+                    detail: format!("No such file: {resolved}"),
+                });
+            }
+            return Err(AgentError::Runtime {
+                detail: format!(
+                    "read_file exit={} stderr={}",
+                    info.exit_code,
+                    stderr_text.trim()
+                ),
+            });
+        }
+        Ok(Bytes::from(buf))
+    }
+
+    async fn write_file(
+        &self,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+        content: Bytes,
+    ) -> Result<(), AgentError> {
+        let resolved = resolve_path(path, cwd);
+        let dir = parent_dir(&resolved);
+        let temp = format!("{dir}/.opensb.{}.tmp", uuid::Uuid::new_v4().simple());
+
+        let mkdir = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec!["mkdir".into(), "-p".into(), "--".into(), dir],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        drain_to_exit(mkdir).await?;
+
+        let writer = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec!["tee".into(), "--".into(), temp.clone()],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        let mut writer = writer;
+        let _ = writer.stdin.send(content).await;
+        drop(writer.stdin);
+        while writer.stdout.recv().await.is_some() {}
+        let mut stderr = Vec::new();
+        while let Some(chunk) = writer.stderr.recv().await {
+            stderr.extend_from_slice(&chunk);
+        }
+        let info = writer.exited.await.map_err(|_| AgentError::Runtime {
+            detail: "write_file tee exec terminated without exit info".into(),
+        })?;
+        if info.exit_code != 0 {
+            return Err(AgentError::Runtime {
+                detail: format!(
+                    "write_file tee exit={} stderr={}",
+                    info.exit_code,
+                    String::from_utf8_lossy(&stderr).trim()
+                ),
+            });
+        }
+
+        let mv = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec!["mv".into(), "--".into(), temp, resolved],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        drain_to_exit(mv).await?;
+        Ok(())
+    }
+
+    async fn write_files_targz(
+        &self,
+        id: &ContainerId,
+        cwd: Option<&str>,
+        tarball: Bytes,
+    ) -> Result<(), AgentError> {
+        let target = cwd.unwrap_or(DEFAULT_WRITE_CWD).to_string();
+        let mkdir = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec!["mkdir".into(), "-p".into(), "--".into(), target.clone()],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        drain_to_exit(mkdir).await?;
+
+        let extract = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec![
+                        "tar".into(),
+                        "xzf".into(),
+                        "-".into(),
+                        "-C".into(),
+                        target,
+                    ],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        let mut extract = extract;
+        let _ = extract.stdin.send(tarball).await;
+        drop(extract.stdin);
+        while extract.stdout.recv().await.is_some() {}
+        let mut stderr = Vec::new();
+        while let Some(chunk) = extract.stderr.recv().await {
+            stderr.extend_from_slice(&chunk);
+        }
+        let info = extract.exited.await.map_err(|_| AgentError::Runtime {
+            detail: "write_files_targz tar exec terminated without exit info".into(),
+        })?;
+        if info.exit_code != 0 {
+            return Err(AgentError::Runtime {
+                detail: format!(
+                    "write_files_targz tar exit={} stderr={}",
+                    info.exit_code,
+                    String::from_utf8_lossy(&stderr).trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+async fn drain_to_exit(handle: ExecHandle) -> Result<(), AgentError> {
+    let mut handle = handle;
+    drop(handle.stdin);
+    while handle.stdout.recv().await.is_some() {}
+    let mut stderr = Vec::new();
+    while let Some(chunk) = handle.stderr.recv().await {
+        stderr.extend_from_slice(&chunk);
+    }
+    let info = handle.exited.await.map_err(|_| AgentError::Runtime {
+        detail: "internal exec terminated without exit info".into(),
+    })?;
+    if info.exit_code != 0 {
+        return Err(AgentError::Runtime {
+            detail: format!(
+                "internal exec exit={} stderr={}",
+                info.exit_code,
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_path(path: &str, cwd: Option<&str>) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    let base = cwd.unwrap_or(DEFAULT_WRITE_CWD);
+    format!("{}/{}", base.trim_end_matches('/'), path)
+}
+
+fn parent_dir(path: &str) -> String {
+    match path.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(n) => path[..n].to_string(),
+        None => ".".to_string(),
     }
 }
 
@@ -369,27 +587,34 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn exec_runs_command() {
+    async fn start_exec_runs_echo() {
         let runtime = YoukiRuntime::new(test_config()).unwrap();
         let sandbox_id = SandboxId::new();
         let config = sandbox_config(sandbox_id);
 
         let info = runtime.create_and_start(config).await.unwrap();
 
-        let output = runtime
-            .exec(
+        let handle = runtime
+            .start_exec(
                 &info.id,
-                ExecOptions {
+                ExecStart {
                     command: vec!["echo".into(), "hello".into()],
-                    stdin: vec![],
                     cwd: String::new(),
+                    env: HashMap::new(),
                 },
             )
             .await
             .unwrap();
 
-        assert_eq!(output.exit_code, 0);
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
+        let mut handle = handle;
+        drop(handle.stdin);
+        let mut stdout: Vec<u8> = Vec::new();
+        while let Some(chunk) = handle.stdout.recv().await {
+            stdout.extend_from_slice(&chunk);
+        }
+        let exit = handle.exited.await.unwrap();
+        assert_eq!(exit.exit_code, 0);
+        assert_eq!(String::from_utf8_lossy(&stdout).trim(), "hello");
 
         let _ = runtime
             .stop_and_remove(&info.id, Duration::from_secs(5))

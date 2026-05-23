@@ -6,7 +6,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::proxy::tunnel_request;
 use open_sandbox_contracts::proxy::tunnel_response;
-use open_sandbox_contracts::proxy::tunnel_service_client::TunnelServiceClient;
+use open_sandbox_contracts::proxy::sandbox_io_service_client::SandboxIoServiceClient;
 use open_sandbox_contracts::proxy::{HttpResponse, TunnelReady, TunnelResponse};
 use open_sandbox_contracts::types::AgentId;
 
@@ -35,7 +35,7 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
             .await
             .map_err(|_| AgentError::TunnelDisconnected)?;
 
-        let mut client = TunnelServiceClient::new(channel);
+        let mut client = SandboxIoServiceClient::new(channel);
 
         let (outbound_tx, outbound_rx) = mpsc::channel(32);
         let outbound_stream = ReceiverStream::new(outbound_rx);
@@ -103,6 +103,15 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
                     let _ = outbound_tx.send(resp).await;
                 }
                 tunnel_request::Payload::Data(_) | tunnel_request::Payload::Close(_) => {}
+                tunnel_request::Payload::IoClient(_) => {
+                    // I/O stream multiplex is wired in module 12.3
+                    // (proxy originate-session) — the proxy will
+                    // route IoClientFrame payloads through this
+                    // arm, which dispatches to drive_io_session.
+                    // Stubbed for 12.2 build; no IoClient frames
+                    // can arrive here yet because the proxy does
+                    // not yet emit them.
+                }
             }
         }
 

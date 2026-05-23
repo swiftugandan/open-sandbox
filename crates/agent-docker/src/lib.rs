@@ -5,16 +5,19 @@ use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
     StopContainerOptions,
 };
-use bollard::models::HostConfig;
-
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+use bollard::models::HostConfig;
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-
-use tracing::info;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, oneshot};
+use tracing::{info, warn};
 
 use open_sandbox_agent::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecOptions, ExecOutput,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, EXEC_CHANNEL_CAPACITY,
+    ExecExitInfo, ExecHandle, ExecStart, detect_command_not_found,
 };
+use open_sandbox_contracts::constants::DEFAULT_WRITE_CWD;
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
@@ -164,108 +167,477 @@ impl ContainerRuntime for DockerRuntime {
         Ok(result)
     }
 
-    async fn exec(
+    async fn start_exec(
         &self,
         id: &ContainerId,
-        options: ExecOptions,
-    ) -> Result<ExecOutput, AgentError> {
-        let attach_stdin = !options.stdin.is_empty();
-        let working_dir = if options.cwd.is_empty() {
+        start: ExecStart,
+    ) -> Result<ExecHandle, AgentError> {
+        let working_dir = if start.cwd.is_empty() {
             None
         } else {
-            Some(options.cwd)
+            Some(start.cwd)
         };
+
+        let env: Vec<String> = if start.env.is_empty() {
+            Vec::new()
+        } else {
+            start.env.iter().map(|(k, v)| format!("{k}={v}")).collect()
+        };
+
         let exec_opts = CreateExecOptions {
-            cmd: Some(options.command),
+            cmd: Some(start.command),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
-            attach_stdin: Some(attach_stdin),
+            attach_stdin: Some(true),
             working_dir,
+            env: if env.is_empty() { None } else { Some(env) },
             ..Default::default()
         };
-        let stdin = options.stdin;
 
         let exec_created = self
             .client
             .create_exec(&id.0, exec_opts)
             .await
             .map_err(runtime_err)?;
+        let exec_id = exec_created.id.clone();
 
-        let start_opts = StartExecOptions {
-            detach: false,
-            ..Default::default()
-        };
-
-        let result = self
+        let started = self
             .client
-            .start_exec(&exec_created.id, Some(start_opts))
+            .start_exec(
+                &exec_id,
+                Some(StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
             .await
             .map_err(runtime_err)?;
 
-        let mut stdout_buf = Vec::new();
-        let mut stderr_buf = Vec::new();
+        let StartExecResults::Attached { output, input } = started else {
+            return Err(AgentError::Runtime {
+                detail: "start_exec returned non-attached result".into(),
+            });
+        };
 
-        if let StartExecResults::Attached {
-            mut output,
-            mut input,
-        } = result
-        {
-            if !stdin.is_empty() {
-                use tokio::io::AsyncWriteExt;
-                input
-                    .write_all(&stdin)
+        // The Pid is populated by dockerd shortly after start. Poll
+        // briefly — same shape as spike 05's strategy for youki, but
+        // here via the bollard inspect API.
+        let in_container_pid = {
+            let mut found: Option<i32> = None;
+            for _ in 0..10 {
+                let info = self
+                    .client
+                    .inspect_exec(&exec_id)
                     .await
-                    .map_err(|e| AgentError::Runtime {
-                        detail: e.to_string(),
-                    })?;
-                input.shutdown().await.map_err(|e| AgentError::Runtime {
-                    detail: e.to_string(),
-                })?;
+                    .map_err(runtime_err)?;
+                if let Some(pid) = info.pid
+                    && pid > 0
+                {
+                    found = Some(pid as i32);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            // It's not fatal if we don't capture a PID: a
+            // microsecond-lifetime exec may have already exited. The
+            // registry will then have nothing to clean up (already
+            // dead). Use 0 as a sentinel meaning "no PID captured."
+            found.unwrap_or(0)
+        };
 
-            while let Some(chunk) = output.next().await {
-                let chunk = chunk.map_err(runtime_err)?;
+        // Build the caller-facing channels.
+        let (stdin_tx, mut stdin_rx) = mpsc::channel::<Bytes>(EXEC_CHANNEL_CAPACITY);
+        let (stdout_tx, stdout_rx) = mpsc::channel::<Bytes>(EXEC_CHANNEL_CAPACITY);
+        let (stderr_tx, stderr_rx) = mpsc::channel::<Bytes>(EXEC_CHANNEL_CAPACITY);
+        let (exited_tx, exited_rx) = oneshot::channel::<ExecExitInfo>();
+
+        // stdin pump: receive from caller, write to bollard input.
+        // Drop of stdin_rx (channel closed) triggers input.shutdown().
+        tokio::spawn(async move {
+            let mut input = input;
+            while let Some(bytes) = stdin_rx.recv().await {
+                if input.write_all(&bytes).await.is_err() {
+                    return;
+                }
+            }
+            let _ = input.shutdown().await;
+        });
+
+        // output pump + exit watcher: consume bollard output Stream,
+        // demux StdOut/StdErr to the two channels, then on stream end
+        // inspect_exec for the exit code and signal exited.
+        let client = self.client.clone();
+        let exec_id_for_watch = exec_id.clone();
+        tokio::spawn(async move {
+            let mut output = output;
+            let mut stdout_buf_for_cnf: Vec<u8> = Vec::new();
+            let mut stderr_buf_for_cnf: Vec<u8> = Vec::new();
+            while let Some(chunk_res) = output.next().await {
+                let Ok(chunk) = chunk_res else { break };
                 match chunk {
                     bollard::container::LogOutput::StdOut { message } => {
-                        stdout_buf.extend_from_slice(&message);
+                        let m: Bytes = message;
+                        if stdout_buf_for_cnf.len() < 4096 {
+                            stdout_buf_for_cnf.extend_from_slice(&m);
+                        }
+                        if stdout_tx.send(m).await.is_err() {
+                            // Consumer hung up; drain remaining.
+                            return;
+                        }
                     }
                     bollard::container::LogOutput::StdErr { message } => {
-                        stderr_buf.extend_from_slice(&message);
+                        let m: Bytes = message;
+                        if stderr_buf_for_cnf.len() < 4096 {
+                            stderr_buf_for_cnf.extend_from_slice(&m);
+                        }
+                        if stderr_tx.send(m).await.is_err() {
+                            return;
+                        }
                     }
                     _ => {}
                 }
             }
+
+            // Stream ended — fetch exit code.
+            let inspect = match client.inspect_exec(&exec_id_for_watch).await {
+                Ok(i) => i,
+                Err(_) => {
+                    let _ = exited_tx.send(ExecExitInfo {
+                        exit_code: -1,
+                        command_not_found: false,
+                    });
+                    return;
+                }
+            };
+            let exit_code = inspect.exit_code.unwrap_or(-1) as i32;
+
+            // Spike-08 / friction-fix item #8: docker pipes the OCI
+            // "executable not found" diagnostic to stdout. Detect on
+            // either stream when exit is 127.
+            let cnf = exit_code == 127
+                && (detect_command_not_found(&stderr_buf_for_cnf)
+                    || detect_command_not_found(&stdout_buf_for_cnf));
+
+            let _ = exited_tx.send(ExecExitInfo {
+                exit_code,
+                command_not_found: cnf,
+            });
+        });
+
+        Ok(ExecHandle {
+            exec_id,
+            in_container_pid,
+            stdin: stdin_tx,
+            stdout: stdout_rx,
+            stderr: stderr_rx,
+            exited: exited_rx,
+        })
+    }
+
+    async fn signal_exec(
+        &self,
+        id: &ContainerId,
+        in_container_pid: i32,
+        signum: i32,
+    ) -> Result<(), AgentError> {
+        if in_container_pid <= 0 {
+            // No PID captured at start (microsecond exec). Nothing
+            // to kill.
+            return Ok(());
         }
 
-        let inspect = self
+        // Issue `kill -<signum> <pid>` inside the container via a
+        // short docker exec. Requires `kill` in the sandbox image —
+        // documented as a sandbox-image requirement in SPEC.md.
+        let cmd: Vec<String> = vec![
+            "kill".into(),
+            format!("-{signum}"),
+            in_container_pid.to_string(),
+        ];
+        let exec = self
             .client
-            .inspect_exec(&exec_created.id)
+            .create_exec(
+                &id.0,
+                CreateExecOptions {
+                    cmd: Some(cmd),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(runtime_err)?;
 
-        let exit_code = inspect.exit_code.unwrap_or(-1) as i32;
+        let _ = self
+            .client
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(runtime_err)?;
 
-        // Docker pipes the OCI runtime's "command not found" diagnostic to
-        // stdout (bug #8 in the SDK friction report) when the exec syscall
-        // fails. Detect the pattern on either stream and lift it into stderr
-        // so callers don't have to look at stdout for runtime-level errors.
-        let mut cnf = false;
-        if exit_code == 127 {
-            if open_sandbox_agent::container::detect_command_not_found(&stderr_buf) {
-                cnf = true;
-            } else if open_sandbox_agent::container::detect_command_not_found(&stdout_buf) {
-                cnf = true;
-                stderr_buf.extend_from_slice(&stdout_buf);
-                stdout_buf.clear();
+        // Inspect to surface the result for telemetry; non-zero
+        // typically means the target has already exited (ESRCH),
+        // which is benign for our use case.
+        let _ = self.client.inspect_exec(&exec.id).await;
+        Ok(())
+    }
+
+    async fn read_file(
+        &self,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+    ) -> Result<Bytes, AgentError> {
+        let resolved = resolve_path(path, cwd);
+
+        // Single-command `cat -- <resolved>` exec. Internal; agent
+        // logs show this as the runtime's read_file, not as a
+        // gateway-emitted shell helper.
+        let handle = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec!["cat".into(), "--".into(), resolved.clone()],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+
+        // Drain stdout fully; ignore stdin.
+        let mut handle = handle;
+        drop(handle.stdin);
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = handle.stdout.recv().await {
+            buf.extend_from_slice(&chunk);
+        }
+        // Also drain stderr to allow the exec to terminate cleanly.
+        let mut stderr: Vec<u8> = Vec::new();
+        while let Some(chunk) = handle.stderr.recv().await {
+            stderr.extend_from_slice(&chunk);
+        }
+        let info = handle
+            .exited
+            .await
+            .map_err(|_| AgentError::Runtime {
+                detail: "read_file exec terminated without exit info".into(),
+            })?;
+
+        if info.exit_code != 0 {
+            let stderr_text = String::from_utf8_lossy(&stderr);
+            if stderr_text.contains("No such file") || stderr_text.contains("not found") {
+                return Err(AgentError::Runtime {
+                    detail: format!("No such file: {resolved}"),
+                });
             }
+            return Err(AgentError::Runtime {
+                detail: format!(
+                    "read_file exit={} stderr={}",
+                    info.exit_code,
+                    stderr_text.trim()
+                ),
+            });
         }
 
-        Ok(ExecOutput {
-            exit_code,
-            stdout: stdout_buf,
-            stderr: stderr_buf,
-            command_not_found: cnf,
-        })
+        Ok(Bytes::from(buf))
+    }
+
+    async fn write_file(
+        &self,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+        content: Bytes,
+    ) -> Result<(), AgentError> {
+        let resolved = resolve_path(path, cwd);
+        // Atomicity: write to a temp file in the target's directory,
+        // then rename. Two short execs; both visible to logs as
+        // first-class runtime operations (no embedded shell script).
+        let dir = parent_dir(&resolved);
+        let temp = format!("{dir}/.opensb.{}.tmp", uuid::Uuid::new_v4().simple());
+
+        // Step 1: ensure the directory exists.
+        let mkdir = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec!["mkdir".into(), "-p".into(), "--".into(), dir.clone()],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        drain_to_exit(mkdir).await?;
+
+        // Step 2: write content via tee into the temp path.
+        let writer = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec!["tee".into(), "--".into(), temp.clone()],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        let mut writer = writer;
+        // Push content as a single chunk (caller's responsibility
+        // to keep payload reasonable for unary write_file).
+        let _ = writer.stdin.send(content).await;
+        drop(writer.stdin); // signal EOF
+        // Drain stdout (tee echoes content) and stderr.
+        while writer.stdout.recv().await.is_some() {}
+        let mut stderr = Vec::new();
+        while let Some(chunk) = writer.stderr.recv().await {
+            stderr.extend_from_slice(&chunk);
+        }
+        let info = writer
+            .exited
+            .await
+            .map_err(|_| AgentError::Runtime {
+                detail: "write_file tee exec terminated without exit info".into(),
+            })?;
+        if info.exit_code != 0 {
+            return Err(AgentError::Runtime {
+                detail: format!(
+                    "write_file tee exit={} stderr={}",
+                    info.exit_code,
+                    String::from_utf8_lossy(&stderr).trim()
+                ),
+            });
+        }
+
+        // Step 3: atomic rename into place.
+        let mv = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec!["mv".into(), "--".into(), temp.clone(), resolved.clone()],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        drain_to_exit(mv).await?;
+
+        Ok(())
+    }
+
+    async fn write_files_targz(
+        &self,
+        id: &ContainerId,
+        cwd: Option<&str>,
+        tarball: Bytes,
+    ) -> Result<(), AgentError> {
+        let target_cwd = cwd.unwrap_or(DEFAULT_WRITE_CWD).to_string();
+
+        // mkdir -p target, then tar xzf - -C target. Two short
+        // execs, both first-class operations.
+        let mkdir = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec!["mkdir".into(), "-p".into(), "--".into(), target_cwd.clone()],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        drain_to_exit(mkdir).await?;
+
+        let extract = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec![
+                        "tar".into(),
+                        "xzf".into(),
+                        "-".into(),
+                        "-C".into(),
+                        target_cwd,
+                    ],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        let mut extract = extract;
+        let _ = extract.stdin.send(tarball).await;
+        drop(extract.stdin);
+        while extract.stdout.recv().await.is_some() {}
+        let mut stderr = Vec::new();
+        while let Some(chunk) = extract.stderr.recv().await {
+            stderr.extend_from_slice(&chunk);
+        }
+        let info = extract
+            .exited
+            .await
+            .map_err(|_| AgentError::Runtime {
+                detail: "write_files_targz tar exec terminated without exit info".into(),
+            })?;
+        if info.exit_code != 0 {
+            return Err(AgentError::Runtime {
+                detail: format!(
+                    "write_files_targz tar exit={} stderr={}",
+                    info.exit_code,
+                    String::from_utf8_lossy(&stderr).trim()
+                ),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+async fn drain_to_exit(handle: ExecHandle) -> Result<(), AgentError> {
+    let mut handle = handle;
+    drop(handle.stdin);
+    while handle.stdout.recv().await.is_some() {}
+    let mut stderr = Vec::new();
+    while let Some(chunk) = handle.stderr.recv().await {
+        stderr.extend_from_slice(&chunk);
+    }
+    let info = handle
+        .exited
+        .await
+        .map_err(|_| AgentError::Runtime {
+            detail: "internal exec terminated without exit info".into(),
+        })?;
+    if info.exit_code != 0 {
+        warn!(
+            exit_code = info.exit_code,
+            stderr = %String::from_utf8_lossy(&stderr).trim(),
+            "internal runtime exec failed"
+        );
+        return Err(AgentError::Runtime {
+            detail: format!(
+                "internal exec exit={} stderr={}",
+                info.exit_code,
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_path(path: &str, cwd: Option<&str>) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    let base = cwd.unwrap_or(DEFAULT_WRITE_CWD);
+    format!("{}/{}", base.trim_end_matches('/'), path)
+}
+
+fn parent_dir(path: &str) -> String {
+    match path.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(n) => path[..n].to_string(),
+        None => ".".to_string(),
     }
 }
 

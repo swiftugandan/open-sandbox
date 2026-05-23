@@ -8,7 +8,8 @@ description = "Docker container runtime for Open Sandbox (development backend)"
 open-sandbox-contracts = { path = "../contracts" }
 open-sandbox-agent = { path = "../agent" }
 bollard = "0.18"
+bytes = "1"
 futures = "0.3"
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", features = ["io-util", "rt", "sync", "time"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
