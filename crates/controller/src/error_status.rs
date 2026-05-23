@@ -1,5 +1,7 @@
 use open_sandbox_contracts::error::ControllerError;
-use tonic::{Code, Status};
+use tonic::Status;
+#[cfg(test)]
+use tonic::Code;
 
 pub fn controller_error_to_status(err: &ControllerError) -> Status {
     match err {

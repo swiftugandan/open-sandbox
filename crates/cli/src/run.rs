@@ -20,6 +20,7 @@ use open_sandbox_api::grpc_service::GrpcSandboxService;
 use open_sandbox_api::proxy_client::{DEFAULT_POOL_SIZE, ProxyClientPool};
 use open_sandbox_api::router::build_router;
 use open_sandbox_api::state::ApiState;
+use open_sandbox_controller::auth::AdminAuthInterceptor;
 use open_sandbox_controller::grpc::Controller;
 use open_sandbox_controller::management::management_service;
 use open_sandbox_controller::pg_store::PgStore;
@@ -64,9 +65,16 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
         expected: join_token,
     };
 
+    // F1: management gRPC requires CONTROLLER_ADMIN_TOKEN. Bind refuses to
+    // start if the token is unset — fail closed rather than silently exposing
+    // a no-auth management surface.
+    let admin_auth = AdminAuthInterceptor::from_env().map_err(|e| {
+        format!("CONTROLLER_ADMIN_TOKEN required for management gRPC: {e}")
+    })?;
+
     let controller = Arc::new(Controller::new(pg_store, validator));
     let agent_service = controller.grpc_service();
-    let mgmt_service = management_service(controller.clone());
+    let mgmt_service = management_service(controller.clone(), admin_auth);
 
     let addr = format!("0.0.0.0:{}", args.grpc_port);
     let listener = TcpListener::bind(&addr).await?;

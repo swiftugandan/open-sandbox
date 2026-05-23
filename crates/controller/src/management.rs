@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use tonic::{Request, Response, Status};
+use tonic::{
+    Request, Response, Status,
+    service::interceptor::InterceptedService,
+};
 
 use open_sandbox_contracts::api::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -10,6 +13,7 @@ use open_sandbox_contracts::api::{
 use open_sandbox_contracts::controller::{ControllerCommand, StopSandbox, controller_command};
 use open_sandbox_contracts::types::SandboxId;
 
+use crate::auth::{AdminAuthInterceptor, LIST_SANDBOXES_MAX};
 use crate::error_status::controller_error_to_status;
 use crate::grpc::{Controller, CreateSandboxRequest as InternalCreateRequest};
 use crate::scheduler::SandboxRequirements;
@@ -157,11 +161,22 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
         &self,
         _request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        let entries = self
+        let mut entries = self
             .controller
             .list_routing_entries()
             .await
             .map_err(|e| controller_error_to_status(&e))?;
+
+        // F1: server-side cap. ListSandboxesRequest has no max_results in
+        // contracts/v1.0.1; proper pagination is deferred to a contract bump.
+        if entries.len() > LIST_SANDBOXES_MAX {
+            tracing::warn!(
+                total = entries.len(),
+                cap = LIST_SANDBOXES_MAX,
+                "ListSandboxes result truncated"
+            );
+            entries.truncate(LIST_SANDBOXES_MAX);
+        }
 
         let mut sandboxes = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -194,8 +209,16 @@ fn parse_id(id: &str) -> Result<SandboxId, Status> {
         .map_err(|_| Status::invalid_argument("invalid sandbox_id"))
 }
 
+/// Wrap the management service with the required admin-token interceptor.
+/// Every RPC requires `authorization: Bearer <CONTROLLER_ADMIN_TOKEN>`.
+/// See REVIEW_LOG.md F1.
 pub fn management_service<S: ControllerStore + 'static>(
     controller: Arc<Controller<S>>,
-) -> SandboxManagementServiceServer<ManagementHandler<S>> {
-    SandboxManagementServiceServer::new(ManagementHandler::new(controller))
+    auth: AdminAuthInterceptor,
+) -> InterceptedService<SandboxManagementServiceServer<ManagementHandler<S>>, AdminAuthInterceptor>
+{
+    InterceptedService::new(
+        SandboxManagementServiceServer::new(ManagementHandler::new(controller)),
+        auth,
+    )
 }

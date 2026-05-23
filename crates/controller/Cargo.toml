@@ -9,6 +9,7 @@ prost-types = "0.13"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "uuid"] }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tokio-stream = "0.1"
+thiserror = "2"
 tonic = "0.12"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
