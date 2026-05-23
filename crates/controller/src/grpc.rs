@@ -309,9 +309,19 @@ impl<S: ControllerStore + 'static> Controller<S> {
     pub async fn sweep_dead_agents(&self) -> Vec<AgentId> {
         let dead = self.heartbeat_monitor.dead_agents();
         for agent_id in &dead {
-            let _ = self.registry.mark_agent_dead(agent_id).await;
-            self.connections.remove(agent_id);
-            self.heartbeat_monitor.remove(agent_id);
+            match self.registry.mark_agent_dead(agent_id).await {
+                Ok(()) | Err(ControllerError::AgentNotFound { .. }) => {
+                    self.connections.remove(agent_id);
+                    self.heartbeat_monitor.remove(agent_id);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %err,
+                        "mark_agent_dead failed; preserving heartbeat entry for retry"
+                    );
+                }
+            }
         }
         dead
     }
