@@ -7,10 +7,18 @@ use open_sandbox_contracts::types::{AgentId, RoutingEntry, SandboxId};
 use crate::store::*;
 use crate::token::TokenValidator;
 
+#[derive(Debug, Clone)]
+struct Reservation {
+    agent_id: AgentId,
+    cpu_millicores: u32,
+    memory_bytes: u64,
+}
+
 pub struct InMemoryStore {
     agents: Mutex<HashMap<AgentId, AgentRecord>>,
     routing: Mutex<Vec<RoutingEntry>>,
     sandbox_states: Mutex<HashMap<SandboxId, SandboxStateRow>>,
+    reservations: Mutex<HashMap<SandboxId, Reservation>>,
 }
 
 impl InMemoryStore {
@@ -19,6 +27,7 @@ impl InMemoryStore {
             agents: Mutex::new(HashMap::new()),
             routing: Mutex::new(Vec::new()),
             sandbox_states: Mutex::new(HashMap::new()),
+            reservations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -161,6 +170,72 @@ impl ControllerStore for InMemoryStore {
                 agent_id: agent_id.to_string(),
             }),
         }
+    }
+
+    async fn try_assign_sandbox(
+        &self,
+        agent_id: &AgentId,
+        sandbox_id: &SandboxId,
+        cpu_millicores: u32,
+        memory_bytes: u64,
+    ) -> Result<bool, ControllerError> {
+        // Lock ordering: agents → routing → reservations.
+        let mut agents = self.agents.lock().unwrap();
+        let mut routing = self.routing.lock().unwrap();
+        let mut reservations = self.reservations.lock().unwrap();
+
+        let Some(agent) = agents.get_mut(agent_id) else {
+            return Err(ControllerError::AgentNotFound {
+                agent_id: agent_id.to_string(),
+            });
+        };
+        if agent.state != AgentState::Active {
+            return Ok(false);
+        }
+        if agent.available.cpu_millicores < cpu_millicores
+            || agent.available.memory_bytes < memory_bytes
+        {
+            return Ok(false);
+        }
+        agent.available.cpu_millicores -= cpu_millicores;
+        agent.available.memory_bytes -= memory_bytes;
+        agent.available.running_sandboxes = agent.available.running_sandboxes.saturating_add(1);
+        routing.push(RoutingEntry {
+            sandbox_id: sandbox_id.clone(),
+            agent_id: agent_id.clone(),
+        });
+        reservations.insert(
+            sandbox_id.clone(),
+            Reservation {
+                agent_id: agent_id.clone(),
+                cpu_millicores,
+                memory_bytes,
+            },
+        );
+        Ok(true)
+    }
+
+    async fn release_sandbox(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<AgentId>, ControllerError> {
+        let mut agents = self.agents.lock().unwrap();
+        let mut routing = self.routing.lock().unwrap();
+        let mut reservations = self.reservations.lock().unwrap();
+
+        let Some(reservation) = reservations.remove(sandbox_id) else {
+            return Ok(None);
+        };
+        if let Some(agent) = agents.get_mut(&reservation.agent_id) {
+            agent.available.cpu_millicores =
+                agent.available.cpu_millicores.saturating_add(reservation.cpu_millicores);
+            agent.available.memory_bytes =
+                agent.available.memory_bytes.saturating_add(reservation.memory_bytes);
+            agent.available.running_sandboxes =
+                agent.available.running_sandboxes.saturating_sub(1);
+        }
+        routing.retain(|e| e.sandbox_id != *sandbox_id);
+        Ok(Some(reservation.agent_id))
     }
 }
 
@@ -324,5 +399,24 @@ impl ControllerStore for FailNextStore {
             });
         }
         self.inner.mark_agent_dead_atomic(agent_id).await
+    }
+
+    async fn try_assign_sandbox(
+        &self,
+        agent_id: &AgentId,
+        sandbox_id: &SandboxId,
+        cpu_millicores: u32,
+        memory_bytes: u64,
+    ) -> Result<bool, ControllerError> {
+        self.inner
+            .try_assign_sandbox(agent_id, sandbox_id, cpu_millicores, memory_bytes)
+            .await
+    }
+
+    async fn release_sandbox(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<AgentId>, ControllerError> {
+        self.inner.release_sandbox(sandbox_id).await
     }
 }

@@ -322,19 +322,19 @@ impl<S: ControllerStore + 'static> Controller<S> {
             .send_command(&assignment.agent_id, command)
             .await
         {
-            // F8: roll back the routing entry the scheduler just inserted.
-            // If the rollback itself fails, log but surface the original
-            // send_command error — that's the actionable one for the caller.
+            // F8 + F5: roll back the routing entry AND release the capacity
+            // the scheduler just reserved. If rollback itself fails, log but
+            // surface the original send_command error.
             if let Err(rollback_err) = self
                 .scheduler
                 .store()
-                .remove_routing_entry(&assignment.sandbox_id)
+                .release_sandbox(&assignment.sandbox_id)
                 .await
             {
                 tracing::error!(
                     sandbox = %assignment.sandbox_id,
                     error = %rollback_err,
-                    "failed to roll back routing entry after send_command failure"
+                    "failed to release sandbox reservation after send_command failure"
                 );
             }
             return Err(err);
@@ -362,6 +362,13 @@ impl<S: ControllerStore + 'static> Controller<S> {
             .store()
             .remove_routing_entry(sandbox_id)
             .await
+    }
+
+    pub async fn release_sandbox(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<AgentId>, ControllerError> {
+        self.scheduler.store().release_sandbox(sandbox_id).await
     }
 
     pub async fn save_sandbox_state(

@@ -69,6 +69,26 @@ impl PgStore {
                 detail: e.to_string(),
             })?;
 
+        // F5: per-sandbox capacity reservation lives on the sandboxes row so
+        // release_sandbox can credit the correct amount back without the
+        // caller needing to track requirements.
+        sqlx::query(
+            "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS cpu_millicores INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        sqlx::query(
+            "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS memory_bytes BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
         Ok(())
     }
 }
@@ -312,6 +332,154 @@ impl ControllerStore for PgStore {
             detail: e.to_string(),
         })?;
         Ok(())
+    }
+
+    async fn try_assign_sandbox(
+        &self,
+        agent_id: &AgentId,
+        sandbox_id: &SandboxId,
+        cpu_millicores: u32,
+        memory_bytes: u64,
+    ) -> Result<bool, ControllerError> {
+        let mut tx = self.pool.begin().await.map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        // SELECT FOR UPDATE locks the agent row for the duration of the txn,
+        // serializing concurrent try_assign attempts on the same agent.
+        let row: Option<(i32, i64, String)> = sqlx::query_as(
+            "SELECT available_cpu_millicores, available_memory_bytes, state
+             FROM agents WHERE agent_id = $1 FOR UPDATE",
+        )
+        .bind(agent_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        let Some((avail_cpu, avail_mem, state)) = row else {
+            return Err(ControllerError::AgentNotFound {
+                agent_id: agent_id.to_string(),
+            });
+        };
+        if state != "active" {
+            return Ok(false);
+        }
+        if (avail_cpu as u32) < cpu_millicores || (avail_mem as u64) < memory_bytes {
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "UPDATE agents SET
+                available_cpu_millicores = available_cpu_millicores - $1,
+                available_memory_bytes = available_memory_bytes - $2,
+                running_sandboxes = running_sandboxes + 1
+             WHERE agent_id = $3",
+        )
+        .bind(cpu_millicores as i32)
+        .bind(memory_bytes as i64)
+        .bind(agent_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        sqlx::query("INSERT INTO routing_entries (sandbox_id, agent_id) VALUES ($1, $2)")
+            .bind(sandbox_id.0)
+            .bind(agent_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ControllerError::Database {
+                detail: e.to_string(),
+            })?;
+
+        // Persist the reservation alongside the sandboxes row so release_sandbox
+        // can credit the correct amount back. ON CONFLICT preserves any state
+        // already written via save_sandbox_state but updates the requirements.
+        sqlx::query(
+            "INSERT INTO sandboxes (sandbox_id, agent_id, state, cpu_millicores, memory_bytes)
+             VALUES ($1, $2, 'reserved', $3, $4)
+             ON CONFLICT (sandbox_id) DO UPDATE SET
+                agent_id = EXCLUDED.agent_id,
+                cpu_millicores = EXCLUDED.cpu_millicores,
+                memory_bytes = EXCLUDED.memory_bytes",
+        )
+        .bind(sandbox_id.0)
+        .bind(agent_id.0)
+        .bind(cpu_millicores as i32)
+        .bind(memory_bytes as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        tx.commit().await.map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        Ok(true)
+    }
+
+    async fn release_sandbox(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<AgentId>, ControllerError> {
+        let mut tx = self.pool.begin().await.map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        let row: Option<(uuid::Uuid, i32, i64)> = sqlx::query_as(
+            "SELECT agent_id, cpu_millicores, memory_bytes FROM sandboxes WHERE sandbox_id = $1 FOR UPDATE",
+        )
+        .bind(sandbox_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        let Some((agent_uuid, cpu, mem)) = row else {
+            return Ok(None);
+        };
+
+        sqlx::query(
+            "UPDATE agents SET
+                available_cpu_millicores = available_cpu_millicores + $1,
+                available_memory_bytes = available_memory_bytes + $2,
+                running_sandboxes = GREATEST(running_sandboxes - 1, 0)
+             WHERE agent_id = $3",
+        )
+        .bind(cpu)
+        .bind(mem)
+        .bind(agent_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        sqlx::query("DELETE FROM routing_entries WHERE sandbox_id = $1")
+            .bind(sandbox_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ControllerError::Database {
+                detail: e.to_string(),
+            })?;
+
+        sqlx::query("DELETE FROM sandboxes WHERE sandbox_id = $1")
+            .bind(sandbox_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ControllerError::Database {
+                detail: e.to_string(),
+            })?;
+
+        tx.commit().await.map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        Ok(Some(AgentId(agent_uuid)))
     }
 }
 

@@ -143,8 +143,10 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             .await
             .map_err(|e| controller_error_to_status(&e))?;
 
+        // F5: release the reservation alongside the routing entry so the
+        // agent's available capacity is credited back atomically.
         self.controller
-            .remove_routing_entry(&sandbox_id)
+            .release_sandbox(&sandbox_id)
             .await
             .map_err(|e| controller_error_to_status(&e))?;
 

@@ -92,6 +92,29 @@ pub trait ControllerStore: Send + Sync {
         &self,
         agent_id: &AgentId,
     ) -> impl Future<Output = Result<(), ControllerError>> + Send;
+
+    /// Atomically reserve capacity on the chosen agent AND insert the routing
+    /// entry. Returns Ok(true) on success; Ok(false) if the agent's available
+    /// capacity is below the request (a concurrent assign won the race). The
+    /// requirements are persisted alongside the routing entry so that
+    /// release_sandbox can credit the correct amount back without the caller
+    /// needing to track it. See REVIEW_LOG.md F5.
+    fn try_assign_sandbox(
+        &self,
+        agent_id: &AgentId,
+        sandbox_id: &SandboxId,
+        cpu_millicores: u32,
+        memory_bytes: u64,
+    ) -> impl Future<Output = Result<bool, ControllerError>> + Send;
+
+    /// Atomically release the capacity reserved by try_assign_sandbox AND
+    /// remove the routing entry. Returns the agent that was holding the
+    /// sandbox, or None if the sandbox had no reservation (idempotent). See
+    /// REVIEW_LOG.md F5.
+    fn release_sandbox(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> impl Future<Output = Result<Option<AgentId>, ControllerError>> + Send;
 }
 
 #[derive(Debug, Clone)]
