@@ -8,7 +8,11 @@ A Rust-based sandbox platform where agents dial out to a controller/proxy over T
 
 ## Current phase
 
-Phase 6 complete: all modules implemented including `agent-youki`. Controller, agent, proxy, CLI shell, infra, agent-docker, proxy-http, api, api-files, and agent-youki modules done. The `agent-youki` module (`module/agent-youki/done`) replaces Docker Engine with youki/libcontainer as a daemonless OCI container runtime (ADR-009). Image pull via oci-client, container lifecycle via libcontainer, networking via CNI bridge+portmap, exec via nsenter. `DockerRuntime` extracted to its own crate (`crates/agent-docker/`); `YoukiRuntime` in `crates/agent-youki/`. Runtime selection via compile-time Cargo features (`docker` default, `youki` for Linux production). Contracts at v0.3.0: `AgentError::Docker` renamed to `AgentError::Runtime`. Build constraint: full build/test on Linux only (`Dockerfile.test` + `docker-compose.test.yml`).
+Phase 6 complete: all modules implemented including `agent-youki`. Controller, agent, proxy, CLI shell, infra, agent-docker, proxy-http, api, api-files, and agent-youki modules done. The `agent-youki` module (`module/agent-youki/done`) replaces Docker Engine with youki/libcontainer as a daemonless OCI container runtime (ADR-009). Image pull via oci-client, container lifecycle via libcontainer, networking via CNI bridge+portmap, exec via nsenter. `DockerRuntime` extracted to its own crate (`crates/agent-docker/`); `YoukiRuntime` in `crates/agent-youki/`. Runtime selection via compile-time Cargo features (`docker` default, `youki` for Linux production). Build constraint: full build/test on Linux only (`Dockerfile.test` + `docker-compose.test.yml`).
+
+**Contracts currently at `contracts/v0.7.0-frozen`** (SDK agent ergonomics — list sandboxes, exec stdin/cwd, single-file write_file, GET read_file, base64 stdout, COMMAND_NOT_FOUND, structured exec logs). Implementation merged on `contracts/amendment-sdk-agent-friction`. `AgentError::Docker` is now `AgentError::Runtime`; `ApiError::FileNotFound.path` is now `.resolved_path`.
+
+**Pending major amendment: exec streaming → v1.0.0.** A full pre-amendment design lives at `EXEC_STREAMING_DESIGN.md` (settled decisions, spike-confirmed assumptions, forward trajectory). Reshapes exec from a message exchange to a stream-shaped session over WebSocket, riding the data plane (proxy) instead of the control plane (controller). Closes friction items H1–H4, M1, M2, M4, M5 from the post-v0.7 friction report. Implementation will live on `contracts/amendment-exec-streaming`. Before working on any "exec timeout / streaming / process control / file ops" item — read that design first.
 
 ## Quick status
 
@@ -34,6 +38,8 @@ git tag --list 'module/*/live-verified'
 - `CONTRACTS.md` — prose documentation of the contracts crate
 - `crates/contracts/` — the contracts crate itself (source of truth)
 - `PLAN.md` — decomposition into binaries with dependency DAG and acceptance criteria
+- `EXEC_STREAMING_DESIGN.md` — **pending v1.0 refactor** design doc. Source of truth for the exec streaming amendment. Read before any work on exec timeouts, streaming, process control, sessions, file ops, computer-use, or VNC-from-browser.
+- `spikes/exec-streaming/spike-0{1,2,3}-*/RESULT.md` — confirmed spike outcomes the design relies on (both runtimes need explicit kill-on-disconnect; axum WebSocket backpressures and detects disconnects cleanly).
 
 ## Notes for future sessions
 
@@ -42,3 +48,4 @@ git tag --list 'module/*/live-verified'
 - Hetzner is the default cloud for cost optimization; AWS validates the cloud abstraction
 - Cloudflare for DNS regardless of compute cloud
 - Multi-tenancy decision and raw TCP exposure are open questions from the design doc
+- **The exec-as-message vs. exec-as-stream architectural decision has been made and documented in `EXEC_STREAMING_DESIGN.md`.** v1.0 will move exec, file ops, and any future log streaming onto the proxy's data plane as bidi WebSocket streams. Do not propose band-aids on the current message-shaped exec; they perpetuate the architectural mistake the design explicitly rejects. The data-plane choice also positions v1.1 transparent-WebSocket-forwarding (VNC-from-browser, inbound WS apps) and computer-use agent APIs to fall out naturally.
