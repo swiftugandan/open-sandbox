@@ -99,7 +99,7 @@ design:
 | ----------------------------------- | --------------------------------------------------------------------------------- |
 | H1 (60s timeout)                    | Stream has no RPC-style deadline; lives as long as the process                    |
 | H2 (no shell session persistence)   | A streaming `bash -i` exec **is** a session — env/cwd live in the bash process    |
-| H3 (disconnect doesn't kill)        | Stream close on either side → agent SIGTERMs the PID (subject to spikes)          |
+| H3 (disconnect doesn't kill)        | Stream close → agent's `ExecRegistry` cleanup SIGTERMs the in-container PID (spikes 01 + 02 showed neither runtime does this for free) |
 | H4 (write_file shell helper in logs)| WriteFile becomes a first-class verb; no embedded shell script                    |
 | M1 (no signals/cancel)              | `Signal` is just another frame on the open stream                                 |
 | M2 (no streaming output)            | Stdout/stderr ARE frames on the stream by construction                            |
@@ -126,9 +126,13 @@ exec target.
 
 **Spike:** `spikes/exec-streaming/spike-01-docker-exec-disconnect/`
 
-If true → docker backend gets H3 for free.
-If false → agent must explicitly track the exec PID and SIGKILL it when
-the stream closes.
+**Result (2026-05-23): FALSE.** dockerd does NOT propagate client
+disconnect to the exec. The in-container process ran to completion
+after the local docker client was SIGKILLed. See
+`spikes/exec-streaming/spike-01-docker-exec-disconnect/RESULT.md`.
+
+**Consequence:** the docker backend requires an agent-side
+`ExecRegistry` and explicit kill-on-stream-close plumbing.
 
 ### Assumption 2: nsenter signals do NOT propagate to the in-namespace child
 
@@ -143,13 +147,45 @@ nsenter does nothing.
 
 **Spike:** `spikes/exec-streaming/spike-02-nsenter-signal-propagation/`
 
-If false (nsenter does propagate) → youki backend gets H3 for free.
-If true (nsenter does not propagate) → agent must capture the child's
-in-container PID after nsenter spawns and explicitly kill it on
-disconnect.
+**Result (2026-05-23): CONFIRMED.** Killing the host-side `nsenter` does
+**not** kill the in-namespace child; the child is reparented to PID 1
+in its PID namespace and survives. See
+`spikes/exec-streaming/spike-02-nsenter-signal-propagation/RESULT.md`.
 
-Result of this spike directly determines whether the youki backend needs
-an extra plumbing step (capture-pid-and-track) or not.
+**Consequence:** the youki backend also requires an agent-side
+`ExecRegistry` and explicit kill-on-stream-close plumbing. The kill is
+issued by exec'ing a fresh `nsenter ... kill -TERM <pid>` into the same
+namespaces (with SIGKILL after a grace period). The in-container PID
+must be captured at exec start by inspecting
+`/proc/<nsenter_pid>/task/*/children` immediately after fork or by an
+equivalent mechanism.
+
+### Joint conclusion from spikes 01 + 02
+
+**Both backends require the same plumbing.** The structurally pure design
+now formally includes:
+
+- An `ExecRegistry<StreamId, ExecRecord>` on the agent, where
+  `ExecRecord` carries `{ in_container_pid, sandbox_id, runtime_handle }`.
+- A stream-close hook that performs SIGTERM (grace) → SIGKILL on the
+  in-container PID via the runtime trait, then removes the registry
+  entry.
+- Symmetric reconciliation on agent restart: walk known containers,
+  reap any leftover marker / state, drop stale registry entries.
+
+This is a small additional piece of work (one HashMap + one async
+cancellation handler) but a non-trivial set of invariants (must not
+leak entries, must not double-kill, must survive agent restart). The
+runtime trait gains one method:
+
+```rust
+fn kill_exec(&self, container: &ContainerId, in_container_pid: i32,
+             grace: Duration) -> impl Future<Output = Result<(), AgentError>> + Send;
+```
+
+Both `agent-docker` and `agent-youki` implement it; the shape is the
+same, only the kill mechanism differs (`docker exec <ctr> kill` vs
+`nsenter ... -- kill`).
 
 ### Assumption 3: axum chunked-transfer streams propagate backpressure
 
