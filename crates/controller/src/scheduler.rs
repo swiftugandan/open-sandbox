@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use open_sandbox_contracts::error::ControllerError;
-use open_sandbox_contracts::types::{AgentId, RoutingEntry, SandboxId};
+use open_sandbox_contracts::types::{AgentId, SandboxId};
 
 use crate::store::ControllerStore;
 
