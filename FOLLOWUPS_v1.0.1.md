@@ -113,7 +113,53 @@ without it, deployments that don't enforce network isolation
 between proxy and untrusted callers rely on a single shared
 secret.
 
-## P3 — youki file ops via `cat`/`tee`/`tar` instead of setns syscalls
+## P3 — youki file ops via `cat`/`tee`/`tar` instead of setns syscalls — **CODE COMPLETE; LIVE GATE PENDING**
+
+**Status:** Implementation merged in `module/v1.0.1-youki-setns-file-ops`
+(tags `/green`, `/refactored`). The `crates/agent-youki/src/setns_ops.rs`
+module performs `read_file`, `write_file`, and `write_files_targz`
+by entering the container's mount namespace via `setns(2)` from
+a dedicated `spawn_blocking` thread, with a Drop guard that
+restores the agent's original mount namespace on every exit
+path (including panic). `YoukiRuntime`'s three file-op methods
+now call `exec::container_pid()` + `setns_ops::*_in_ns()` —
+zero in-container binaries (no `cat`/`tee`/`tar`/`mkdir`/`mv`)
+are invoked.
+
+Verified on the Linux Dockerfile.test container:
+- Lib compiles cleanly (no warnings after the unused-import cleanup).
+- `setns_ops::tests::invalid_pid_returns_runtime_error_not_panic` passes.
+- `setns_ops::tests::setns_self_round_trip_is_noop` passes (the
+  kernel rejects self-setns on the unprivileged docker-in-docker
+  test host, which the test handles as an expected outcome).
+
+**`/live-verified` gate is NOT yet placed** because the test
+container can't actually create real libcontainer sandboxes in
+the current macOS Docker Desktop environment:
+
+```
+failed to create container: intermediate process error
+cgroup error: io error: failed to write +io to
+/sys/fs/cgroup/cgroup.subtree_control: Not supported (os error 95)
+```
+
+This is a Docker Desktop nesting limitation, NOT a bug in the
+P3 implementation — the same error blocks all four pre-existing
+lib tests that exercise the full `create_and_start` path. It
+predates this work.
+
+**To close the gate**, run the test suite on a bare-metal
+Linux host (or a Linux VM with proper cgroup v2 + `+io`
+controller enabled). The pre-existing failures must be
+addressed first, and then the two new `e2e_mock` tests
+(`write_then_read_via_setns_round_trips` and
+`write_files_targz_via_setns_round_trips`) should run cleanly.
+Tag `module/v1.0.1-youki-setns-file-ops/live-verified` and
+`/done` once that's green.
+
+The original text follows for historical context.
+
+---
 
 `crates/agent-youki/src/lib.rs` implements `read_file`,
 `write_file`, and `write_files_targz` by invoking
