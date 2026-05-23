@@ -57,6 +57,7 @@ async fn main() -> ExitCode {
             }
         };
 
+    #[allow(unused_assignments)]
     let mut exit_code: i32 = 0;
     let deadline = if args.read_for_secs > 0 {
         Some(tokio::time::Instant::now() + Duration::from_secs(args.read_for_secs))

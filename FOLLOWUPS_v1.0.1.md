@@ -7,7 +7,19 @@ amendment to `main`, but should be addressed before tagging
 
 Prioritized order matches the user's stated focus during the audit.
 
-## P1 — CHANGELOG ↔ implementation mismatch (`WS /files/read`)
+## P1 — CHANGELOG ↔ implementation mismatch (`WS /files/read`) — **CLOSED**
+
+**Status:** Closed in `module/v1.0.1-ws-read-file`. The streaming
+variant is exposed at `WS /v1/sandboxes/{id}/files/read-stream`
+(separate path from the unary `GET /files/read` to sidestep a
+transitive axum 0.7 vs 0.8 trait collision pulled in by tonic);
+CHANGELOG and ws-client README updated to point at the new path;
+ws-client SDK gains `ReadFileSession`; scenario 09 + example
+binary `stream-read-file` both green.
+
+The original text follows for historical context.
+
+---
 
 `CHANGELOG.md` advertises:
 

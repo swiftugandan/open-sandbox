@@ -42,7 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session =
         ExecSession::connect(&args.base, &args.sandbox, &args.api_key, params).await?;
 
-    eprintln!("# session opened; expecting up to {}s of output", args.seconds);
+    eprintln!(
+        "# session opened; expecting up to {}s of output",
+        args.seconds
+    );
     while let Some(frame) = session.next_frame().await? {
         match frame {
             ServerFrame::Stdout(bytes) => print!("{}", String::from_utf8_lossy(&bytes)),
@@ -55,7 +58,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("error: {code}: {detail}");
                 std::process::exit(1);
             }
-            ServerFrame::Started { in_container_pid, .. } => {
+            ServerFrame::Started {
+                in_container_pid, ..
+            } => {
                 eprintln!("# started in_container_pid={in_container_pid}");
             }
         }

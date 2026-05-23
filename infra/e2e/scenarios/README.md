@@ -37,6 +37,7 @@ Exit code = number of failing scenarios.
 | 06  | `06-long-running.sh`    | `sleep 70` completes cleanly — v1.0 sessions have no built-in per-call timeout; the connection IS the lifetime. |
 | 07  | `07-command-not-found.sh` | An unknown binary exits 127 AND the `command_not_found` flag is surfaced (cnf marker on stderr).      |
 | 08  | `08-write-then-exec.sh` | `write_file` (single-file REST) followed by exec of the uploaded script works end-to-end.               |
+| 09  | `09-ws-read-file.sh`    | Streaming `WS /files/read-stream`: a 256 KiB payload round-trips intact via the WebSocket variant.       |
 
 For the SDK-level introduction to the same surface, see the
 runnable examples in `crates/ws-client/examples/`.

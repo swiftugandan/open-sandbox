@@ -63,7 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // concurrently. The pump owns a clone-free move of the
         // line reader; on local EOF it half-closes the session.
         // We use a oneshot to surface fatal errors back to main.
-        let (err_tx, err_rx) = tokio::sync::oneshot::channel::<Box<dyn std::error::Error + Send + Sync>>();
+        let (err_tx, err_rx) =
+            tokio::sync::oneshot::channel::<Box<dyn std::error::Error + Send + Sync>>();
         // ExecSession isn't Clone — but send_stdin / close_stdin
         // only need &mut self. We need to share access, so we
         // route stdin lines through a channel that main pulls
