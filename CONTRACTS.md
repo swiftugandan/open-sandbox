@@ -4,11 +4,18 @@
 
 ## Status
 
-Current frozen version: **contracts/v1.0.0-frozen**
+Current released version: **`contracts/v1.0.1`** on `main`.
+Last freeze tag: **`contracts/v1.0.0-frozen`** (the wire-shape freeze; unchanged in v1.0.1).
 
-*Frozen at `contracts/v1.0.0-frozen` on 2026-05-23 (paired with `spec/v1.0.0`). Changes after this point require a `contracts/amendment-<desc>` branch and a version bump.*
+*v1.0.0 frozen 2026-05-23 (paired with `spec/v1.0.0`). v1.0.1 is on-wire compatible: no proto changes, no new error variants, no constant changes. Changes after the freeze require a `contracts/amendment-<desc>` branch and a version bump for any wire-shape changes.*
 
-v1.0.0 is the first stable contracts release. It is also a **breaking** reshape from v0.7: exec moves from a message exchange routed through the control plane (controller's ExecBroker, agent stream ExecCommand/ExecResult, gateway's unary ExecSandbox RPC) to a stream-shaped session on the data plane (proxy's SandboxIoService.OpenIoStream, agent's tunnel multiplex, gateway WebSocket). Reasons, decisions, spike evidence, and forward trajectory are documented in `EXEC_STREAMING_DESIGN.md`; the executable plan that produced this freeze is `PLAN_EXEC_STREAMING.md` (tag `plan/v0.6.3`).
+v1.0.0 is the first stable contracts release. It was a **breaking** reshape from v0.7: exec moves from a message exchange routed through the control plane (controller's ExecBroker, agent stream ExecCommand/ExecResult, gateway's unary ExecSandbox RPC) to a stream-shaped session on the data plane (proxy's SandboxIoService.OpenIoStream, agent's tunnel multiplex, gateway WebSocket). Architectural-decision record: `EXEC_STREAMING_DESIGN.md`. Historical plan: `PLAN_EXEC_STREAMING.md` (tag `plan/v0.6.3`).
+
+v1.0.1 adds three internal-only improvements on top of the v1.0.0 wire shape (see `CHANGELOG.md` for the operator-facing summary):
+
+- **WS `/v1/sandboxes/{id}/files/read-stream`** — streaming file-read endpoint exposed by the api gateway. Hosted on a distinct URL from the unary `GET /files/read` to sidestep a transitive axum 0.7/0.8 trait collision pulled in by tonic. Both endpoints back onto the same `IoStart::ReadFile` agent flow; no contract change.
+- **Two-listener proxy split.** The proxy now binds `:50052` (Public role, OpenTunnel only) and `:50053` (Internal role, OpenIoStream only). Wrong-RPC calls return `Status::unimplemented` at the role gate. `OPEN_SANDBOX_INTERNAL_TOKEN` Bearer check stays as defense-in-depth.
+- **youki file ops via `setns(2)`.** `YoukiRuntime::{read_file, write_file, write_files_targz}` enter the container's mount namespace from a dedicated thread (`unshare(CLONE_FS)` + `setns(CLONE_NEWNS)`, restored by a Drop guard). Eliminates the in-container `cat`/`tee`/`tar` invocations; distroless sandbox images are now first-class for the youki file plane.
 
 Summary of v1.0 changes vs v0.7:
 

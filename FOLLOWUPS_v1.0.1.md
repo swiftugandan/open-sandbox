@@ -1,221 +1,59 @@
 # v1.0.1 follow-ups
 
-Gaps surfaced by the post-amendment audit (PLAN_EXEC_STREAMING.md
-vs. actual implementation) that did NOT block merging the v1.0
-amendment to `main`, but should be addressed before tagging
-`contracts/v1.1.0-frozen` (or sooner where security-relevant).
+Gaps surfaced by the post-amendment audit. P1–P3 are **closed and
+shipped on `main`**; P4 items are deferred and tracked here for
+visibility.
 
-Prioritized order matches the user's stated focus during the audit.
+## Closed (shipped on `contracts/v1.0.1`)
 
-## P1 — CHANGELOG ↔ implementation mismatch (`WS /files/read`) — **CLOSED**
+| #  | Item                                       | Branch / tags                                                    |
+|----|--------------------------------------------|------------------------------------------------------------------|
+| P1 | WS `/files/read-stream` streaming endpoint | `module/v1.0.1-ws-read-file/{green,refactored,live-verified,done}` |
+| P2 | Two-listener proxy split (`:50052` Public / `:50053` Internal) | `module/v1.0.1-two-listener-proxy/{live-verified,done}` |
+| P3 | youki file ops via `setns(2)` (no in-container `cat`/`tee`/`tar`) | `module/v1.0.1-youki-setns-file-ops/{green,refactored,live-verified,done}` |
 
-**Status:** Closed in `module/v1.0.1-ws-read-file`. The streaming
-variant is exposed at `WS /v1/sandboxes/{id}/files/read-stream`
-(separate path from the unary `GET /files/read` to sidestep a
-transitive axum 0.7 vs 0.8 trait collision pulled in by tonic);
-CHANGELOG and ws-client README updated to point at the new path;
-ws-client SDK gains `ReadFileSession`; scenario 09 + example
-binary `stream-read-file` both green.
+Operator-facing summaries of each item are in `CHANGELOG.md` under
+`## v1.0.1`. The architectural "why" lives in
+`EXEC_STREAMING_DESIGN.md` for shape decisions and in the merge
+commit messages on `main` for the surprises uncovered during
+implementation (notably the kernel's `fs->users == 1` requirement
+for `setns(MNT)`, and the axum 0.7↔0.8 transitive-trait collision
+that forced the WS route's distinct path).
 
-The original text follows for historical context.
+## P4 — deferred, visibility-only
 
----
+These were acknowledged during the audit but accepted as v1.0
+limitations. None block production use; they improve operability
+and should be scheduled before tagging `contracts/v1.1.0-frozen`.
 
-`CHANGELOG.md` advertises:
+### P4.1 — Prometheus metrics
 
-```
-WebSocket I/O: WS /v1/sandboxes/{id}/exec, WS .../files/read
-```
+Eleven metrics were specified across `crates/agent` and
+`crates/api` in `PLAN_EXEC_STREAMING.md`. None are implemented;
+the `prometheus` crate is not wired and no `/metrics` HTTP
+endpoint exists. Current ops story is "read tracing logs".
 
-…but the streaming `WS .../files/read` route does not exist in
-`crates/api/src/router.rs`. The unary `GET /v1/sandboxes/{id}/files/read`
-endpoint survives and is wired through `OpenIoStream` with an
-`IoStart::ReadFile` variant.
+### P4.2 — Missing tracing event names
 
-**Resolution options:**
+The plan specified these structured event names; the code emits
+the substantive events but under different (or no) names:
 
-- **Implement.** Add `crates/api/src/ws_read_file.rs`, route as
-  `WS /v1/sandboxes/{id}/files/read?path=...`, drive an
-  `IoStart::ReadFile` over the same `ProxyClientPool`, stream
-  bytes back as WS binary frames. The agent's runtime
-  `read_file` already returns a `Bytes`; for a true streaming
-  read we'd want to change the agent trait to return a stream,
-  which is invasive.
-- **Drop the line from CHANGELOG.** The unary `GET` endpoint
-  covers small-file reads (the primary AI-agent use case);
-  streaming reads are a v1.1 ergonomic improvement, not a v1.0
-  requirement.
+- `io_session.client_disconnected` (agent)
+- `ws.upgrade_rejected` (gateway)
+- `proxy_pool.channel_opened` (gateway)
+- `proxy_pool.channel_lost` (gateway)
 
-Recommended: drop the line, document the streaming variant as a
-v1.1 ergonomic; revisit when there's a concrete consumer that
-needs > 64 MiB single-file reads.
+Pure-naming gap; no functional impact.
 
-## P2 — single proxy gRPC listener (restore the two-listener split) — **CLOSED**
+### P4.3 — youki e2e harness + scenario 02 rewrite
 
-**Status:** Closed in `module/v1.0.1-two-listener-proxy`. The
-proxy now binds two listeners:
-
-- `--grpc-port` (default `50052`, env `OPEN_SANDBOX_PROXY_GRPC_PORT`)
-  — Public role; hosts only `OpenTunnel`. Agents dial here.
-- `--internal-grpc-port` (default `50053`, env
-  `OPEN_SANDBOX_PROXY_INTERNAL_GRPC_PORT`) — Internal role;
-  hosts only `OpenIoStream`. The api gateway dials here.
-
-Calls to the wrong RPC are rejected with `Status::unimplemented`
-at the role gate, *before* the bearer-token check. Setting both
-ports to the same value falls back to a single combined listener
-(development only). Bearer-token check (`OPEN_SANDBOX_INTERNAL_TOKEN`)
-remains as defense-in-depth.
-
-Unit tests added:
-`open_io_stream_on_public_listener_returns_unimplemented` and
-`open_tunnel_on_internal_listener_returns_unimplemented`
-(`crates/proxy/src/grpc.rs`). Live-verified by the full e2e suite
-(9/9 green with the split active).
-
-The original text follows for historical context.
-
----
-
-The proxy currently binds ONE TCP port (`crates/cli/src/run.rs`)
-hosting both:
-
-- `OpenTunnel` — agent ingress, must reach the public internet.
-- `OpenIoStream` — gateway egress to proxy, must be reachable
-  ONLY by the api gateway process.
-
-Plan called for a separate internal-only listener on its own
-port (e.g. 50053) as the **primary** defense. The bearer-token
-check in `OpenIoStream` is currently the only guard; if an
-attacker reaches the public proxy port and exfiltrates the
-shared secret, they can dispatch `IoStart` frames against any
-sandbox.
-
-**Resolution sketch:**
-
-- Split `run_proxy` to bind two `tonic::Server`s:
-  - public listener (existing): only the `OpenTunnel` service
-  - internal listener (new): only the `OpenIoStream` service,
-    bound to a separate port and (in production) a separate
-    interface or loopback-only
-- `docker-compose.full.yml` and the operator-facing
-  configuration grow a `PROXY_INTERNAL_PORT` knob.
-- The api gateway's `ProxyClientPool` reads the new port from
-  config; existing `INTERNAL_TOKEN` bearer check stays as
-  defense-in-depth.
-- A test scenario that attempts `OpenIoStream` against the
-  public port should be rejected at the listener level
-  (connection refused / no such service), not by the bearer
-  check.
-
-This is the highest-impact security fix in the v1.0.1 batch —
-without it, deployments that don't enforce network isolation
-between proxy and untrusted callers rely on a single shared
-secret.
-
-## P3 — youki file ops via `cat`/`tee`/`tar` instead of setns syscalls — **CLOSED**
-
-**Status:** Closed in `module/v1.0.1-youki-setns-file-ops`
-(tags `/green`, `/refactored`, `/live-verified`, `/done`).
-
-Resolution:
-
-- `crates/agent-youki/src/setns_ops.rs` performs `read_file`,
-  `write_file`, and `write_files_targz` by entering the
-  container's mount namespace via `setns(2)`. Each call runs
-  on a dedicated `std::thread::spawn` thread (NOT a pooled
-  tokio worker) because the kernel requires `fs->users == 1`
-  for `mntns_install`: we have to `unshare(CLONE_FS)` before
-  `setns(CLONE_NEWNS)`, and that unshare is irreversible. The
-  fresh-thread-per-call shape avoids tainting pool threads
-  for unrelated subsequent work. A Drop guard restores the
-  agent's original mount namespace on every exit path
-  (including panic) so any errno-extracting code outside the
-  closure runs in the home ns.
-
-- `YoukiRuntime::read_file` / `write_file` / `write_files_targz`
-  resolve to `exec::container_pid()` + the matching
-  `setns_ops::*_in_ns()`. Zero in-container binaries
-  (`cat` / `tee` / `tar` / `mkdir` / `mv`) are invoked.
-  Pure-distroless sandbox images are first-class for the
-  youki file plane.
-
-- `crates/agent-youki/Dockerfile.test` gains an ENTRYPOINT
-  shim that performs cgroup v2 setup before exec'ing the
-  test command. The kernel's "no internal process constraint"
-  requires moving all processes into a leaf cgroup before
-  enabling controllers on the root for children; without it,
-  `libcontainer` fails to create sandboxes with
-  `failed to write +io to /sys/fs/cgroup/cgroup.subtree_control:
-  Not supported (os error 95)`. The shim is no-op outside
-  cgroup v2 environments.
-
-- Stale v0.7-era `exec_sandbox` tests in `tests/e2e_mock.rs`
-  rewritten to exercise the new path:
-  `write_then_read_via_setns_round_trips` and
-  `write_files_targz_via_setns_round_trips`.
-
-Live verification (Docker Desktop's nested Linux VM):
-
-- 28/28 youki lib tests pass — including the four that
-  previously failed on Docker Desktop due to the cgroup
-  delegation issue (now fixed by the entrypoint shim).
-- 3/3 `e2e_mock` tests pass (sandbox lifecycle + both setns
-  round-trips).
-- 1/1 `live_e2e` test passes.
-
-**Total: 32/32 youki tests green.**
-
-The original text follows for historical context.
-
----
-
-`crates/agent-youki/src/lib.rs` implements `read_file`,
-`write_file`, and `write_files_targz` by invoking
-`start_exec_streaming` against `cat`, `tee`, and `tar` inside the
-container. The plan's intent (and the structural-purity ideal)
-was to use `setns(2)` to enter the container's mount namespace
-and then perform direct file syscalls in the agent's process.
-
-**Why it matters:**
-
-- Reintroduces the binary-dependency-in-image footprint the v1.0
-  refactor explicitly removed for the docker backend's case.
-  Pure-distroless sandbox images don't work today.
-- The wrapper-script in-container-PID capture (`sh -c '... exec
-  "$@"'`) ALREADY requires `sh` in the image; adding `cat`,
-  `tee`, and `tar` widens the footprint further.
-
-**Resolution sketch:**
-
-- New `youki::syscalls` module: `setns_into_container(pid, ns)`,
-  `read_file_via_ns(path)`, `atomic_write_via_ns(path, bytes)`.
-- The agent process must be `CAP_SYS_ADMIN` and run on the same
-  host as the container — which it already is.
-- Add a `Drop` guard that re-enters the agent's original
-  namespace, to keep the setns scoped per-call.
-- Tests: live-verify against the same scenario 08 plus a new
-  scenario that runs in a distroless sandbox image (no `sh`,
-  `cat`, `tar`).
-
-## P4 (deferred, tracked here for visibility) — gaps acknowledged but not closed for v1.0.1
-
-These came up in the audit but were explicitly accepted as
-v1.0 limitations (operator-resolvable for now). Listed here so
-future sessions know they exist.
-
-- **Prometheus metrics.** Eleven metrics were specified across
-  agent and gateway; none are implemented. The metrics surface
-  itself (HTTP `/metrics` endpoint, `prometheus` crate) is also
-  not wired. Plan called metrics "part of acceptance"; current
-  ops story is "read tracing logs".
-- **Tracing events not in code.** `io_session.client_disconnected`
-  (agent), `ws.upgrade_rejected`, `proxy_pool.channel_opened`,
-  `proxy_pool.channel_lost` (gateway). Logging-only gaps; no
-  functional impact.
-- **e2e missing `run-all-youki.sh`** and scenario 02 is a bash
-  bulk-transfer rather than the Rust RSS-measurement
-  backpressure test the plan specified.
+- `infra/e2e/scenarios/run-all-youki.sh` does not exist; only
+  the docker-backed `run-all.sh` ships.
+- Scenario 02 (bulk transfer) is a bash script measuring a
+  10 MiB stdout round-trip. The plan specified a Rust client
+  that measures gateway RSS to assert backpressure behavior
+  rather than just throughput. Softer assertion of the
+  intended property.
 
 ## Out of scope
 

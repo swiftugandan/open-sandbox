@@ -8,11 +8,11 @@ A Rust-based sandbox platform where agents dial out to a controller/proxy over T
 
 ## Current phase
 
-Phase 6 complete: all modules implemented including `agent-youki`. Controller, agent, proxy, CLI shell, infra, agent-docker, proxy-http, api, api-files, and agent-youki modules done. The `agent-youki` module (`module/agent-youki/done`) replaces Docker Engine with youki/libcontainer as a daemonless OCI container runtime (ADR-009). Image pull via oci-client, container lifecycle via libcontainer, networking via CNI bridge+portmap, exec via nsenter. `DockerRuntime` extracted to its own crate (`crates/agent-docker/`); `YoukiRuntime` in `crates/agent-youki/`. Runtime selection via compile-time Cargo features (`docker` default, `youki` for Linux production). Build constraint: full build/test on Linux only (`Dockerfile.test` + `docker-compose.test.yml`).
+**Shipped: `contracts/v1.0.1` on `main`** — the v1.0 streaming-exec amendment (sub-modules 12.1–12.7) plus the three v1.0.1 follow-ups (WS `/files/read-stream`, two-listener proxy split, youki `setns(2)` file ops). Exec is a bidirectional stream-shaped session on the proxy's data plane (`SandboxIoService.OpenIoStream`), exposed publicly as WebSocket. File ops share that same data plane. The agent-dials-out architecture, BYO-workers, and youki daemonless runtime (ADR-009) are unchanged.
 
-**Contracts currently at `contracts/v0.7.0-frozen`** (SDK agent ergonomics — list sandboxes, exec stdin/cwd, single-file write_file, GET read_file, base64 stdout, COMMAND_NOT_FOUND, structured exec logs). Implementation merged on `contracts/amendment-sdk-agent-friction`. `AgentError::Docker` is now `AgentError::Runtime`; `ApiError::FileNotFound.path` is now `.resolved_path`.
+Runtime selection is via compile-time Cargo features (`docker` default; `youki` for Linux production via `crates/agent-youki`). Build constraint: full agent-youki build/test on Linux only — use `crates/agent-youki/Dockerfile.test` + `crates/agent-youki/docker-compose.test.yml`. The Dockerfile.test entrypoint handles cgroup v2 setup automatically for nested environments (Docker Desktop, Linux VMs); no manual prep needed.
 
-**Pending major amendment: exec streaming → v1.0.0.** A full pre-amendment design lives at `EXEC_STREAMING_DESIGN.md` (settled decisions, spike-confirmed assumptions, forward trajectory). The executable plan with seven sub-modules, exact file lists, type signatures, observability requirements, and acceptance criteria lives at `PLAN_EXEC_STREAMING.md` (current tag: `plan/v0.6.3`). All five pre-implementation spikes have run clean (results under `spikes/exec-streaming/`). Reshapes exec from a message exchange to a stream-shaped session over WebSocket, riding the data plane (proxy) instead of the control plane (controller). Closes friction items H1–H4, M1, M2, M4, M5 from the post-v0.7 friction report. Implementation will live on `contracts/amendment-exec-streaming`. Before working on any "exec timeout / streaming / process control / file ops" item — read the design first, then the plan.
+**Outstanding v1.0.1 follow-ups** (deferred, visibility-only): see `FOLLOWUPS_v1.0.1.md` P4. Includes Prometheus metrics, four missing tracing event names, `run-all-youki.sh`, and a Rust rewrite of scenario 02. None of these block shipping.
 
 ## Quick status
 
@@ -38,9 +38,11 @@ git tag --list 'module/*/live-verified'
 - `CONTRACTS.md` — prose documentation of the contracts crate
 - `crates/contracts/` — the contracts crate itself (source of truth)
 - `PLAN.md` — decomposition into binaries with dependency DAG and acceptance criteria
-- `EXEC_STREAMING_DESIGN.md` — **pending v1.0 refactor** design doc. Source of truth for *what* the exec streaming amendment is and *why* the data-plane choice was made. Read before any work on exec timeouts, streaming, process control, sessions, file ops, computer-use, or VNC-from-browser.
-- `PLAN_EXEC_STREAMING.md` — **executable plan** for the v1.0 amendment. Seven sub-modules (12.1 – 12.7) with branches, exact file lists, type signatures, TDD cycle expectations, acceptance criteria, observability requirements, smoke tests, risks, and effort estimates. Current tag: `plan/v0.6.3`.
-- `spikes/exec-streaming/spike-0{1..5}-*/RESULT.md` — five confirmed spike outcomes the design + plan rely on:
+- `EXEC_STREAMING_DESIGN.md` — **architectural-decision record** for the shipped v1.0 streaming exec refactor. The "why" behind the data-plane choice, the connection-as-lifetime model, and the five spike conclusions. Still the canonical reference for anyone touching exec timeouts, sessions, file ops, process control, computer-use APIs, or VNC-from-browser.
+- `PLAN_EXEC_STREAMING.md` — **historical implementation plan** for v1.0 (shipped). Tagged `plan/v0.6.3`. Preserved for archeology; do not act on its instructions as if they were pending work.
+- `FOLLOWUPS_v1.0.1.md` — closure log for P1/P2/P3 plus the deferred P4 visibility-only items.
+- `CHANGELOG.md` — public-facing API + behavior changes, organized by contracts version.
+- `spikes/exec-streaming/spike-0{1..5}-*/RESULT.md` — five confirmed spike outcomes the v1.0 design + implementation rely on:
   - 01: docker exec does NOT propagate disconnect → agent must kill explicitly
   - 02: nsenter does NOT propagate SIGTERM → agent must kill explicitly
   - 03: axum WebSocket backpressures + detects abrupt disconnect in ~7ms (idle needs 30s ping)
@@ -54,4 +56,4 @@ git tag --list 'module/*/live-verified'
 - Hetzner is the default cloud for cost optimization; AWS validates the cloud abstraction
 - Cloudflare for DNS regardless of compute cloud
 - Multi-tenancy decision and raw TCP exposure are open questions from the design doc
-- **The exec-as-message vs. exec-as-stream architectural decision has been made and documented in `EXEC_STREAMING_DESIGN.md`.** v1.0 will move exec, file ops, and any future log streaming onto the proxy's data plane as bidi WebSocket streams. Do not propose band-aids on the current message-shaped exec; they perpetuate the architectural mistake the design explicitly rejects. The data-plane choice also positions v1.1 transparent-WebSocket-forwarding (VNC-from-browser, inbound WS apps) and computer-use agent APIs to fall out naturally.
+- **Exec is a stream-shaped session on the proxy's data plane, not a message exchange.** Shipped in v1.0 — see `EXEC_STREAMING_DESIGN.md` for the rationale. Do not propose band-aids that re-introduce message-shaped exec or route exec/file ops via the controller; the architecture explicitly rejects both. The data-plane choice positions transparent-WebSocket-forwarding (VNC-from-browser, inbound WS apps) and computer-use agent APIs to fall out naturally — those remain v1.1+ work.

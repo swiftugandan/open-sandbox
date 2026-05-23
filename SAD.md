@@ -431,7 +431,7 @@ Residual risks:
   - Reverse tunnel multiplexing performance under high concurrent request load is unvalidated. The design assumes HTTP/2 stream multiplexing is sufficient, but pathological workloads (many large concurrent responses) could saturate the single TCP connection per agent.
   - Exec-backed file operations (ADR-008) may hit shell escaping edge cases with binary file content. The tar.gz approach mitigates this (binary-safe archive format), but the exec response path (stdout capture for large files) needs flow control.
 Known gaps:
-  - ExecCommand response flow (agent → controller → API) needs a new proto message type for exec results. The existing proto defines ExecCommand but not an ExecResult. This will be addressed in the contracts amendment.
+  - (Resolved by v1.0 — exec moved off the controller's command stream onto the proxy's data plane via `SandboxIoService.OpenIoStream`. ExecCommand / ExecResult removed from `controller.proto` in module 12.5. See `EXEC_STREAMING_DESIGN.md` for the rationale.)
 ```
 
 Amended with API gateway component (ADR-007, ADR-008). Tagged `sad/v0.2.0`.

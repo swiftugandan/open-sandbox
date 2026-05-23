@@ -1,13 +1,19 @@
 # Plan — Exec Streaming Amendment (v1.0.0)
 
-> **Source of truth for the design:** `EXEC_STREAMING_DESIGN.md`.
-> **Spike results consumed:** `spikes/exec-streaming/spike-0{1,2,3}-*/RESULT.md`.
-> **This document:** the executable plan. Six sub-modules, each with a
-> branch, exact file list, type signatures, TDD cycle expectations,
-> acceptance criterion, smoke test, risks, and effort estimate.
+> **⚠️ SHIPPED — historical reference only.**
 >
-> If you are picking this up cold: read the design doc first, then this
-> file top to bottom, then start at sub-module 12.1.
+> This document was the executable plan for v1.0.0. The amendment
+> merged to `main` (contracts tag `contracts/v1.0.0-frozen`,
+> follow-ups `contracts/v1.0.1`). All seven sub-modules carry
+> `module/exec-streaming-{1..7}-*/done` tags.
+>
+> Do not treat instructions in this file as pending work. If you
+> are designing a *new* amendment, draft a fresh plan document;
+> this one is preserved for archeology.
+>
+> Canonical architectural record: `EXEC_STREAMING_DESIGN.md`.
+> Operator-facing changelog: `CHANGELOG.md`.
+> v1.0.1 follow-up tracking: `FOLLOWUPS_v1.0.1.md`.
 
 ## Status & dependencies
 

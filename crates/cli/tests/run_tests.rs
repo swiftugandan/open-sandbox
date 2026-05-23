@@ -20,6 +20,7 @@ async fn run_proxy_returns_result() {
     let args = ProxyArgs {
         http_port: 8080,
         grpc_port: 50052,
+        internal_grpc_port: 50053,
         database_url: "postgres://localhost/test".to_string(),
     };
     let result = run::run_proxy(args).await;

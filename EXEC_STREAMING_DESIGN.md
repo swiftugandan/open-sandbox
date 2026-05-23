@@ -1,16 +1,22 @@
-# Exec Streaming — Pre-Amendment Design
+# Exec Streaming — Architectural Decision Record
 
-> Status: **design / spikes** — not yet a contracts amendment. Lives on
-> `contracts/amendment-sdk-agent-friction` next to the v0.7.0 work because
-> both concern exec evolution. The implementation amendment branch will
-> be `contracts/amendment-exec-streaming` once the questions below are
-> settled and spikes have completed.
-
-This document is the source of truth for the **exec streaming redesign**
-discussion. If you are picking this up in a new session: read this doc
-first, then the spike results under `spikes/exec-streaming/`, then the
-friction-points consolidation at the bottom of this file. Do not rely on
-memory or chat summaries — this file is the artifact.
+> Status: **shipped in v1.0.0** (paired with `contracts/v1.0.0-frozen`,
+> `spec/v1.0.0`), with v1.0.1 follow-ups merged on `main`. This
+> document is retained as the canonical ADR — the "why" behind the
+> data-plane choice, the connection-as-lifetime model, the rejected
+> alternatives, and the five spike conclusions the architecture rests
+> on. Future amendments that touch exec, file ops, sessions, signals,
+> computer-use APIs, or VNC-from-browser should start here.
+>
+> Companion documents:
+> - `CHANGELOG.md` — operator-facing summary of what shipped.
+> - `CONTRACTS.md` — current contracts version + cross-cutting policies.
+> - `FOLLOWUPS_v1.0.1.md` — closure log + remaining deferred work (P4).
+> - `PLAN_EXEC_STREAMING.md` — historical implementation plan
+>   (archived; do not act on its instructions as if pending).
+>
+> Open-question Q1, Q5, Q6 from the original design were settled
+> during the amendment; their resolutions are recorded inline below.
 
 ---
 

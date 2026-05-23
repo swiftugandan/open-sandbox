@@ -1,5 +1,47 @@
 # CHANGELOG
 
+## v1.0.1 — Streaming read, two-listener proxy, youki setns file ops
+
+On-wire compatible with v1.0.0; no proto changes.
+
+### Additions
+- **`WS /v1/sandboxes/{id}/files/read-stream?path=<...>`** — streaming
+  variant of `GET /files/read`. Raw file bytes as WS Binary frames,
+  terminated by WS Close (`1000` EOF, `44xx` error). Hosted on a
+  distinct path from the unary endpoint to sidestep a transitive
+  axum 0.7/0.8 trait collision pulled in by tonic.
+- **`ReadFileSession`** in `open-sandbox-ws-client` — `connect()` +
+  `next_chunk()`. Companion example: `examples/stream-read-file.rs`.
+
+### Security
+- **Two-listener proxy split.** The proxy now binds two ports:
+  `:50052` (Public role, agents dial here for `OpenTunnel` only)
+  and `:50053` (Internal role, api gateway dials here for
+  `OpenIoStream` only). Wrong-RPC calls return
+  `Status::unimplemented` at the role gate before bearer-token
+  validation. The `OPEN_SANDBOX_INTERNAL_TOKEN` bearer check
+  remains as defense-in-depth. Set both ports equal to fall back
+  to a single combined listener (development only).
+- New flags: `--internal-grpc-port` /
+  `OPEN_SANDBOX_PROXY_INTERNAL_GRPC_PORT`.
+- The api gateway's `--proxy-url` default moves from `:50052` to
+  `:50053`.
+
+### youki backend
+- **File ops via `setns(2)`.** `YoukiRuntime::{read_file,
+  write_file, write_files_targz}` now enter the container's
+  mount namespace from a dedicated thread and call plain
+  `std::fs::*`. Removes the in-container `cat` / `tee` / `tar` /
+  `mkdir` / `mv` invocations. Pure-distroless sandbox images are
+  first-class for the youki file plane.
+
+### Build & test
+- `crates/agent-youki/Dockerfile.test` gains an ENTRYPOINT shim
+  that performs cgroup v2 root-controller delegation before
+  exec'ing the test command. Fixes `libcontainer`'s "no internal
+  process constraint" failure on Docker Desktop's nested Linux
+  VM.
+
 ## v1.0.0 — Streaming exec (first stable release)
 
 Open Sandbox v1.0 is the first contracts version with stability
