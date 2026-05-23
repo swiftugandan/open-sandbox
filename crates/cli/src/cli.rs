@@ -48,9 +48,25 @@ pub struct ProxyArgs {
     #[arg(long, default_value_t = 8080, env = "OPEN_SANDBOX_PROXY_HTTP_PORT")]
     pub http_port: u16,
 
-    /// gRPC listen port for agent tunnel connections
+    /// gRPC listen port for agent tunnel connections (Public role:
+    /// hosts only the OpenTunnel RPC; OpenIoStream calls are
+    /// rejected with Unimplemented at the role gate).
     #[arg(long, default_value_t = 50052, env = "OPEN_SANDBOX_PROXY_GRPC_PORT")]
     pub grpc_port: u16,
+
+    /// gRPC listen port for gateway → proxy OpenIoStream calls
+    /// (Internal role; hosts only the OpenIoStream RPC). In
+    /// production this listener should be reachable ONLY from the
+    /// api gateway's network segment. The bearer-token check
+    /// (INTERNAL_TOKEN env) layers on top of the network
+    /// isolation. Set to the same value as `--grpc-port` to fall
+    /// back to a single combined listener (development only).
+    #[arg(
+        long,
+        default_value_t = 50053,
+        env = "OPEN_SANDBOX_PROXY_INTERNAL_GRPC_PORT"
+    )]
+    pub internal_grpc_port: u16,
 
     /// PostgreSQL connection URL
     #[arg(long, env = "OPEN_SANDBOX_DATABASE_URL")]
@@ -94,10 +110,13 @@ pub struct ApiArgs {
     )]
     pub controller_url: String,
 
-    /// Proxy gRPC address (streaming I/O via OpenIoStream)
+    /// Proxy gRPC address for OpenIoStream — the proxy's
+    /// INTERNAL listener (50053 by default; see ProxyArgs.
+    /// internal_grpc_port). Dialing the public port 50052
+    /// will be rejected with Unimplemented at the role gate.
     #[arg(
         long,
-        default_value = "http://127.0.0.1:50052",
+        default_value = "http://127.0.0.1:50053",
         env = "OPEN_SANDBOX_PROXY_URL"
     )]
     pub proxy_url: String,

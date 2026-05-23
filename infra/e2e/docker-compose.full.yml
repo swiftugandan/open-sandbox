@@ -34,6 +34,9 @@ services:
     command: proxy --database-url postgres://postgres:test@10.0.0.2:5432/open_sandbox
     environment:
       RUST_LOG: info
+      # Shared secret for the internal OpenIoStream listener.
+      # Bearer-checked by the proxy + sent by the api gateway.
+      OPEN_SANDBOX_INTERNAL_TOKEN: e2e-internal-token
     depends_on:
       - controller
     networks:
@@ -61,9 +64,10 @@ services:
     build:
       context: ../..
       dockerfile: infra/e2e/Dockerfile
-    command: api --controller-url http://10.0.0.3:50051 --proxy-url http://10.0.0.4:50052
+    command: api --controller-url http://10.0.0.3:50051 --proxy-url http://10.0.0.4:50053
     environment:
       OPEN_SANDBOX_API_KEY: e2e-api-key
+      OPEN_SANDBOX_INTERNAL_TOKEN: e2e-internal-token
       RUST_LOG: info
     depends_on:
       - controller

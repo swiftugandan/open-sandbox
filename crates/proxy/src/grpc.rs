@@ -20,6 +20,34 @@ use crate::tunnel_pool::TunnelPool;
 
 const INTERNAL_AUTH_METADATA_KEY: &str = "authorization";
 
+/// Which roles a `SandboxIoService` listener exposes. The proxy
+/// runs two listeners — agents reach Public on a port exposed
+/// publicly; the api gateway reaches Internal on a port that
+/// (in production) is reachable only from the gateway's network
+/// segment. Each role serves exactly one of the two RPCs; calls
+/// to the wrong RPC are rejected with `Unimplemented` at the
+/// role gate, *before* the bearer-token check.
+///
+/// `Combined` keeps a single-listener mode for unit tests and
+/// for the rare developer setup where network isolation isn't
+/// available; production deployments should use the two-listener
+/// split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyRole {
+    Public,
+    Internal,
+    Combined,
+}
+
+impl ProxyRole {
+    fn accepts_open_tunnel(self) -> bool {
+        matches!(self, ProxyRole::Public | ProxyRole::Combined)
+    }
+    fn accepts_open_io_stream(self) -> bool {
+        matches!(self, ProxyRole::Internal | ProxyRole::Combined)
+    }
+}
+
 /// Shared dependencies for the proxy's gRPC handlers.
 pub struct SandboxIoHandler<S: RoutingStore> {
     mux: Arc<StreamMux>,
@@ -32,6 +60,8 @@ pub struct SandboxIoHandler<S: RoutingStore> {
     /// the check (used in single-process tests where network
     /// isolation suffices).
     internal_token: Option<String>,
+    /// Which RPCs this handler instance accepts. See [`ProxyRole`].
+    role: ProxyRole,
 }
 
 impl<S: RoutingStore> SandboxIoHandler<S> {
@@ -42,12 +72,31 @@ impl<S: RoutingStore> SandboxIoHandler<S> {
         routing: Arc<RoutingCache<S>>,
         internal_token: Option<String>,
     ) -> Self {
+        Self::with_role(
+            mux,
+            pool,
+            sessions,
+            routing,
+            internal_token,
+            ProxyRole::Combined,
+        )
+    }
+
+    pub fn with_role(
+        mux: Arc<StreamMux>,
+        pool: Arc<TunnelPool>,
+        sessions: Arc<IoSessions>,
+        routing: Arc<RoutingCache<S>>,
+        internal_token: Option<String>,
+        role: ProxyRole,
+    ) -> Self {
         Self {
             mux,
             pool,
             sessions,
             routing,
             internal_token,
+            role,
         }
     }
 }
@@ -60,6 +109,12 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
         &self,
         request: Request<Streaming<TunnelResponse>>,
     ) -> Result<Response<Self::OpenTunnelStream>, Status> {
+        if !self.role.accepts_open_tunnel() {
+            return Err(Status::unimplemented(
+                "OpenTunnel is not served on this proxy listener; \
+                 agents must dial the public listener",
+            ));
+        }
         let mut inbound = request.into_inner();
         let (result_tx, outbound_rx) = mpsc::channel::<Result<TunnelRequest, Status>>(32);
         let (request_tx, mut request_rx) = mpsc::channel::<TunnelRequest>(32);
@@ -125,6 +180,12 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
         &self,
         request: Request<Streaming<IoClientFrame>>,
     ) -> Result<Response<Self::OpenIoStreamStream>, Status> {
+        if !self.role.accepts_open_io_stream() {
+            return Err(Status::unimplemented(
+                "OpenIoStream is not served on this proxy listener; \
+                 the api gateway must dial the internal listener",
+            ));
+        }
         // Internal authn: gateway sends `authorization: Bearer
         // <token>`. Network isolation (separate listener) is the
         // primary defense; the token is defense in depth and
@@ -345,12 +406,31 @@ pub fn sandbox_io_service<S: RoutingStore + 'static>(
     routing: Arc<RoutingCache<S>>,
     internal_token: Option<String>,
 ) -> SandboxIoServiceServer<SandboxIoHandler<S>> {
-    SandboxIoServiceServer::new(SandboxIoHandler::new(
+    sandbox_io_service_with_role(
         mux,
         pool,
         sessions,
         routing,
         internal_token,
+        ProxyRole::Combined,
+    )
+}
+
+pub fn sandbox_io_service_with_role<S: RoutingStore + 'static>(
+    mux: Arc<StreamMux>,
+    pool: Arc<TunnelPool>,
+    sessions: Arc<IoSessions>,
+    routing: Arc<RoutingCache<S>>,
+    internal_token: Option<String>,
+    role: ProxyRole,
+) -> SandboxIoServiceServer<SandboxIoHandler<S>> {
+    SandboxIoServiceServer::new(SandboxIoHandler::with_role(
+        mux,
+        pool,
+        sessions,
+        routing,
+        internal_token,
+        role,
     ))
 }
 
@@ -403,6 +483,129 @@ mod tests {
                 })),
             })),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_io_stream_on_public_listener_returns_unimplemented() {
+        // The public listener (Role::Public) exposes only
+        // OpenTunnel — agent ingress. Any caller that reaches it
+        // and tries to dispatch an OpenIoStream call must be
+        // rejected at the role gate, before the bearer-token
+        // check. This is the network-isolation primary defense
+        // that the v1.0 amendment dropped; v1.0.1 restores it.
+        let pool = Arc::new(TunnelPool::new());
+        let mux = Arc::new(StreamMux::new(pool.clone()));
+        let sessions = Arc::new(IoSessions::new());
+        let routing = empty_cache();
+        let addr =
+            start_proxy_grpc_with_role(mux, pool, sessions, routing, None, ProxyRole::Public).await;
+        let channel = tonic::transport::Channel::from_shared(addr)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = SandboxIoServiceClient::new(channel);
+        let (tx, rx) = mpsc::channel::<IoClientFrame>(1);
+        tx.send(iostart_frame(&SandboxId::new())).await.unwrap();
+        drop(tx);
+        let resp = client.open_io_stream(ReceiverStream::new(rx)).await;
+        match resp {
+            Err(status) => {
+                // Expect UNIMPLEMENTED or UNAUTHENTICATED. Any
+                // other code means the request reached real
+                // dispatch logic, which is the bug this test
+                // guards against.
+                assert!(
+                    matches!(
+                        status.code(),
+                        tonic::Code::Unimplemented | tonic::Code::Unauthenticated
+                    ),
+                    "expected Unimplemented/Unauthenticated on public listener, got {:?}",
+                    status.code()
+                );
+            }
+            Ok(mut response) => {
+                // Some servers may return a streaming response
+                // immediately and then fail on the first frame.
+                let inbound = response.get_mut();
+                match inbound.message().await {
+                    Err(status) => {
+                        assert!(
+                            matches!(
+                                status.code(),
+                                tonic::Code::Unimplemented | tonic::Code::Unauthenticated
+                            ),
+                            "expected Unimplemented/Unauthenticated on first frame from public listener, got {:?}",
+                            status.code()
+                        );
+                    }
+                    Ok(None) => {
+                        panic!("public listener returned a clean empty stream; expected rejection")
+                    }
+                    Ok(Some(_)) => {
+                        panic!("public listener processed an IoStart frame; expected rejection")
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_tunnel_on_internal_listener_returns_unimplemented() {
+        // Symmetric guard: the internal listener (Role::Internal)
+        // hosts only OpenIoStream — gateway egress. Agents that
+        // mis-target it must be rejected at the role gate.
+        let pool = Arc::new(TunnelPool::new());
+        let mux = Arc::new(StreamMux::new(pool.clone()));
+        let sessions = Arc::new(IoSessions::new());
+        let routing = empty_cache();
+        let addr =
+            start_proxy_grpc_with_role(mux, pool, sessions, routing, None, ProxyRole::Internal)
+                .await;
+        let channel = tonic::transport::Channel::from_shared(addr)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = SandboxIoServiceClient::new(channel);
+        let (_outbound_tx, outbound_rx) = mpsc::channel::<TunnelResponse>(1);
+        let outbound = ReceiverStream::new(outbound_rx);
+        let resp = client.open_tunnel(outbound).await;
+        match resp {
+            Err(status) => {
+                assert!(
+                    matches!(
+                        status.code(),
+                        tonic::Code::Unimplemented | tonic::Code::Unauthenticated
+                    ),
+                    "expected Unimplemented/Unauthenticated on internal listener, got {:?}",
+                    status.code()
+                );
+            }
+            Ok(_) => panic!("internal listener accepted an OpenTunnel call; expected rejection"),
+        }
+    }
+
+    async fn start_proxy_grpc_with_role(
+        mux: Arc<StreamMux>,
+        pool: Arc<TunnelPool>,
+        sessions: Arc<IoSessions>,
+        routing: Arc<RoutingCache<InMemoryRoutingStore>>,
+        internal_token: Option<String>,
+        role: ProxyRole,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let service =
+            sandbox_io_service_with_role(mux, pool, sessions, routing, internal_token, role);
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        addr
     }
 
     #[tokio::test(flavor = "multi_thread")]

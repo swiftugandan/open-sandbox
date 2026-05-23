@@ -50,7 +50,32 @@ Recommended: drop the line, document the streaming variant as a
 v1.1 ergonomic; revisit when there's a concrete consumer that
 needs > 64 MiB single-file reads.
 
-## P2 — single proxy gRPC listener (restore the two-listener split)
+## P2 — single proxy gRPC listener (restore the two-listener split) — **CLOSED**
+
+**Status:** Closed in `module/v1.0.1-two-listener-proxy`. The
+proxy now binds two listeners:
+
+- `--grpc-port` (default `50052`, env `OPEN_SANDBOX_PROXY_GRPC_PORT`)
+  — Public role; hosts only `OpenTunnel`. Agents dial here.
+- `--internal-grpc-port` (default `50053`, env
+  `OPEN_SANDBOX_PROXY_INTERNAL_GRPC_PORT`) — Internal role;
+  hosts only `OpenIoStream`. The api gateway dials here.
+
+Calls to the wrong RPC are rejected with `Status::unimplemented`
+at the role gate, *before* the bearer-token check. Setting both
+ports to the same value falls back to a single combined listener
+(development only). Bearer-token check (`OPEN_SANDBOX_INTERNAL_TOKEN`)
+remains as defense-in-depth.
+
+Unit tests added:
+`open_io_stream_on_public_listener_returns_unimplemented` and
+`open_tunnel_on_internal_listener_returns_unimplemented`
+(`crates/proxy/src/grpc.rs`). Live-verified by the full e2e suite
+(9/9 green with the split active).
+
+The original text follows for historical context.
+
+---
 
 The proxy currently binds ONE TCP port (`crates/cli/src/run.rs`)
 hosting both:
