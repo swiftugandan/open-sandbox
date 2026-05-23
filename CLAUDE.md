@@ -12,7 +12,7 @@ Phase 6 complete: all modules implemented including `agent-youki`. Controller, a
 
 **Contracts currently at `contracts/v0.7.0-frozen`** (SDK agent ergonomics — list sandboxes, exec stdin/cwd, single-file write_file, GET read_file, base64 stdout, COMMAND_NOT_FOUND, structured exec logs). Implementation merged on `contracts/amendment-sdk-agent-friction`. `AgentError::Docker` is now `AgentError::Runtime`; `ApiError::FileNotFound.path` is now `.resolved_path`.
 
-**Pending major amendment: exec streaming → v1.0.0.** A full pre-amendment design lives at `EXEC_STREAMING_DESIGN.md` (settled decisions, spike-confirmed assumptions, forward trajectory). Reshapes exec from a message exchange to a stream-shaped session over WebSocket, riding the data plane (proxy) instead of the control plane (controller). Closes friction items H1–H4, M1, M2, M4, M5 from the post-v0.7 friction report. Implementation will live on `contracts/amendment-exec-streaming`. Before working on any "exec timeout / streaming / process control / file ops" item — read that design first.
+**Pending major amendment: exec streaming → v1.0.0.** A full pre-amendment design lives at `EXEC_STREAMING_DESIGN.md` (settled decisions, spike-confirmed assumptions, forward trajectory). The executable plan with seven sub-modules, exact file lists, type signatures, observability requirements, and acceptance criteria lives at `PLAN_EXEC_STREAMING.md` (current tag: `plan/v0.6.3`). All five pre-implementation spikes have run clean (results under `spikes/exec-streaming/`). Reshapes exec from a message exchange to a stream-shaped session over WebSocket, riding the data plane (proxy) instead of the control plane (controller). Closes friction items H1–H4, M1, M2, M4, M5 from the post-v0.7 friction report. Implementation will live on `contracts/amendment-exec-streaming`. Before working on any "exec timeout / streaming / process control / file ops" item — read the design first, then the plan.
 
 ## Quick status
 
@@ -38,8 +38,14 @@ git tag --list 'module/*/live-verified'
 - `CONTRACTS.md` — prose documentation of the contracts crate
 - `crates/contracts/` — the contracts crate itself (source of truth)
 - `PLAN.md` — decomposition into binaries with dependency DAG and acceptance criteria
-- `EXEC_STREAMING_DESIGN.md` — **pending v1.0 refactor** design doc. Source of truth for the exec streaming amendment. Read before any work on exec timeouts, streaming, process control, sessions, file ops, computer-use, or VNC-from-browser.
-- `spikes/exec-streaming/spike-0{1,2,3}-*/RESULT.md` — confirmed spike outcomes the design relies on (both runtimes need explicit kill-on-disconnect; axum WebSocket backpressures and detects disconnects cleanly).
+- `EXEC_STREAMING_DESIGN.md` — **pending v1.0 refactor** design doc. Source of truth for *what* the exec streaming amendment is and *why* the data-plane choice was made. Read before any work on exec timeouts, streaming, process control, sessions, file ops, computer-use, or VNC-from-browser.
+- `PLAN_EXEC_STREAMING.md` — **executable plan** for the v1.0 amendment. Seven sub-modules (12.1 – 12.7) with branches, exact file lists, type signatures, TDD cycle expectations, acceptance criteria, observability requirements, smoke tests, risks, and effort estimates. Current tag: `plan/v0.6.3`.
+- `spikes/exec-streaming/spike-0{1..5}-*/RESULT.md` — five confirmed spike outcomes the design + plan rely on:
+  - 01: docker exec does NOT propagate disconnect → agent must kill explicitly
+  - 02: nsenter does NOT propagate SIGTERM → agent must kill explicitly
+  - 03: axum WebSocket backpressures + detects abrupt disconnect in ~7ms (idle needs 30s ping)
+  - 04: bollard exec pipeline backpressures end-to-end (~10 MiB chain buffer)
+  - 05: youki PID-capture race is sub-millisecond (p99 = 484 μs, max = 12 ms; plan's 5×10ms polling has 4× margin)
 
 ## Notes for future sessions
 
