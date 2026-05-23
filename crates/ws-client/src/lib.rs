@@ -263,3 +263,89 @@ fn decode_server(bytes: &[u8]) -> Result<ServerFrame, WsClientError> {
         ))),
     }
 }
+
+/// Streaming file-read session over WebSocket.
+///
+/// Wire: `GET ws://gateway/v1/sandboxes/{id}/files/read-stream?path=<urlencoded>[&cwd=...]`
+/// with `Authorization: Bearer <api-key>`. Server emits raw file
+/// bytes as WS Binary frames and closes with code 1000 on EOF or a
+/// 44xx-range code on failure.
+pub struct ReadFileSession {
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    closed_ok: bool,
+}
+
+impl ReadFileSession {
+    /// Open a streaming file read.
+    pub async fn connect(
+        base_url: &str,
+        sandbox_id: &str,
+        api_key: &str,
+        path: &str,
+        cwd: Option<&str>,
+    ) -> Result<Self, WsClientError> {
+        let encoded_path = urlencoding::encode(path);
+        let mut url =
+            format!("{base_url}/v1/sandboxes/{sandbox_id}/files/read-stream?path={encoded_path}");
+        if let Some(c) = cwd {
+            url.push_str(&format!("&cwd={}", urlencoding::encode(c)));
+        }
+        let mut request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+                .map_err(|e| WsClientError::Connect(e.to_string()))?;
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {api_key}").parse().map_err(
+                |e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| {
+                    WsClientError::Connect(e.to_string())
+                },
+            )?,
+        );
+        let (ws, _) = connect_async(request)
+            .await
+            .map_err(|e| WsClientError::Connect(e.to_string()))?;
+        Ok(Self {
+            ws,
+            closed_ok: false,
+        })
+    }
+
+    /// Read the next chunk of file bytes, or `Ok(None)` on EOF
+    /// (server closed with WS code 1000). On any non-1000 close
+    /// code returns `Err(WsClientError::Protocol)` with the
+    /// server-supplied reason.
+    pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, WsClientError> {
+        loop {
+            let msg = match self.ws.next().await {
+                None if self.closed_ok => return Ok(None),
+                None => return Err(WsClientError::Closed),
+                Some(Err(e)) => return Err(WsClientError::Io(e.to_string())),
+                Some(Ok(m)) => m,
+            };
+            match msg {
+                WsMessage::Binary(bytes) => return Ok(Some(Bytes::from(bytes))),
+                WsMessage::Close(frame) => {
+                    if let Some(f) = frame {
+                        let code = u16::from(f.code);
+                        if code == 1000 {
+                            self.closed_ok = true;
+                            return Ok(None);
+                        }
+                        return Err(WsClientError::Protocol(format!(
+                            "server closed with code {} reason: {}",
+                            code, f.reason
+                        )));
+                    }
+                    self.closed_ok = true;
+                    return Ok(None);
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => continue,
+                WsMessage::Text(_) => {
+                    return Err(WsClientError::Protocol(
+                        "received text frame; expected binary".into(),
+                    ));
+                }
+            }
+        }
+    }
+}

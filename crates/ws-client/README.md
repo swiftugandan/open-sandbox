@@ -86,6 +86,7 @@ Three runnable examples are included under `examples/`:
 | `echo`               | Minimal command + capture stdout                           |
 | `long-running-build` | Exec runs past the legacy 60s timeout (no client timeout)  |
 | `interactive-bash`   | Bidirectional shell; half-close stdin to signal EOF        |
+| `stream-read-file`   | Stream a file out via `WS /files/read-stream`              |
 
 Run them against a running stack:
 

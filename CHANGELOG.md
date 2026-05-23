@@ -22,6 +22,9 @@ Streaming I/O (`Authorization: Bearer <api-key>` on the WebSocket
 upgrade):
 
 - `WS /v1/sandboxes/{id}/exec` — bidirectional exec session
+- `WS /v1/sandboxes/{id}/files/read-stream?path=<...>` — chunked
+  file read; raw bytes as WS Binary frames, terminated by WS
+  Close (1000 = EOF, 44xx = error)
 
 ### Architecture
 
