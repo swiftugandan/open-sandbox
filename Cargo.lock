@@ -2267,9 +2267,11 @@ dependencies = [
  "open-sandbox-contracts",
  "prost-types",
  "sqlx",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
  "uuid",
 ]
 

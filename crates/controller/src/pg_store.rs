@@ -5,6 +5,10 @@ use open_sandbox_contracts::types::{AgentId, RoutingEntry, SandboxId};
 
 use crate::store::*;
 
+/// Postgres LISTEN channel name proxies subscribe to for routing-table change
+/// notifications. See REVIEW_LOG.md F4.
+pub const ROUTING_CHANGED_CHANNEL: &str = "routing_changed";
+
 pub struct PgStore {
     pool: PgPool,
 }
@@ -68,6 +72,37 @@ impl PgStore {
             .map_err(|e| ControllerError::Database {
                 detail: e.to_string(),
             })?;
+
+        // F5: per-sandbox capacity reservation lives on the sandboxes row so
+        // release_sandbox can credit the correct amount back without the
+        // caller needing to track requirements.
+        sqlx::query(
+            "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS cpu_millicores INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        sqlx::query(
+            "ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS memory_bytes BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        // F6: heartbeat liveness is persisted so dead-agent detection survives
+        // a controller restart and is visible across replicas.
+        sqlx::query(
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
 
         Ok(())
     }
@@ -161,17 +196,18 @@ impl ControllerStore for PgStore {
     }
 
     async fn insert_routing_entry(&self, entry: RoutingEntry) -> Result<(), ControllerError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
         sqlx::query(
             "INSERT INTO routing_entries (sandbox_id, agent_id) VALUES ($1, $2)
              ON CONFLICT (sandbox_id) DO UPDATE SET agent_id = EXCLUDED.agent_id",
         )
         .bind(entry.sandbox_id.0)
         .bind(entry.agent_id.0)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| ControllerError::Database {
-            detail: e.to_string(),
-        })?;
+        .map_err(db_err)?;
+        notify_routing_change(&mut tx, "insert", entry.sandbox_id.0, Some(entry.agent_id.0)).await?;
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -179,13 +215,23 @@ impl ControllerStore for PgStore {
         &self,
         agent_id: &AgentId,
     ) -> Result<(), ControllerError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Capture affected sandboxes BEFORE delete so we can emit per-row notifies.
+        let rows: Vec<(uuid::Uuid,)> =
+            sqlx::query_as("SELECT sandbox_id FROM routing_entries WHERE agent_id = $1")
+                .bind(agent_id.0)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
         sqlx::query("DELETE FROM routing_entries WHERE agent_id = $1")
             .bind(agent_id.0)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| ControllerError::Database {
-                detail: e.to_string(),
-            })?;
+            .map_err(db_err)?;
+        for (sid,) in rows {
+            notify_routing_change(&mut tx, "remove", sid, None).await?;
+        }
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -227,13 +273,14 @@ impl ControllerStore for PgStore {
     }
 
     async fn remove_routing_entry(&self, sandbox_id: &SandboxId) -> Result<(), ControllerError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
         sqlx::query("DELETE FROM routing_entries WHERE sandbox_id = $1")
             .bind(sandbox_id.0)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| ControllerError::Database {
-                detail: e.to_string(),
-            })?;
+            .map_err(db_err)?;
+        notify_routing_change(&mut tx, "remove", sandbox_id.0, None).await?;
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -277,6 +324,252 @@ impl ControllerStore for PgStore {
                 })?;
         Ok(row.map(|(state, error)| crate::store::SandboxStateRow { state, error }))
     }
+
+    async fn mark_agent_dead_atomic(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<(), ControllerError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        let result = sqlx::query("UPDATE agents SET state = $1 WHERE agent_id = $2")
+            .bind(state_to_str(&AgentState::Dead))
+            .bind(agent_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        if result.rows_affected() == 0 {
+            return Err(ControllerError::AgentNotFound {
+                agent_id: agent_id.to_string(),
+            });
+        }
+
+        let affected: Vec<(uuid::Uuid,)> =
+            sqlx::query_as("SELECT sandbox_id FROM routing_entries WHERE agent_id = $1")
+                .bind(agent_id.0)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+
+        sqlx::query("DELETE FROM routing_entries WHERE agent_id = $1")
+            .bind(agent_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+
+        for (sid,) in affected {
+            notify_routing_change(&mut tx, "remove", sid, None).await?;
+        }
+
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn try_assign_sandbox(
+        &self,
+        agent_id: &AgentId,
+        sandbox_id: &SandboxId,
+        cpu_millicores: u32,
+        memory_bytes: u64,
+    ) -> Result<bool, ControllerError> {
+        let mut tx = self.pool.begin().await.map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        // SELECT FOR UPDATE locks the agent row for the duration of the txn,
+        // serializing concurrent try_assign attempts on the same agent.
+        let row: Option<(i32, i64, String)> = sqlx::query_as(
+            "SELECT available_cpu_millicores, available_memory_bytes, state
+             FROM agents WHERE agent_id = $1 FOR UPDATE",
+        )
+        .bind(agent_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        let Some((avail_cpu, avail_mem, state)) = row else {
+            return Err(ControllerError::AgentNotFound {
+                agent_id: agent_id.to_string(),
+            });
+        };
+        if state != "active" {
+            return Ok(false);
+        }
+        if (avail_cpu as u32) < cpu_millicores || (avail_mem as u64) < memory_bytes {
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "UPDATE agents SET
+                available_cpu_millicores = available_cpu_millicores - $1,
+                available_memory_bytes = available_memory_bytes - $2,
+                running_sandboxes = running_sandboxes + 1
+             WHERE agent_id = $3",
+        )
+        .bind(cpu_millicores as i32)
+        .bind(memory_bytes as i64)
+        .bind(agent_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        sqlx::query("INSERT INTO routing_entries (sandbox_id, agent_id) VALUES ($1, $2)")
+            .bind(sandbox_id.0)
+            .bind(agent_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+
+        notify_routing_change(&mut tx, "insert", sandbox_id.0, Some(agent_id.0)).await?;
+
+        // Persist the reservation alongside the sandboxes row so release_sandbox
+        // can credit the correct amount back. ON CONFLICT preserves any state
+        // already written via save_sandbox_state but updates the requirements.
+        sqlx::query(
+            "INSERT INTO sandboxes (sandbox_id, agent_id, state, cpu_millicores, memory_bytes)
+             VALUES ($1, $2, 'reserved', $3, $4)
+             ON CONFLICT (sandbox_id) DO UPDATE SET
+                agent_id = EXCLUDED.agent_id,
+                cpu_millicores = EXCLUDED.cpu_millicores,
+                memory_bytes = EXCLUDED.memory_bytes",
+        )
+        .bind(sandbox_id.0)
+        .bind(agent_id.0)
+        .bind(cpu_millicores as i32)
+        .bind(memory_bytes as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        tx.commit().await.map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        Ok(true)
+    }
+
+    async fn record_heartbeat(&self, agent_id: &AgentId) -> Result<(), ControllerError> {
+        sqlx::query("UPDATE agents SET last_heartbeat_at = now() WHERE agent_id = $1")
+            .bind(agent_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ControllerError::Database {
+                detail: e.to_string(),
+            })?;
+        Ok(())
+    }
+
+    async fn dead_agents(&self) -> Result<Vec<AgentId>, ControllerError> {
+        use open_sandbox_contracts::constants::DEAD_AGENT_TIMEOUT;
+        let threshold_secs = DEAD_AGENT_TIMEOUT.as_secs() as f64;
+        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
+            "SELECT agent_id FROM agents
+             WHERE state = 'active'
+               AND last_heartbeat_at < now() - ($1::float8 * interval '1 second')",
+        )
+        .bind(threshold_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        Ok(rows.into_iter().map(|(id,)| AgentId(id)).collect())
+    }
+
+    async fn release_sandbox(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<AgentId>, ControllerError> {
+        let mut tx = self.pool.begin().await.map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        let row: Option<(uuid::Uuid, i32, i64)> = sqlx::query_as(
+            "SELECT agent_id, cpu_millicores, memory_bytes FROM sandboxes WHERE sandbox_id = $1 FOR UPDATE",
+        )
+        .bind(sandbox_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        let Some((agent_uuid, cpu, mem)) = row else {
+            return Ok(None);
+        };
+
+        sqlx::query(
+            "UPDATE agents SET
+                available_cpu_millicores = available_cpu_millicores + $1,
+                available_memory_bytes = available_memory_bytes + $2,
+                running_sandboxes = GREATEST(running_sandboxes - 1, 0)
+             WHERE agent_id = $3",
+        )
+        .bind(cpu)
+        .bind(mem)
+        .bind(agent_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
+        sqlx::query("DELETE FROM routing_entries WHERE sandbox_id = $1")
+            .bind(sandbox_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+
+        notify_routing_change(&mut tx, "remove", sandbox_id.0, None).await?;
+
+        sqlx::query("DELETE FROM sandboxes WHERE sandbox_id = $1")
+            .bind(sandbox_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ControllerError::Database {
+                detail: e.to_string(),
+            })?;
+
+        tx.commit().await.map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        Ok(Some(AgentId(agent_uuid)))
+    }
+}
+
+fn db_err(e: sqlx::Error) -> ControllerError {
+    ControllerError::Database {
+        detail: e.to_string(),
+    }
+}
+
+/// Emit a routing-table change notification inside the current transaction.
+/// Listeners (proxies) subscribed to ROUTING_CHANGED_CHANNEL receive the
+/// payload only when the transaction commits — see REVIEW_LOG.md F4.
+async fn notify_routing_change(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    op: &str,
+    sandbox_id: uuid::Uuid,
+    agent_id: Option<uuid::Uuid>,
+) -> Result<(), ControllerError> {
+    let payload = match agent_id {
+        Some(aid) => format!(
+            r#"{{"op":"{op}","sandbox_id":"{sid}","agent_id":"{aid}"}}"#,
+            sid = sandbox_id,
+        ),
+        None => format!(r#"{{"op":"{op}","sandbox_id":"{sid}"}}"#, sid = sandbox_id),
+    };
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(ROUTING_CHANGED_CHANNEL)
+        .bind(payload)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    Ok(())
 }
 
 fn state_to_str(state: &AgentState) -> &'static str {

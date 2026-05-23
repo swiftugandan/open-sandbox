@@ -79,6 +79,57 @@ pub trait ControllerStore: Send + Sync {
         &self,
         sandbox_id: &SandboxId,
     ) -> impl Future<Output = Result<Option<SandboxStateRow>, ControllerError>> + Send;
+
+    /// Atomically transition an agent to Dead AND remove all of its routing
+    /// entries. Either both writes persist, or neither does — implementations
+    /// MUST NOT leave the system in a state where the agent is marked Dead in
+    /// storage but routing entries still reference it (or vice-versa).
+    ///
+    /// AgentNotFound is returned only when the agent did not exist before the
+    /// call; transient errors return ControllerError::Database so the caller
+    /// can retry. See REVIEW_LOG.md F7 for the original failure mode.
+    fn mark_agent_dead_atomic(
+        &self,
+        agent_id: &AgentId,
+    ) -> impl Future<Output = Result<(), ControllerError>> + Send;
+
+    /// Atomically reserve capacity on the chosen agent AND insert the routing
+    /// entry. Returns Ok(true) on success; Ok(false) if the agent's available
+    /// capacity is below the request (a concurrent assign won the race). The
+    /// requirements are persisted alongside the routing entry so that
+    /// release_sandbox can credit the correct amount back without the caller
+    /// needing to track it. See REVIEW_LOG.md F5.
+    fn try_assign_sandbox(
+        &self,
+        agent_id: &AgentId,
+        sandbox_id: &SandboxId,
+        cpu_millicores: u32,
+        memory_bytes: u64,
+    ) -> impl Future<Output = Result<bool, ControllerError>> + Send;
+
+    /// Atomically release the capacity reserved by try_assign_sandbox AND
+    /// remove the routing entry. Returns the agent that was holding the
+    /// sandbox, or None if the sandbox had no reservation (idempotent). See
+    /// REVIEW_LOG.md F5.
+    fn release_sandbox(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> impl Future<Output = Result<Option<AgentId>, ControllerError>> + Send;
+
+    /// Record that the given agent is alive as of now. Persists to durable
+    /// storage so heartbeat liveness survives a controller restart and is
+    /// visible across replicas. See REVIEW_LOG.md F6.
+    fn record_heartbeat(
+        &self,
+        agent_id: &AgentId,
+    ) -> impl Future<Output = Result<(), ControllerError>> + Send;
+
+    /// Return the agents whose last_heartbeat_at is older than DEAD_AGENT_TIMEOUT
+    /// AND whose state is still Active. Used by sweep_dead_agents to drive
+    /// eviction; the threshold lives in contracts/v1.0.1 (DEAD_AGENT_TIMEOUT).
+    fn dead_agents(
+        &self,
+    ) -> impl Future<Output = Result<Vec<AgentId>, ControllerError>> + Send;
 }
 
 #[derive(Debug, Clone)]

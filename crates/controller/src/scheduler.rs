@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use open_sandbox_contracts::error::ControllerError;
-use open_sandbox_contracts::types::{AgentId, RoutingEntry, SandboxId};
+use open_sandbox_contracts::types::{AgentId, SandboxId};
 
 use crate::store::ControllerStore;
 
@@ -10,6 +10,7 @@ pub struct SandboxRequirements {
     pub memory_bytes: u64,
 }
 
+#[derive(Debug)]
 pub struct SandboxAssignment {
     pub agent_id: AgentId,
     pub sandbox_id: SandboxId,
@@ -37,31 +38,36 @@ impl<S: ControllerStore> Scheduler<S> {
         sandbox_id: SandboxId,
         requirements: &SandboxRequirements,
     ) -> Result<SandboxAssignment, ControllerError> {
-        let agents = self.store.list_active_agents().await?;
+        // F5: walk candidates in best-first order, attempting an atomic
+        // reservation on each. try_assign_sandbox returns Ok(false) when a
+        // concurrent assign won the capacity race; we try the next candidate
+        // rather than overcommitting the same agent.
+        let mut agents = self.store.list_active_agents().await?;
+        agents.sort_by(|a, b| b.available.cpu_millicores.cmp(&a.available.cpu_millicores));
 
-        let best = agents
-            .into_iter()
-            .filter(|a| {
-                a.available.cpu_millicores >= requirements.cpu_millicores
-                    && a.available.memory_bytes >= requirements.memory_bytes
-            })
-            .max_by_key(|a| a.available.cpu_millicores);
-
-        match best {
-            Some(agent) => {
-                let entry = RoutingEntry {
-                    sandbox_id: sandbox_id.clone(),
-                    agent_id: agent.agent_id.clone(),
-                };
-                self.store.insert_routing_entry(entry).await?;
-
-                Ok(SandboxAssignment {
+        for agent in agents {
+            if agent.available.cpu_millicores < requirements.cpu_millicores
+                || agent.available.memory_bytes < requirements.memory_bytes
+            {
+                continue;
+            }
+            let reserved = self
+                .store
+                .try_assign_sandbox(
+                    &agent.agent_id,
+                    &sandbox_id,
+                    requirements.cpu_millicores,
+                    requirements.memory_bytes,
+                )
+                .await?;
+            if reserved {
+                return Ok(SandboxAssignment {
                     agent_id: agent.agent_id,
                     sandbox_id,
-                })
+                });
             }
-            None => Err(ControllerError::NoAvailableAgents),
         }
+        Err(ControllerError::NoAvailableAgents)
     }
 }
 
@@ -160,6 +166,85 @@ mod tests {
             .assign_sandbox(SandboxId::new(), &requirements)
             .await;
         assert!(matches!(result, Err(ControllerError::NoAvailableAgents)));
+    }
+
+    #[tokio::test]
+    async fn back_to_back_assigns_debit_capacity_no_overcommit() {
+        // F5: scheduler must reserve capacity on assign so concurrent /
+        // back-to-back create_sandbox calls don't all pile onto the same
+        // 'max available' agent. With one 4000-millicore agent and three
+        // 1500-millicore sandboxes, only two should fit; the third must
+        // return NoAvailableAgents.
+        let store = Arc::new(InMemoryStore::new());
+        let agent = AgentRecord {
+            agent_id: AgentId::new(),
+            capacity: AgentCapacity {
+                cpu_cores: 4,
+                memory_bytes: 8_000_000_000,
+            },
+            available: AvailableResources {
+                cpu_millicores: 4000,
+                memory_bytes: 8_000_000_000,
+                running_sandboxes: 0,
+            },
+            state: AgentState::Active,
+        };
+        store.save_agent(agent).await.unwrap();
+        let scheduler = Scheduler::new(store);
+        let req = SandboxRequirements {
+            cpu_millicores: 1500,
+            memory_bytes: 512_000_000,
+        };
+
+        let a1 = scheduler.assign_sandbox(SandboxId::new(), &req).await;
+        let a2 = scheduler.assign_sandbox(SandboxId::new(), &req).await;
+        let a3 = scheduler.assign_sandbox(SandboxId::new(), &req).await;
+
+        assert!(a1.is_ok(), "first assign should succeed");
+        assert!(a2.is_ok(), "second assign should succeed (3000/4000 used)");
+        assert!(
+            matches!(a3, Err(ControllerError::NoAvailableAgents)),
+            "third assign must fail — 4500 > 4000 millicores: {a3:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_sandbox_restores_capacity() {
+        // F5: release_sandbox credits the reserved capacity back so a
+        // delete_sandbox / send_command rollback path leaves the agent
+        // schedulable again.
+        let store = Arc::new(InMemoryStore::new());
+        let agent_id = AgentId::new();
+        let agent = AgentRecord {
+            agent_id: agent_id.clone(),
+            capacity: AgentCapacity {
+                cpu_cores: 4,
+                memory_bytes: 8_000_000_000,
+            },
+            available: AvailableResources {
+                cpu_millicores: 4000,
+                memory_bytes: 8_000_000_000,
+                running_sandboxes: 0,
+            },
+            state: AgentState::Active,
+        };
+        store.save_agent(agent).await.unwrap();
+        let scheduler = Scheduler::new(store.clone());
+        let req = SandboxRequirements {
+            cpu_millicores: 3000,
+            memory_bytes: 512_000_000,
+        };
+
+        let a1 = scheduler.assign_sandbox(SandboxId::new(), &req).await.unwrap();
+        // After reservation: 1000 millicores left, can't fit another 3000.
+        let blocked = scheduler.assign_sandbox(SandboxId::new(), &req).await;
+        assert!(matches!(blocked, Err(ControllerError::NoAvailableAgents)));
+
+        // Release and retry — now there's room.
+        let released = store.release_sandbox(&a1.sandbox_id).await.unwrap();
+        assert_eq!(released, Some(agent_id));
+        let retry = scheduler.assign_sandbox(SandboxId::new(), &req).await;
+        assert!(retry.is_ok(), "capacity should be restored after release: {retry:?}");
     }
 
     #[tokio::test]

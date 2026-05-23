@@ -1,3 +1,5 @@
+pub mod auth;
+pub mod error_status;
 pub mod grpc;
 pub mod heartbeat;
 pub mod management;

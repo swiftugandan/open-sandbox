@@ -62,13 +62,7 @@ impl<S: ControllerStore> AgentRegistry<S> {
     }
 
     pub async fn mark_agent_dead(&self, agent_id: &AgentId) -> Result<(), ControllerError> {
-        self.store
-            .update_agent_state(agent_id, AgentState::Dead)
-            .await?;
-        self.store
-            .remove_routing_entries_for_agent(agent_id)
-            .await?;
-        Ok(())
+        self.store.mark_agent_dead_atomic(agent_id).await
     }
 }
 
@@ -170,6 +164,50 @@ mod tests {
             result.unwrap_err(),
             ControllerError::AgentNotFound { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn mark_dead_rolls_back_state_when_routing_delete_fails() {
+        // F7: mark_agent_dead must be atomic. If the second write fails, the
+        // first (state→Dead) must be rolled back so the system never observes
+        // 'agent is Dead but routing entries still point at it'.
+        let store = Arc::new(FailNextStore::new());
+        let registry = AgentRegistry::new(store.clone(), AcceptAllTokens);
+        let agent_id = AgentId::new();
+
+        registry
+            .register(
+                agent_id.clone(),
+                &JoinToken::new("token".into()),
+                test_capacity(),
+            )
+            .await
+            .unwrap();
+        store
+            .insert_routing_entry(RoutingEntry {
+                sandbox_id: SandboxId::new(),
+                agent_id: agent_id.clone(),
+            })
+            .await
+            .unwrap();
+
+        store.arm_remove_routing_entries_for_agent_failure();
+
+        let err = registry.mark_agent_dead(&agent_id).await.unwrap_err();
+        assert!(matches!(err, ControllerError::Database { .. }));
+
+        // Atomicity: agent state MUST still be Active, routing entry MUST persist.
+        let agent = store.get_agent(&agent_id).await.unwrap().unwrap();
+        assert_eq!(
+            agent.state,
+            AgentState::Active,
+            "agent state must be rolled back when the second write fails"
+        );
+        assert_eq!(
+            store.inner().routing_entries_for_agent(&agent_id).len(),
+            1,
+            "routing entry must be untouched when the operation fails"
+        );
     }
 
     #[tokio::test]

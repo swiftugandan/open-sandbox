@@ -65,7 +65,7 @@ impl AgentConnections {
 
 pub struct GrpcHandler<S: ControllerStore> {
     registry: Arc<AgentRegistry<S>>,
-    heartbeat_monitor: Arc<HeartbeatMonitor>,
+    heartbeat_monitor: Arc<HeartbeatMonitor<S>>,
     connections: Arc<AgentConnections>,
     store: Arc<S>,
 }
@@ -114,7 +114,11 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                         let response = match result {
                             Ok(RegistrationResult::Accepted) => {
                                 connections.add(agent_id.clone(), tx.clone());
-                                heartbeat_monitor.record_heartbeat(agent_id.clone());
+                                if let Err(e) =
+                                    heartbeat_monitor.record_heartbeat(&agent_id).await
+                                {
+                                    tracing::warn!(error = %e, "record_heartbeat at register failed");
+                                }
                                 registered_agent_id = Some(agent_id);
                                 RegisterResponse {
                                     accepted: true,
@@ -148,12 +152,36 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                         };
                         let agent_id = AgentId::from(agent_uuid);
 
+                        // F3: the heartbeat MUST refer to the stream's registered agent.
+                        // A mismatch is treated as a benign protocol drift (could be a
+                        // racy reconnect) and dropped — not stream-fatal.
+                        match registered_agent_id.as_ref() {
+                            Some(reg) if reg == &agent_id => {}
+                            Some(reg) => {
+                                tracing::warn!(
+                                    stream_agent = %reg,
+                                    msg_agent = %agent_id,
+                                    "heartbeat agent_id mismatch; dropping"
+                                );
+                                continue;
+                            }
+                            None => {
+                                tracing::warn!(
+                                    msg_agent = %agent_id,
+                                    "heartbeat before Register; dropping"
+                                );
+                                continue;
+                            }
+                        }
+
                         if let Err(e) = registry.heartbeat(&agent_id).await {
                             let _ = tx.send(Err(Status::not_found(e.to_string()))).await;
                             break;
                         }
 
-                        heartbeat_monitor.record_heartbeat(agent_id);
+                        if let Err(e) = heartbeat_monitor.record_heartbeat(&agent_id).await {
+                            tracing::warn!(error = %e, "record_heartbeat failed");
+                        }
 
                         let ack = HeartbeatAck {
                             timestamp: Some(prost_types::Timestamp::from(
@@ -169,20 +197,57 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                     }
 
                     agent_message::Payload::SandboxStatus(status) => {
-                        if let Some(ref agent_id) = registered_agent_id {
-                            let sandbox_id =
-                                uuid::Uuid::parse_str(&status.sandbox_id).map(SandboxId::from);
-                            if let Ok(sandbox_id) = sandbox_id {
-                                let state_str = sandbox_state_to_str(status.state());
-                                let error = if status.error_message.is_empty() {
-                                    None
-                                } else {
-                                    Some(status.error_message.as_str())
-                                };
-                                let _ = store
-                                    .save_sandbox_state(&sandbox_id, agent_id, state_str, error)
-                                    .await;
+                        let Some(ref agent_id) = registered_agent_id else {
+                            tracing::warn!("SandboxStatus before Register; dropping");
+                            continue;
+                        };
+                        let Ok(sandbox_id) =
+                            uuid::Uuid::parse_str(&status.sandbox_id).map(SandboxId::from)
+                        else {
+                            continue;
+                        };
+
+                        // F2: only the agent that owns the routing entry may
+                        // update the sandbox's state. A mismatch (or a routing
+                        // entry that no longer exists) is dropped with a warn,
+                        // not stream-fatal — a benign race during failover
+                        // shouldn't tear down a healthy agent stream.
+                        match store.find_routing_entry(&sandbox_id).await {
+                            Ok(Some(entry)) if entry.agent_id == *agent_id => {}
+                            Ok(Some(entry)) => {
+                                tracing::warn!(
+                                    sender = %agent_id,
+                                    owner = %entry.agent_id,
+                                    sandbox = %sandbox_id,
+                                    "SandboxStatus from non-owning agent; dropping"
+                                );
+                                continue;
                             }
+                            Ok(None) => {
+                                tracing::warn!(
+                                    sender = %agent_id,
+                                    sandbox = %sandbox_id,
+                                    "SandboxStatus for sandbox with no routing entry; dropping"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "find_routing_entry failed; dropping SandboxStatus");
+                                continue;
+                            }
+                        }
+
+                        let state_str = sandbox_state_to_str(status.state());
+                        let error = if status.error_message.is_empty() {
+                            None
+                        } else {
+                            Some(status.error_message.as_str())
+                        };
+                        if let Err(e) = store
+                            .save_sandbox_state(&sandbox_id, agent_id, state_str, error)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "save_sandbox_state failed");
                         }
                     }
 
@@ -209,7 +274,7 @@ pub struct CreateSandboxRequest {
 
 pub struct Controller<S: ControllerStore> {
     pub(crate) registry: Arc<AgentRegistry<S>>,
-    pub(crate) heartbeat_monitor: Arc<HeartbeatMonitor>,
+    pub(crate) heartbeat_monitor: Arc<HeartbeatMonitor<S>>,
     pub(crate) scheduler: Arc<Scheduler<S>>,
     pub(crate) connections: Arc<AgentConnections>,
 }
@@ -217,7 +282,7 @@ pub struct Controller<S: ControllerStore> {
 impl<S: ControllerStore + 'static> Controller<S> {
     pub fn new(store: Arc<S>, validator: impl TokenValidator + 'static) -> Self {
         let registry = Arc::new(AgentRegistry::new(store.clone(), validator));
-        let heartbeat_monitor = Arc::new(HeartbeatMonitor::new());
+        let heartbeat_monitor = Arc::new(HeartbeatMonitor::new(store.clone()));
         let scheduler = Arc::new(Scheduler::new(store));
         let connections = Arc::new(AgentConnections::new());
         Self {
@@ -258,9 +323,28 @@ impl<S: ControllerStore + 'static> Controller<S> {
                 }),
             })),
         };
-        self.connections
+        if let Err(err) = self
+            .connections
             .send_command(&assignment.agent_id, command)
-            .await?;
+            .await
+        {
+            // F8 + F5: roll back the routing entry AND release the capacity
+            // the scheduler just reserved. If rollback itself fails, log but
+            // surface the original send_command error.
+            if let Err(rollback_err) = self
+                .scheduler
+                .store()
+                .release_sandbox(&assignment.sandbox_id)
+                .await
+            {
+                tracing::error!(
+                    sandbox = %assignment.sandbox_id,
+                    error = %rollback_err,
+                    "failed to release sandbox reservation after send_command failure"
+                );
+            }
+            return Err(err);
+        }
 
         Ok(assignment)
     }
@@ -286,6 +370,13 @@ impl<S: ControllerStore + 'static> Controller<S> {
             .await
     }
 
+    pub async fn release_sandbox(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<AgentId>, ControllerError> {
+        self.scheduler.store().release_sandbox(sandbox_id).await
+    }
+
     pub async fn save_sandbox_state(
         &self,
         sandbox_id: &SandboxId,
@@ -307,11 +398,30 @@ impl<S: ControllerStore + 'static> Controller<S> {
     }
 
     pub async fn sweep_dead_agents(&self) -> Vec<AgentId> {
-        let dead = self.heartbeat_monitor.dead_agents();
+        let dead = match self.heartbeat_monitor.dead_agents().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "dead_agents query failed; sweep skipped");
+                return Vec::new();
+            }
+        };
         for agent_id in &dead {
-            let _ = self.registry.mark_agent_dead(agent_id).await;
-            self.connections.remove(agent_id);
-            self.heartbeat_monitor.remove(agent_id);
+            match self.registry.mark_agent_dead(agent_id).await {
+                Ok(()) | Err(ControllerError::AgentNotFound { .. }) => {
+                    // F6 + F7: state is now Dead in the store, so the next
+                    // dead_agents() query naturally excludes this agent. The
+                    // in-memory connections entry is the only thing left to
+                    // clean up.
+                    self.connections.remove(agent_id);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %err,
+                        "mark_agent_dead failed; next sweep will retry"
+                    );
+                }
+            }
         }
         dead
     }
@@ -514,7 +624,9 @@ mod tests {
             .unwrap();
         controller
             .heartbeat_monitor
-            .record_heartbeat(agent_id.clone());
+            .record_heartbeat(&agent_id)
+            .await
+            .unwrap();
 
         store
             .insert_routing_entry(RoutingEntry {
@@ -532,5 +644,252 @@ mod tests {
         let agent = store.get_agent(&agent_id).await.unwrap().unwrap();
         assert_eq!(agent.state, AgentState::Dead);
         assert!(store.routing_entries_for_agent(&agent_id).is_empty());
+    }
+
+    fn sandbox_status_message(sandbox_id: &SandboxId, state: SandboxState) -> AgentMessage {
+        use open_sandbox_contracts::controller::SandboxStatus;
+        AgentMessage {
+            payload: Some(agent_message::Payload::SandboxStatus(SandboxStatus {
+                sandbox_id: sandbox_id.to_string(),
+                state: state as i32,
+                error_message: String::new(),
+            })),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_with_mismatched_agent_id_is_ignored() {
+        // F3: agent registered as A sends Heartbeat{agent_id: B} where B is a
+        // legitimately-registered peer. The controller MUST NOT call
+        // store.record_heartbeat(B) — otherwise A can keep a dead B alive in
+        // the liveness store indefinitely.
+        let store = Arc::new(InMemoryStore::new());
+        let controller = Controller::new(store.clone(), AcceptAllTokens);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let service = controller.grpc_service();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+
+        // Pre-register B directly so registry.heartbeat(&B) succeeds.
+        controller
+            .registry
+            .register(
+                agent_b.clone(),
+                &JoinToken::new("token".into()),
+                AgentCapacity {
+                    cpu_cores: 4,
+                    memory_bytes: 8_000_000_000,
+                },
+            )
+            .await
+            .unwrap();
+        // B has NEVER recorded a heartbeat — confirm precondition.
+        assert!(!store.heartbeated_agents().contains(&agent_b));
+
+        let (tx, mut inbound) = connect_agent(&addr).await;
+        tx.send(register_message(&agent_a, "token")).await.unwrap();
+        let _ = inbound.message().await.unwrap().unwrap();
+
+        // A sends Heartbeat{agent_id: B}.
+        tx.send(heartbeat_message(&agent_b)).await.unwrap();
+
+        // Barrier: legitimate heartbeat for A so we know the prior message has
+        // been processed before we observe the store.
+        tx.send(heartbeat_message(&agent_a)).await.unwrap();
+        let msg = inbound.message().await.unwrap().unwrap();
+        assert!(matches!(
+            msg.payload,
+            Some(controller_command::Payload::HeartbeatAck(_))
+        ));
+
+        let heartbeated = store.heartbeated_agents();
+        assert!(
+            !heartbeated.contains(&agent_b),
+            "B must NOT have a recorded heartbeat; current set: {heartbeated:?}"
+        );
+        assert!(heartbeated.contains(&agent_a));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandbox_status_from_non_owning_agent_is_ignored() {
+        // F2: routing assigns sandbox_x → agent_A. Agent B (connected and
+        // registered) sends SandboxStatus{sandbox_id: sandbox_x, state: Failed}.
+        // The controller MUST reject the update because B is not the owner.
+        let (controller, addr) = start_controller(AcceptAllTokens).await;
+
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+        let sandbox_x = SandboxId::new();
+
+        // Register agent A in registry/connections, seed the routing entry x→A,
+        // and pre-set the sandbox state to "running" so we can detect overwrites.
+        controller
+            .registry
+            .register(
+                agent_a.clone(),
+                &JoinToken::new("token".into()),
+                AgentCapacity {
+                    cpu_cores: 4,
+                    memory_bytes: 8_000_000_000,
+                },
+            )
+            .await
+            .unwrap();
+        controller
+            .scheduler
+            .store()
+            .insert_routing_entry(RoutingEntry {
+                sandbox_id: sandbox_x.clone(),
+                agent_id: agent_a.clone(),
+            })
+            .await
+            .unwrap();
+        controller
+            .scheduler
+            .store()
+            .save_sandbox_state(&sandbox_x, &agent_a, "running", None)
+            .await
+            .unwrap();
+
+        // Open a stream and register as B.
+        let (tx, mut inbound) = connect_agent(&addr).await;
+        tx.send(register_message(&agent_b, "token")).await.unwrap();
+        let _ = inbound.message().await.unwrap().unwrap();
+
+        // B sends a SandboxStatus for sandbox_x.
+        tx.send(sandbox_status_message(&sandbox_x, SandboxState::Failed))
+            .await
+            .unwrap();
+
+        // Barrier: heartbeat ack proves the prior message was processed.
+        tx.send(heartbeat_message(&agent_b)).await.unwrap();
+        let msg = inbound.message().await.unwrap().unwrap();
+        assert!(matches!(
+            msg.payload,
+            Some(controller_command::Payload::HeartbeatAck(_))
+        ));
+
+        let row = controller
+            .scheduler
+            .store()
+            .get_sandbox_state(&sandbox_x)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state, "running",
+            "non-owning agent B must not be able to overwrite sandbox_x's state"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_sandbox_rolls_back_routing_entry_when_send_command_fails() {
+        // F8: scheduler.assign_sandbox INSERTS the routing entry to PG. If
+        // send_command then fails (agent in list_active_agents but missing
+        // from in-memory AgentConnections — a real race after disconnect),
+        // the routing row must NOT be left orphaned.
+        let store = Arc::new(InMemoryStore::new());
+        let controller = Controller::new(store.clone(), AcceptAllTokens);
+
+        // Seed an Active agent in the store but DO NOT connect it (no entry
+        // in AgentConnections), so send_command will return AgentNotFound.
+        let agent_id = AgentId::new();
+        store
+            .save_agent(crate::store::AgentRecord {
+                agent_id: agent_id.clone(),
+                capacity: AgentCapacity {
+                    cpu_cores: 4,
+                    memory_bytes: 8_000_000_000,
+                },
+                available: crate::store::AvailableResources {
+                    cpu_millicores: 4000,
+                    memory_bytes: 8_000_000_000,
+                    running_sandboxes: 0,
+                },
+                state: crate::store::AgentState::Active,
+            })
+            .await
+            .unwrap();
+
+        let sandbox_id = SandboxId::new();
+        let result = controller
+            .create_sandbox(CreateSandboxRequest {
+                sandbox_id: sandbox_id.clone(),
+                image: "nginx:latest".into(),
+                requirements: SandboxRequirements {
+                    cpu_millicores: 1000,
+                    memory_bytes: 512_000_000,
+                },
+                env_vars: std::collections::HashMap::new(),
+                exposed_port: 8080,
+            })
+            .await;
+
+        assert!(result.is_err(), "create_sandbox should fail when send_command fails");
+
+        // Atomicity: NO routing entry must remain for the unreachable agent.
+        assert!(
+            store.routing_entries_for_agent(&agent_id).is_empty(),
+            "orphan routing entry must be rolled back when send_command fails"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweep_preserves_heartbeat_when_mark_dead_fails_transiently() {
+        let store = Arc::new(FailNextStore::new());
+        let controller = Controller::new(store.clone(), AcceptAllTokens);
+        let agent_id = AgentId::new();
+
+        controller
+            .registry
+            .register(
+                agent_id.clone(),
+                &JoinToken::new("token".into()),
+                AgentCapacity {
+                    cpu_cores: 4,
+                    memory_bytes: 8_000_000_000,
+                },
+            )
+            .await
+            .unwrap();
+        controller
+            .heartbeat_monitor
+            .record_heartbeat(&agent_id)
+            .await
+            .unwrap();
+
+        tokio::time::advance(DEAD_AGENT_TIMEOUT + Duration::from_secs(1)).await;
+
+        // Inject one failure into the next update_agent_state call.
+        store.arm_update_agent_state_failure();
+
+        let dead = controller.sweep_dead_agents().await;
+        assert_eq!(dead, vec![agent_id.clone()]);
+
+        // The Database error means mark_agent_dead failed. The next sweep
+        // must be able to retry, so dead_agents() MUST still return this agent.
+        let dead_again = controller.heartbeat_monitor.dead_agents().await.unwrap();
+        assert_eq!(
+            dead_again,
+            vec![agent_id.clone()],
+            "dead_agents must continue to surface a transient mark_agent_dead failure"
+        );
+
+        // Second sweep, without injected failure, completes the cleanup.
+        let dead = controller.sweep_dead_agents().await;
+        assert_eq!(dead, vec![agent_id.clone()]);
+        assert!(
+            controller.heartbeat_monitor.dead_agents().await.unwrap().is_empty(),
+            "successful sweep should leave dead_agents empty (state flipped to Dead)"
+        );
     }
 }

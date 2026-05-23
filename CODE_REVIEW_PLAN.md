@@ -8,24 +8,22 @@ A cross-session plan for running `/code-review` over the system one component at
 
 ## Mechanics
 
-> Note: `/code-review` is a Claude Code slash command (formerly `/simplify`). It is user-invoked from the CLI; Claude does not call it as a tool.
-
-`/code-review` operates on the current diff. To scope a review to one component, diff that crate against the anchor tag:
+`/code-review` is a Claude Code skill (formerly `/simplify`) that Claude can invoke directly via the Skill tool. It operates on the current diff. To scope a review to one component, stage that component's diff against the anchor before invoking the skill:
 
 ```sh
 # Review entire crate as if it were a new contribution against the anchor
 git diff contracts/v1.0.1 HEAD -- crates/<name>/
 
-# Or, against an empty tree (full-content review)
+# Or, against an empty tree (full-content review — use for component 0)
 git diff $(git hash-object -t tree /dev/null) HEAD -- crates/<name>/
 ```
 
 Per component:
 
-1. Branch off `main`.
-2. Run `/code-review` — start at `medium`, escalate to `high` for trust-boundary code.
-3. Fix findings in a focused PR.
-4. Re-run `/code-review` on the fix diff.
+1. Branch off `main` (skip for audit-only slots like component 0 if no edits will land).
+2. Claude invokes the `code-review` skill — start at `medium`, escalate to `high` for trust-boundary code.
+3. Triage findings: contract-touching ones go to the deferred list in `REVIEW_LOG.md`; in-crate fixes land in a focused PR.
+4. Re-run `code-review` on the fix diff.
 5. Merge; move to next component.
 
 One component in flight at a time so reviewer context stays scoped.
@@ -66,8 +64,8 @@ Each row gets ticked as it merges. Update this table as components land.
 
 | # | Component | Status | PR | Notes |
 |---|---|---|---|---|
-| 0 | contracts (audit) | not started | — | |
-| 1 | controller | not started | — | |
+| 0 | contracts (audit) | done | audit-only (no PR) | 10 findings logged in `REVIEW_LOG.md`; all deferred to potential `contracts/v1.0.2`. |
+| 1 | controller | fixes-landed; awaiting merge | `review/01-controller` | 10 findings F1–F10 closed; PG-side verification deferred to `tests/live_e2e.rs`. Cross-component follow-ups for cli/proxy logged in `REVIEW_LOG.md`. |
 | 2 | proxy | not started | — | |
 | 3 | agent (core) | not started | — | |
 | 4 | agent-docker | not started | — | |
