@@ -73,9 +73,16 @@ pub trait ControllerStore: Send + Sync {
         sandbox_id: &SandboxId,
         agent_id: &AgentId,
         state: &str,
+        error: Option<&str>,
     ) -> impl Future<Output = Result<(), ControllerError>> + Send;
     fn get_sandbox_state(
         &self,
         sandbox_id: &SandboxId,
-    ) -> impl Future<Output = Result<Option<String>, ControllerError>> + Send;
+    ) -> impl Future<Output = Result<Option<SandboxStateRow>, ControllerError>> + Send;
+}
+
+#[derive(Debug, Clone)]
+pub struct SandboxStateRow {
+    pub state: String,
+    pub error: Option<String>,
 }

@@ -8,7 +8,11 @@ API_HOST="${API_HOST:-127.0.0.1}"
 API_PORT="${API_PORT:-18081}"
 API_KEY="${API_KEY:-e2e-api-key}"
 SANDBOX_IMAGE="${SANDBOX_IMAGE:-alpine:3.21}"
-ROUTING_REFRESH_SECS="${ROUTING_REFRESH_SECS:-32}"
+# The proxy's routing cache now falls back to a per-lookup DB hit
+# on miss (RoutingCache::lookup_or_fetch), so freshly-created
+# sandboxes are routable immediately. Default to no wait; the knob
+# is kept for reproducing the legacy polling-only behavior.
+ROUTING_REFRESH_SECS="${ROUTING_REFRESH_SECS:-0}"
 
 API_BASE="http://${API_HOST}:${API_PORT}"
 WS_BASE="ws://${API_HOST}:${API_PORT}"
@@ -61,12 +65,15 @@ wait_for_running() {
 }
 
 # Wait for the proxy's routing cache to pick up newly-created
-# sandboxes. The cache currently refreshes every 30s; we just wait
-# the configurable interval. (A later cache invalidation amendment
-# can remove this.)
+# sandboxes. With RoutingCache::lookup_or_fetch the cache resolves
+# misses against the DB on the hot path, so the default is no
+# wait. A positive ROUTING_REFRESH_SECS reproduces legacy polling
+# behavior for back-pressure testing.
 wait_for_routing() {
-  log "waiting ${ROUTING_REFRESH_SECS}s for routing cache to refresh"
-  sleep "$ROUTING_REFRESH_SECS"
+  if [ "$ROUTING_REFRESH_SECS" -gt 0 ]; then
+    log "waiting ${ROUTING_REFRESH_SECS}s for routing cache to refresh"
+    sleep "$ROUTING_REFRESH_SECS"
+  fi
 }
 
 delete_sandbox() {

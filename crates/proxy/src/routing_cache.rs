@@ -29,6 +29,39 @@ impl<S: RoutingStore> RoutingCache<S> {
         self.cache.lock().unwrap().get(subdomain).cloned()
     }
 
+    /// Fast cache hit, with a single DB round-trip fallback on
+    /// miss. Used on the data-plane hot path so a freshly-created
+    /// sandbox is routable immediately, instead of waiting for the
+    /// next periodic refresh tick. The cache is updated in-place
+    /// so subsequent lookups hit the fast path. The store call
+    /// uses `lookup_by_subdomain`, which means a 12-hex-char
+    /// prefix is enough — callers don't need the full SandboxId.
+    pub async fn lookup_or_fetch(
+        &self,
+        subdomain: &str,
+    ) -> Result<Option<CachedRoute>, ProxyError> {
+        if let Some(hit) = self.lookup(subdomain) {
+            return Ok(Some(hit));
+        }
+        match self.store.lookup_by_subdomain(subdomain).await? {
+            Some(entry) => {
+                let route = CachedRoute {
+                    agent_id: entry.agent_id.clone(),
+                    sandbox_id: entry.sandbox_id.clone(),
+                };
+                self.cache.lock().unwrap().insert(
+                    entry.sandbox_id.subdomain(),
+                    CachedRoute {
+                        agent_id: entry.agent_id,
+                        sandbox_id: entry.sandbox_id,
+                    },
+                );
+                Ok(Some(route))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub async fn refresh(&self) -> Result<(), ProxyError> {
         let entries = self.store.load_all().await?;
         let mut cache = self.cache.lock().unwrap();

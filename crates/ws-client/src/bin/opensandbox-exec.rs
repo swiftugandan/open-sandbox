@@ -7,13 +7,20 @@
 //!                    --sandbox <uuid> \
 //!                    --api-key $KEY \
 //!                    -- bash -c 'echo hello && date'
+//!
+//! Local stdin is forwarded to the remote process when stdin is not
+//! a TTY (e.g. when piping or redirecting). EOF on local stdin
+//! triggers a half-close of the remote stdin without ending the
+//! session — the remote process keeps running until it exits on its
+//! own or the WebSocket is closed.
 
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
 use open_sandbox_ws_client::{ExecParams, ExecSession, ServerFrame};
+use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
 #[command(name = "opensandbox-exec")]
@@ -36,9 +43,27 @@ struct Args {
     /// exit on its own. 0 = no limit (default).
     #[arg(long, default_value_t = 0)]
     read_for_secs: u64,
+    /// Control whether local stdin is forwarded to the remote
+    /// process. `auto` forwards iff stdin is not a TTY. `always`
+    /// forwards unconditionally (useful with `--read-for-secs`).
+    /// `never` skips the stdin pump.
+    #[arg(long, value_enum, default_value_t = StdinMode::Auto)]
+    stdin: StdinMode,
     /// Command and arguments to run.
     #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum StdinMode {
+    Auto,
+    Always,
+    Never,
+}
+
+enum StdinMsg {
+    Chunk(Vec<u8>),
+    Eof,
 }
 
 #[tokio::main]
@@ -57,24 +82,105 @@ async fn main() -> ExitCode {
             }
         };
 
-    #[allow(unused_assignments)]
-    let mut exit_code: i32 = 0;
+    let forward_stdin = match args.stdin {
+        StdinMode::Always => true,
+        StdinMode::Never => false,
+        StdinMode::Auto => !std::io::stdin().is_terminal(),
+    };
+
+    // mpsc with capacity 8 to backpressure a fast local writer
+    // against a slow WebSocket. spawn_blocking is needed because
+    // std::io::Stdin is sync.
+    let (tx, mut stdin_rx) = mpsc::channel::<StdinMsg>(8);
+    if forward_stdin {
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut handle = stdin.lock();
+            let mut buf = [0u8; 8192];
+            loop {
+                match handle.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx
+                            .blocking_send(StdinMsg::Chunk(buf[..n].to_vec()))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.blocking_send(StdinMsg::Eof);
+        });
+    } else {
+        drop(tx);
+    }
+
+    let mut stdin_done = !forward_stdin;
     let deadline = if args.read_for_secs > 0 {
         Some(tokio::time::Instant::now() + Duration::from_secs(args.read_for_secs))
     } else {
         None
     };
+
+    #[allow(unused_assignments)]
+    let mut exit_code: i32 = 0;
     loop {
-        let frame_res = if let Some(d) = deadline {
-            tokio::select! {
+        // Decide which futures to race. The borrow checker won't
+        // let us race two `&mut session` futures, so stdin pumping
+        // goes through the channel and we only call `send_stdin`
+        // outside the select — same trick used by tower's mpsc
+        // adapters.
+        let frame_res = match (stdin_done, deadline) {
+            (true, None) => session.next_frame().await,
+            (true, Some(d)) => tokio::select! {
                 f = session.next_frame() => f,
                 _ = tokio::time::sleep_until(d) => {
                     eprintln!("# read deadline reached after {}s — exiting cleanly", args.read_for_secs);
                     return ExitCode::from(0);
                 }
-            }
-        } else {
-            session.next_frame().await
+            },
+            (false, None) => tokio::select! {
+                msg = stdin_rx.recv() => {
+                    match msg {
+                        Some(StdinMsg::Chunk(c)) => {
+                            if let Err(e) = session.send_stdin(c).await {
+                                eprintln!("# stdin send: {e}");
+                            }
+                            continue;
+                        }
+                        Some(StdinMsg::Eof) | None => {
+                            let _ = session.close_stdin().await;
+                            stdin_done = true;
+                            continue;
+                        }
+                    }
+                }
+                f = session.next_frame() => f,
+            },
+            (false, Some(d)) => tokio::select! {
+                msg = stdin_rx.recv() => {
+                    match msg {
+                        Some(StdinMsg::Chunk(c)) => {
+                            if let Err(e) = session.send_stdin(c).await {
+                                eprintln!("# stdin send: {e}");
+                            }
+                            continue;
+                        }
+                        Some(StdinMsg::Eof) | None => {
+                            let _ = session.close_stdin().await;
+                            stdin_done = true;
+                            continue;
+                        }
+                    }
+                }
+                f = session.next_frame() => f,
+                _ = tokio::time::sleep_until(d) => {
+                    eprintln!("# read deadline reached after {}s — exiting cleanly", args.read_for_secs);
+                    return ExitCode::from(0);
+                }
+            },
         };
 
         match frame_res {

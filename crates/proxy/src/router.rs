@@ -41,7 +41,8 @@ impl<S: RoutingStore> Router<S> {
 
         let route = self
             .cache
-            .lookup(&subdomain)
+            .lookup_or_fetch(&subdomain)
+            .await?
             .ok_or_else(|| ProxyError::RoutingMiss {
                 sandbox_id: subdomain.clone(),
             })?;

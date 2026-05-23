@@ -23,4 +23,28 @@ RUN wget -q https://github.com/containernetworking/plugins/releases/download/v1.
     && tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin \
     && rm /tmp/cni-plugins.tgz
 COPY --from=builder /build/target/release/open-sandbox /usr/local/bin/
-ENTRYPOINT ["open-sandbox"]
+
+# Nested-environment cgroup v2 prep — mirrors the entrypoint used
+# in crates/agent-youki/Dockerfile.test. Required on Docker Desktop
+# (and any host that hasn't pre-delegated cgroup controllers to this
+# container) to avoid libcontainer's "failed to write +io to
+# /sys/fs/cgroup/cgroup.subtree_control: Not supported" at first
+# sandbox start. No-op when controllers are already delegated.
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'set -e' \
+    'if [ -d /sys/fs/cgroup ] && [ -f /sys/fs/cgroup/cgroup.controllers ]; then' \
+    '  if mkdir -p /sys/fs/cgroup/init 2>/dev/null; then' \
+    '    while read -r pid; do' \
+    '      echo "$pid" > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true' \
+    '    done < /sys/fs/cgroup/cgroup.procs' \
+    '  fi' \
+    '  for c in $(cat /sys/fs/cgroup/cgroup.controllers); do' \
+    '    echo "+$c" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true' \
+    '  done' \
+    'fi' \
+    'exec open-sandbox "$@"' \
+    > /usr/local/bin/cgroup-v2-entrypoint.sh \
+ && chmod +x /usr/local/bin/cgroup-v2-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/cgroup-v2-entrypoint.sh"]

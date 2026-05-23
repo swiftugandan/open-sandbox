@@ -51,7 +51,7 @@ services:
       dockerfile: infra/e2e/Dockerfile.youki
       args:
         FEATURES: docker
-    command: api --controller-url http://10.0.0.3:50051 --proxy-url http://10.0.0.4:50052
+    command: api --controller-url http://10.0.0.3:50051 --proxy-url http://10.0.0.4:50053
     environment:
       OPEN_SANDBOX_API_KEY: e2e-api-key
       OPEN_SANDBOX_INTERNAL_TOKEN: e2e-internal-token

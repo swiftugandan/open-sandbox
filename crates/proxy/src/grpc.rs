@@ -268,13 +268,19 @@ async fn dispatch_io_stream<S: RoutingStore + 'static>(
     };
     let sandbox_id = SandboxId::from(sandbox_uuid);
 
-    let route = match routing.lookup(&sandbox_id.subdomain()) {
-        Some(r) => r,
-        None => {
+    let route = match routing.lookup_or_fetch(&sandbox_id.subdomain()).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
             let _ = server_tx
                 .send(Err(Status::not_found(format!(
                     "sandbox {sandbox_id} not in routing table"
                 ))))
+                .await;
+            return;
+        }
+        Err(e) => {
+            let _ = server_tx
+                .send(Err(Status::internal(format!("routing lookup failed: {e}"))))
                 .await;
             return;
         }
@@ -335,8 +341,22 @@ async fn dispatch_io_stream<S: RoutingStore + 'static>(
     let stream_id_for_pump = stream_id.clone();
     tokio::spawn(async move {
         let mut saw_explicit_close = false;
-        while let Ok(Some(frame)) = inbound.message().await {
-            if matches!(&frame.payload, Some(io_client_frame::Payload::Close(_))) {
+        loop {
+            let frame = match inbound.message().await {
+                Ok(Some(f)) => f,
+                _ => break,
+            };
+            // Only a *full* close (stdin_eof=false) counts as the
+            // client's "session over" signal. A half-close
+            // (stdin_eof=true) is the SDK's stdin-EOF affordance —
+            // the process keeps running and may still emit output.
+            // Without this distinction, any client that closes its
+            // local stdin (e.g. piped or backgrounded ssh-style use)
+            // would defeat the synthetic-Close cleanup on later
+            // disconnect.
+            if let Some(io_client_frame::Payload::Close(c)) = &frame.payload
+                && !c.stdin_eof
+            {
                 saw_explicit_close = true;
             }
             let wrapped = TunnelRequest {
@@ -358,9 +378,10 @@ async fn dispatch_io_stream<S: RoutingStore + 'static>(
                 return;
             }
         }
-        // Gateway closed its request stream. If the caller never
-        // sent an explicit IoClose (e.g., a WebSocket peer that
-        // simply dropped the socket) the agent has no way to know
+        // Gateway closed its request stream (or the stream was
+        // canceled). If the caller never sent an explicit IoClose
+        // (e.g. a WebSocket peer that simply dropped the socket) the
+        // agent has no way to know
         // the session is over — it would keep the in-container
         // process running until natural exit. Forward a synthetic
         // Close so the agent's pump_exec_session fires its

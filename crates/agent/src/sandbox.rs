@@ -72,7 +72,12 @@ impl<R: ContainerRuntime> SandboxManager<R> {
                     state: SandboxState::Failed,
                 };
                 self.sandboxes.lock().unwrap().insert(sandbox_id, entry);
-                Ok(SandboxState::Failed)
+                // Bubble the runtime error up so controller_client
+                // can include the detail in SandboxStatus.error_message.
+                // The `creating → failed` transition is already
+                // captured by the SandboxEntry insert above, so this
+                // doesn't lose any local accounting.
+                Err(e)
             }
         }
     }
@@ -208,17 +213,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_sandbox_returns_failed_on_docker_error() {
+    async fn start_sandbox_returns_err_with_runtime_detail_on_failure() {
         let runtime = Arc::new(FailingContainerRuntime);
         let manager = SandboxManager::new(runtime);
         let sandbox_id = SandboxId::new();
 
-        let state = manager
+        let err = manager
             .start_sandbox(start_cmd(&sandbox_id, "nginx:latest"))
             .await
-            .unwrap();
+            .expect_err("expected runtime error to bubble up");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("mock runtime failure"),
+            "expected runtime detail in error, got: {detail}"
+        );
 
-        assert_eq!(state, SandboxState::Failed);
+        // Local accounting still records the failed entry so a
+        // subsequent stop/get observes the terminal state.
+        let entry = manager.sandboxes.lock().unwrap().get(&sandbox_id).cloned();
+        assert_eq!(entry.map(|e| e.state), Some(SandboxState::Failed));
     }
 
     #[tokio::test]

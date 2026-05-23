@@ -26,7 +26,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use open_sandbox_contracts::constants::EXEC_KILL_GRACE;
 use open_sandbox_contracts::error::AgentError;
@@ -244,7 +244,7 @@ async fn pump_exec_session<R, S>(
     // protocol error and ends the session.
     let demux_handle = tokio::spawn(client_frames_demux(
         client_frames,
-        stdin,
+        Some(stdin),
         signal_tx,
         close_tx,
         stream_id.clone(),
@@ -372,24 +372,52 @@ async fn output_pump(
 
 async fn client_frames_demux<S>(
     mut client_frames: S,
-    stdin: mpsc::Sender<Bytes>,
+    mut stdin: Option<mpsc::Sender<Bytes>>,
     signal_tx: mpsc::Sender<IoSignal>,
     close_tx: mpsc::Sender<IoClose>,
     stream_id: String,
 ) where
     S: Stream<Item = Result<IoClientFrame, AgentError>> + Unpin + Send + 'static,
 {
-    while let Some(frame) = client_frames.next().await {
+    // The demux owns stdin behind an Option so a half-close
+    // (stdin_eof=true) can drop it while leaving the task running
+    // to observe a subsequent full close (or stream end). If we
+    // returned on half-close, any later Close frame — including the
+    // synthetic one the proxy forwards when the gateway disconnects
+    // — would arrive at a dead demux and the cleanup hook would
+    // never fire.
+    loop {
+        let frame = match client_frames.next().await {
+            Some(f) => f,
+            None => {
+                // Stream ended without an explicit Close —
+                // typically the client process was SIGKILLed or
+                // the TCP connection was reset. Synthesize a Close
+                // so the main control loop runs the cleanup hook
+                // (SIGTERM/SIGKILL the in-container PID).
+                debug!(stream_id = %stream_id, "client stream ended; synthesizing Close");
+                let _ = close_tx.send(IoClose { stdin_eof: false }).await;
+                break;
+            }
+        };
         let Ok(IoClientFrame {
             payload: Some(p), ..
         }) = frame
         else {
-            return;
+            debug!(stream_id = %stream_id, "client frame error; synthesizing Close");
+            let _ = close_tx.send(IoClose { stdin_eof: false }).await;
+            break;
         };
         match p {
             io_client_frame::Payload::Stdin(bytes) => {
-                if stdin.send(Bytes::from(bytes)).await.is_err() {
-                    return;
+                let Some(tx) = stdin.as_ref() else {
+                    // stdin already half-closed; drop subsequent
+                    // stdin bytes silently (no protocol violation).
+                    continue;
+                };
+                if tx.send(Bytes::from(bytes)).await.is_err() {
+                    let _ = close_tx.send(IoClose { stdin_eof: false }).await;
+                    break;
                 }
             }
             io_client_frame::Payload::Signal(s) => {
@@ -397,28 +425,23 @@ async fn client_frames_demux<S>(
             }
             io_client_frame::Payload::Close(c) => {
                 if c.stdin_eof {
-                    // Half-close stdin only — drop the sender side to
-                    // signal EOF to the in-container process. Session
-                    // continues; the process may still emit output.
-                    drop(stdin);
-                    return;
+                    // Half-close: drop the stdin sender to signal
+                    // EOF to the in-container process. Continue
+                    // looping so Signal / full-Close frames can
+                    // still be processed.
+                    stdin = None;
+                    continue;
                 }
                 let _ = close_tx.send(c).await;
-                return;
+                break;
             }
             io_client_frame::Payload::Start(_) => {
-                // Duplicate Start is a protocol error. Treat as
-                // disconnect (the main loop will clean up).
                 warn!(stream_id = %stream_id, "duplicate IoStart received; ending session");
-                return;
+                let _ = close_tx.send(IoClose { stdin_eof: false }).await;
+                break;
             }
         }
     }
-    // Stream ended without a Close. The main loop will detect this
-    // when stdin drops (process gets EOF) and the process eventually
-    // exits, OR via the close_rx not firing — in which case the
-    // session terminates only when the runtime sends IoExited.
-    drop(stdin);
 }
 
 async fn drive_read_file<R>(
@@ -720,7 +743,9 @@ mod tests {
         tx.send(Ok(iostart_exec(vec!["echo", "hello"])))
             .await
             .unwrap();
-        drop(tx);
+        // Hold tx open until the natural Exited frame arrives —
+        // dropping it would be interpreted as a client disconnect
+        // and trigger the SIGTERM/SIGKILL cleanup path instead.
 
         let frames = collect_until_exit(rx).await;
         // Expect: Started, Stdout("hello\n"), Exited(0)
@@ -790,7 +815,7 @@ mod tests {
         tx.send(Ok(iostart_exec(vec!["definitely_not_a_binary"])))
             .await
             .unwrap();
-        drop(tx);
+        // Hold tx open — see exec_runs_echo for rationale.
 
         let frames = collect_until_exit(rx).await;
         let stderr_joined: Vec<u8> = frames
@@ -848,6 +873,51 @@ mod tests {
         // Close the session so the spawned task wraps up.
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+    }
+
+    #[tokio::test]
+    async fn abrupt_stream_drop_triggers_cleanup_signals() {
+        // Models a client process that was SIGKILLed (or whose TCP
+        // connection was reset) without sending an explicit Close.
+        // The agent must still drive the cleanup hook so the
+        // in-container PID is signaled — without this guard,
+        // abandoned processes outlive their controller.
+        let runtime = Arc::new(MockContainerRuntime::new());
+        let registry = Arc::new(ExecRegistry::new());
+        let (tx, mut rx, h) = spawn_session(runtime.clone(), registry.clone(), "s-drop");
+
+        tx.send(Ok(iostart_exec(vec!["sleep", "30"])))
+            .await
+            .unwrap();
+        let started = rx.recv().await.unwrap();
+        assert!(matches!(
+            started.payload,
+            Some(io_server_frame::Payload::Started(_))
+        ));
+        assert_eq!(registry.len(), 1);
+
+        // Abrupt drop — no Close frame sent.
+        drop(tx);
+
+        let _ = tokio::time::timeout(Duration::from_secs(10), h).await;
+
+        let signums: Vec<i32> = runtime
+            .signals_received()
+            .iter()
+            .map(|s| s.signum)
+            .collect();
+        assert!(
+            signums.contains(&15),
+            "SIGTERM should have been sent on abrupt drop, got {signums:?}"
+        );
+        assert!(
+            signums.contains(&9),
+            "SIGKILL should have been sent after grace, got {signums:?}"
+        );
+        assert!(
+            registry.is_empty(),
+            "registry should be drained after cleanup"
+        );
     }
 
     #[tokio::test]

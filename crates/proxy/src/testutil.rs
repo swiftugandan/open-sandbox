@@ -38,6 +38,23 @@ impl RoutingStore for InMemoryRoutingStore {
         Ok(self.entries.lock().unwrap().get(sandbox_id).cloned())
     }
 
+    async fn lookup_by_subdomain(
+        &self,
+        subdomain: &str,
+    ) -> Result<Option<RoutingEntry>, ProxyError> {
+        let guard = self.entries.lock().unwrap();
+        Ok(guard.iter().find_map(|(s, a)| {
+            if s.subdomain() == subdomain {
+                Some(RoutingEntry {
+                    sandbox_id: s.clone(),
+                    agent_id: a.clone(),
+                })
+            } else {
+                None
+            }
+        }))
+    }
+
     async fn load_all(&self) -> Result<Vec<RoutingEntry>, ProxyError> {
         Ok(self
             .entries

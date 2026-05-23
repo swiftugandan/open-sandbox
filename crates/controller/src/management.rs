@@ -67,7 +67,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
 
         let _ = self
             .controller
-            .save_sandbox_state(&sandbox_id, &assignment.agent_id, "creating")
+            .save_sandbox_state(&sandbox_id, &assignment.agent_id, "creating", None)
             .await;
 
         Ok(Response::new(CreateSandboxResponse {
@@ -93,17 +93,21 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
 
         match entry {
             Some(entry) => {
-                let status = self
+                let row = self
                     .controller
                     .get_sandbox_state(&sandbox_id)
                     .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .unwrap_or_else(|| "running".into());
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let (status, error) = match row {
+                    Some(r) => (r.state, r.error.unwrap_or_default()),
+                    None => ("running".to_string(), String::new()),
+                };
                 Ok(Response::new(GetSandboxResponse {
                     sandbox_id: entry.sandbox_id.to_string(),
                     agent_id: entry.agent_id.to_string(),
                     subdomain: entry.sandbox_id.subdomain(),
                     status,
+                    error,
                 }))
             }
             None => Err(Status::not_found(req.sandbox_id.clone())),
@@ -158,17 +162,21 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
 
         let mut sandboxes = Vec::with_capacity(entries.len());
         for entry in entries {
-            let status = self
+            let row = self
                 .controller
                 .get_sandbox_state(&entry.sandbox_id)
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .unwrap_or_else(|| "running".into());
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let (status, error) = match row {
+                Some(r) => (r.state, r.error.unwrap_or_default()),
+                None => ("running".to_string(), String::new()),
+            };
             sandboxes.push(GetSandboxResponse {
                 sandbox_id: entry.sandbox_id.to_string(),
                 agent_id: entry.agent_id.to_string(),
                 subdomain: entry.sandbox_id.subdomain(),
                 status,
+                error,
             });
         }
         Ok(Response::new(ListSandboxesResponse { sandboxes }))

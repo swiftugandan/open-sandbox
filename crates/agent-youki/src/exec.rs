@@ -50,7 +50,11 @@ pub async fn start_exec_streaming(
 ) -> Result<ExecHandle, AgentError> {
     let target_pid = container_pid(container_id, state_dir)?;
 
-    let exec_id = format!("youki-{}", uuid::Uuid::new_v4().simple());
+    // exec_id is an opaque, runtime-internal token. Use the same
+    // hex shape as the docker runtime (which forwards docker's
+    // 64-char exec id) so clients can't tell the two runtimes
+    // apart from this field.
+    let exec_id = uuid::Uuid::new_v4().simple().to_string();
 
     let mut cmd = Command::new("nsenter");
     cmd.arg("--target")
