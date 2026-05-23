@@ -240,6 +240,28 @@ comp-1 cross-component CLI reconnect-loop follow-up closed here.
 
 ---
 
+## Component 6 — api (in-crate findings)
+
+8 findings; 3 closed in `review/06-api`, 5 deferred (chunking, structured-trailer NotFound mapping, mutex poison, body limit middleware, tonic codec sizes).
+
+### [comp-6 · critical] Non-constant-time API key compare (3 sites) — **closed**
+
+- **Fix:** shared `constant_time_eq` helper used by `handlers::check_rest_auth`, `ws_exec::check_auth`, `ws_read_file::check_auth`.
+
+### [comp-6 · high] map_io_error missed SANDBOX_NOT_FOUND alias — **closed**
+
+- **Fix:** alias added; closes comp-3 cross-component finding C3.
+
+### [comp-6 · high] Path traversal at gateway boundary — **closed**
+
+- **Fix:** `validate_sandbox_path` rejects NUL bytes, control chars, and `..` segments on write_file and read_file paths.
+
+### [comp-6 · DEFERRED] Stdin frame chunking, NotFound mapping, mutex poison, body limit, tonic codec
+
+- See `NEEDS_HUMAN_ATTENTION.md`.
+
+---
+
 ## Component 5 — agent-youki (audit-only; Linux-only crate)
 
 8 findings; **0 closed, all 8 deferred** to `NEEDS_HUMAN_ATTENTION.md`. agent-youki uses procfs and cannot compile on macOS where the rest of this review pass runs — fixes here must be validated on the Linux dev env via `crates/agent-youki/Dockerfile.dev` / `docker-compose.dev.yml`. I won't ship code without a Linux compile-check, and the OCI hardening choices (caps, seccomp, userns, readonly_rootfs) each need an SPEC decision before implementation.

@@ -59,7 +59,10 @@ pub fn check_rest_auth<S: SandboxService>(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
     match got {
-        Some(t) if t == state.api_key => Ok(()),
+        // Comp-6: constant-time compare so the API-key string isn't a
+        // byte-by-byte timing oracle. v1.0 has a single shared key
+        // protecting the entire control plane.
+        Some(t) if constant_time_eq(t.as_bytes(), state.api_key.as_bytes()) => Ok(()),
         _ => Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -69,6 +72,41 @@ pub fn check_rest_auth<S: SandboxService>(
         )
             .into_response()),
     }
+}
+
+/// Comp-6: reject obvious path-traversal shapes at the gateway boundary.
+/// The agent re-validates, but defense in depth here means a regression in
+/// the agent's resolver doesn't immediately escalate to a tenant escape.
+///
+/// Rejects: NUL bytes, `..` path components, control characters. Allows
+/// absolute paths (the in-sandbox file system uses them) but the segment
+/// check prevents climbing out of an intended cwd.
+pub(crate) fn validate_sandbox_path(path: &str) -> Result<(), &'static str> {
+    if path.contains('\0') {
+        return Err("path must not contain NUL bytes");
+    }
+    if path.bytes().any(|b| b < 0x20 && b != b'\t') {
+        return Err("path must not contain control characters");
+    }
+    for segment in path.split('/') {
+        if segment == ".." {
+            return Err("path must not contain '..' segments");
+        }
+    }
+    Ok(())
+}
+
+/// Constant-time byte compare. Lifted from crates/controller/src/auth.rs
+/// to keep crates/api self-contained without a workspace shared module.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub async fn create_sandbox<S: SandboxService>(
@@ -199,6 +237,12 @@ pub async fn write_file<S: SandboxService>(
     if body.path.is_empty() {
         return invalid_request("path must not be empty");
     }
+    // Comp-6: defense-in-depth boundary check. Reject obvious traversal
+    // shapes before forwarding to the agent so a regression in the agent's
+    // path resolution can't escalate to a tenant escape.
+    if let Err(msg) = validate_sandbox_path(&body.path) {
+        return invalid_request(msg);
+    }
     let content = match body.content_bytes() {
         Ok(b) => b,
         Err(e) => return api_error_response(e),
@@ -239,6 +283,10 @@ pub async fn read_file<S: SandboxService>(
     };
     if query.path.is_empty() {
         return invalid_request("path query parameter is required");
+    }
+    // Comp-6: defense-in-depth boundary check (same as write_file).
+    if let Err(msg) = validate_sandbox_path(&query.path) {
+        return invalid_request(msg);
     }
 
     let result = stream_via_io_stream(
@@ -387,7 +435,11 @@ fn map_io_error(err: &open_sandbox_contracts::proxy::IoError) -> ApiError {
         "FILE_NOT_FOUND" => ApiError::FileNotFound {
             resolved_path: err.detail.clone(),
         },
-        "SANDBOX_GONE" => ApiError::SandboxGone {
+        // Comp-6 (closes comp-3 C3): agent emits SANDBOX_NOT_FOUND when its
+        // in-memory sandbox_manager has no entry; alias to the same
+        // SandboxGone variant so SDKs see a clean 404 instead of an opaque
+        // IoStreamFailed 500.
+        "SANDBOX_GONE" | "SANDBOX_NOT_FOUND" => ApiError::SandboxGone {
             sandbox_id: err.detail.clone(),
         },
         _ => ApiError::IoStreamFailed {
