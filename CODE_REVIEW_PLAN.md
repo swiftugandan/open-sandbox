@@ -68,7 +68,7 @@ Each row gets ticked as it merges. Update this table as components land.
 | 1 | controller | fixes-landed; awaiting merge | `review/01-controller` | 10 findings F1–F10 closed; PG-side verification deferred to `tests/live_e2e.rs`. Cross-component follow-ups for cli/proxy logged in `REVIEW_LOG.md`. |
 | 2 | proxy | fixes-landed; awaiting merge | `review/02-proxy` | 11 findings closed (A1-A6, B1-B6 minus 3 deferred-with-decision: B2, C5, C2). LISTEN side of comp-1 F4 closed here. |
 | 3 | agent (core) | fixes-landed; awaiting merge | `review/03-agent-core` | 7 closed (A1/B2/C1, A2, A5, A6, B5, C6); 7 deferred-with-decision in `NEEDS_HUMAN_ATTENTION.md`. CLI reconnect-loop follow-up from comp-1 closed. |
-| 4 | agent-docker | not started | — | |
+| 4 | agent-docker | fixes-landed; awaiting merge | `review/04-agent-docker` | 5 closed (PID fail-loud, read cap, create rollback, stdin error, tmp cleanup); 3 deferred in NEEDS_HUMAN_ATTENTION. |
 | 5 | agent-youki | not started | — | |
 | 6 | api | not started | — | |
 | 7 | ws-client | not started | — | |

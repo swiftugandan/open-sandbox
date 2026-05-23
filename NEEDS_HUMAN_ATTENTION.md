@@ -98,7 +98,125 @@ entry, prepend `[done YYYY-MM-DD]` to the heading or remove it.
 - **Summary:** the agent emits `IoError { code: "SANDBOX_NOT_FOUND" }` when a routing race hits before the agent's in-memory sandbox_manager has the entry; api's `map_io_error` only recognizes `SANDBOX_GONE` and collapses the rest to `IoStreamFailed`. SDKs that should retry on transient-not-found instead see opaque 500s.
 - **Recommended next step:** comp-6 (api review) — add `SANDBOX_NOT_FOUND` as an alias for `SANDBOX_GONE` in `map_io_error` and `ws_read_file.rs:221`. Or change the agent emission to `SANDBOX_GONE` (one-line agent change). Comp-0's stringly-typed `IoError.code` finding already flagged this drift class; this is a concrete instance to wire when comp-6 lands.
 
-## [comp-3 · decision] Duplicate stream_id on IoStart silently overwrites existing session (C5)
+## [comp-4 · decision] Image pull has no retry, no progress visibility, no in-flight dedup
+
+- **Blocker class:** `decision`
+- **Source:** comp-4 line-by-line
+- **File:** `crates/agent-docker/src/lib.rs:62` (`try_collect::<Vec<_>>()` on the pull stream)
+- **Summary:** transient registry hiccups abort the entire create_and_start. Multiple concurrent creates of the same fresh image stampede the registry instead of sharing one in-flight pull. Errors map to opaque runtime-error strings with no signal that this is retryable.
+- **Recommended next step:** decide between (a) wrap the pull in a per-image bounded retry with exponential backoff, no in-flight dedup (~30 LOC); (b) add a process-wide dedup map keyed by image (~80 LOC) so concurrent pulls share one stream; (c) defer pull retries to the controller's StartSandbox retry policy (no change here). I lean toward (a) + map errors to a typed `ImagePullFailed` variant on `AgentError` if you allow a contract change.
+
+## [comp-4 · decision] signal_exec leaks an undrained bollard exec stream
+
+- **Blocker class:** `decision`
+- **Source:** comp-4 line-by-line
+- **File:** `crates/agent-docker/src/lib.rs:421` (signal_exec)
+- **Summary:** the kill exec opens a `start_exec(detach: false, attach_stdout: true, attach_stderr: true)` and binds the `StartExecResults::Attached` to `_`. The output stream is dropped immediately; bollard's internal buffer is never drained, and the docker exec instance may not finalize cleanly. Repeated SIGTERM/SIGKILL per disconnect accumulates undrained streams.
+- **Recommended next step:** either (a) use `detach: true` (cleanest — no attach, no buffer); (b) drain the output stream via a small `spawn` task. (a) is ~3 LOC. Confirm bollard's detach semantics match what we want and I'll ship.
+
+## [comp-4 · decision] inspect_exec failure conflated with process exit -1
+
+- **Blocker class:** `decision`
+- **Source:** comp-4 line-by-line
+- **File:** `crates/agent-docker/src/lib.rs:350`
+- **Summary:** when the bollard output stream ends and inspect_exec fails, the output-pump emits `ExecExitInfo { exit_code: -1, command_not_found: false }` — indistinguishable from a process that legitimately exits -1 (impossible on Linux but allowed by the wire format). Worse, agent-core's natural-exit fast path then SKIPS the SIGTERM/SIGKILL cleanup, so a daemon restart leaves the in-container PID orphaned.
+- **Recommended next step:** introduce a new `RUNTIME_ERROR` ExecInfo path (or emit `Err` on the `exited` channel) so io_stream's runtime-error branch fires the cleanup hook. ~15 LOC. Touches the ContainerRuntime trait shape — decide whether to extend it.
+
+## [comp-5 · live-validation] OCI security defaults missing (caps, readonly_rootfs, seccomp, userns, pids limit)
+
+- **Blocker class:** `decision` + `live-validation`
+- **Source:** comp-5 spec.rs review
+- **File:** `crates/agent-youki/src/spec.rs:83` (and the broader spec builder)
+- **Summary:** generated OCI spec has NO capabilities drop, NO readonly_rootfs, NO seccomp profile, NO masked_paths / readonly_paths, NO user namespace, NO pids limit. Container runs as host-root with full caps and unfiltered /proc and /sys. This is the **single largest production-safety gap** in the codebase — the entire backend's threat model collapses without baseline hardening.
+- **Recommended next step:** I cannot make these decisions alone — each touches what user code can do inside the sandbox. Concretely, you need to decide:
+  1. **Capability set**: which caps to keep? Recommend dropping all except a minimal subset (CAP_AUDIT_WRITE for some glibc operations, CAP_CHOWN/DAC_OVERRIDE/SETUID/SETGID for in-container useradd, NET_BIND_SERVICE for binding < 1024). Match docker's default `cap_drop_default` or stricter.
+  2. **User namespace**: enable it? Requires kernel ≥5.11 + subuid/subgid mapping setup. Big improvement to defense-in-depth.
+  3. **readonly_rootfs**: yes/no? Many images expect writable / (e.g. apt cache, /tmp); requires explicit writable mount points (`/tmp`, `/var`, `/run`). Common docker default is read-write rootfs; consider read-only with tmpfs overlays.
+  4. **seccomp**: ship a default profile? docker's default profile is ~330 lines of JSON. Could vendor a copy.
+  5. **masked_paths / readonly_paths**: standard set is `/proc/asound,/proc/acpi,/proc/kcore,/proc/keys,/proc/latency_stats,/proc/timer_list,/proc/timer_stats,/proc/sched_debug,/proc/scsi,/sys/firmware`.
+  6. **pids limit**: numeric cap; recommend ~256 default.
+
+This needs an SPEC amendment and live testing on the Linux dev env. Block on your decisions.
+
+## [comp-5 · live-validation] Tar layer extraction has path-traversal vulnerability
+
+- **Blocker class:** `live-validation`
+- **Source:** comp-5 image.rs review
+- **File:** `crates/agent-youki/src/image.rs:117` (and `:104-112` whiteout)
+- **Summary:** `entry.unpack(&dest)` with pre-joined `dest = rootfs.join(&path)` does NOT verify the resolved path stays within `rootfs`. (`Archive::unpack` does check; `entry.unpack` does not.) A malicious OCI image layer with `../../../etc/cron.d/evil` entries writes host files under the agent's privilege.
+- **Recommended next step:** I can implement the fix (canonicalize each entry's path, reject any escape from `rootfs`, ~40 LOC). Need a Linux env to validate; no risk on macOS since the crate doesn't build there. Want me to ship the fix unvalidated?
+
+## [comp-5 · decision] Image install is non-atomic — partial failures corrupt subsequent pulls
+
+- **Blocker class:** `decision`
+- **Source:** comp-5 image.rs review
+- **File:** `crates/agent-youki/src/image.rs:42`
+- **Summary:** layers extract into `rootfs_dir` directly; `.complete` marker only written after all succeed. Partial extracts leave dirty state that the next pull builds atop, silently corrupting the rootfs.
+- **Recommended next step:** extract to a sibling `<rootfs>.tmp.<uuid>` directory, atomic rename on success, `rm -rf` the tmp on failure. ~30 LOC. Want me to ship?
+
+## [comp-5 · decision] setns(2) thread doesn't enter PID namespace → /proc-based host access
+
+- **Blocker class:** `decision`
+- **Source:** comp-5 setns_ops.rs review
+- **File:** `crates/agent-youki/src/setns_ops.rs:57`
+- **Summary:** the thread enters the container's mount namespace (`CLONE_NEWNS`) but not its PID, user, or network namespaces. The container's `/proc` is the procfs mount the container saw, but viewed through the host PID namespace's eyes — paths like `/proc/1/root/etc/shadow` resolve to host paths. Combined with full host-root privilege inside the file-op thread, this is a primitive for reading arbitrary host files and memory.
+- **Recommended next step:** add `setns(CLONE_NEWPID | CLONE_NEWUSER | CLONE_NEWNET)` before any file op. May require `unshare(CLONE_NEWPID)`-style fork dance since CLONE_NEWPID has fork semantics. ~50 LOC + a Linux test. Confirm and I'll ship.
+
+## [comp-5 · decision] create_and_start has no rollback on partial failure
+
+- **Blocker class:** `decision`
+- **Source:** comp-5 lib.rs review
+- **File:** `crates/agent-youki/src/lib.rs:154`
+- **Summary:** if CNI ADD fails after libcontainer create, or container.start fails after CNI is up, no cleanup runs. Leaks accumulate: libcontainer state_dir, container_dir on disk, CNI ip allocations.
+- **Recommended next step:** mirror the comp-4 docker rollback approach — track the partial state and run a best-effort cleanup chain on any error. ~60 LOC. Want me to ship?
+
+## [comp-5 · live-validation] Image layer unbounded buffering OOMs on large pulls
+
+- **Blocker class:** `live-validation`
+- **Source:** comp-5 image.rs review
+- **File:** `crates/agent-youki/src/image.rs:61`
+- **Summary:** each layer is fully buffered into `Vec<u8>` before extraction. A 5 GiB layer = 5 GiB host RAM spike. Same shape as comp-4 image-pull issue but at higher impact (youki is the production runtime).
+- **Recommended next step:** stream through the gunzip+tar decoder rather than buffering. ~40 LOC. Want me to ship?
+
+## [comp-5 · decision] write_files_targz target_dir is client-controlled with no allowlist
+
+- **Blocker class:** `decision`
+- **Source:** comp-5 setns_ops.rs review
+- **File:** `crates/agent-youki/src/setns_ops.rs:197`
+- **Summary:** `target_dir` comes from client's `cwd` with no normalization. Client can write tarball contents to `/etc`, `/usr/bin`, etc. inside the container. Sandbox-internal but enables in-container privilege manipulation primitives (esp. without the OCI hardening from the first comp-5 entry).
+- **Recommended next step:** decide whether (a) this is by-design ("inside the container is the sandbox; trust it"); (b) restrict cwd to a sandbox-prefix like `/workspace/...` and reject anything outside; (c) leave it but document. Comp-5's OCI hardening dominates the risk model here — if you ship the cap-drop + readonly_rootfs + tmpfs overlays, this finding is moot.
+
+## [comp-6 · decision] Wire-level structured error codes vs per-method NotFound mapping
+
+- **Blocker class:** `decision`
+- **Source:** comp-6 cross-file (comp-0 follow-up)
+- **File:** `crates/api/src/grpc_service.rs:120`
+- **Summary:** `grpc_to_api` collapses every controller-emitted `tonic::Code::NotFound` to `SandboxNotFound`. Controller's ControllerError already has `AgentNotFound` and other potential NotFound variants. Need a structured wire signal so the api maps correctly.
+- **Recommended next step:** controller emits `x-os-error-code` trailer with the variant name (e.g. "AGENT_NOT_FOUND"); api reads the trailer first and falls back to current behavior. Touches both controller (~30 LOC) and api (~30 LOC), but no contract change. Want me to ship?
+
+## [comp-6 · decision] Stdin frame chunking for write_file uploads
+
+- **Blocker class:** `decision`
+- **Source:** comp-6 line-by-line
+- **File:** `crates/api/src/handlers.rs:296`
+- **Summary:** write_file sends the entire upload as one `IoClientFrame::Stdin(bytes)` proto message. tonic's default 4 MiB codec cap fails uploads larger than that with a cryptic ResourceExhausted. Same applies to write_files (gzip tarballs >4 MiB).
+- **Recommended next step:** chunk the Stdin pushes at 64 KiB (matching the read-side chunking). ~25 LOC. Could also raise codec limits on both sides as a less-clean workaround. Tell me which.
+
+## [comp-9 · decision] Production deployment story (TLS, secrets, backups, observability)
+
+- **Blocker class:** `decision`
+- **Source:** comp-9 infra/Pulumi review
+- **Files:** `infra/src/cloud-init.ts`, `infra/src/constants.ts`, `infra/Pulumi.dev.yaml`, `infra/index.ts`, `infra/src/dns.ts`
+- **Summary:** comp-9 surfaced 8 distinct production-readiness gaps. Each needs your call before infra is safe to deploy:
+  1. **TLS termination** (comp-2 C5 cross-ref): proxy binds plaintext :443 with no cert source. Decide between (a) Cloudflare proxied + edge TLS; (b) operator-provided cert files via env; (c) Let's Encrypt in-binary via `rustls-acme`.
+  2. **Postgres has no password**: trust-on-127.0.0.1 means any process on the controller host becomes superuser. Add `ALTER USER postgres PASSWORD ...` to cloud-init.
+  3. **operatorCidrs default `0.0.0.0/0`**: SSH wide open by default. Change `Pulumi.dev.yaml` and the index.ts fallback to require explicit CIDR.
+  4. **Cloud-init missing env passthrough**: `CONTROLLER_ADMIN_TOKEN`, `INTERNAL_TOKEN`, `TUNNEL_JOIN_TOKEN` aren't wired anywhere in cloud-init systemd units. The auth tokens added in comp-1/2 have no delivery path.
+  5. **joinToken default `"changeme"`**: change to `config.requireSecret("joinToken")` so deploys fail closed when unset.
+  6. **pg_dump backups on same volume**: a volume-loss event wipes both. Add off-host upload (S3, etc) and retention policy.
+  7. **Binary download is amd64-only on ARM controllers, no checksum**: cloud-init's `curl ...linux-amd64` fails on cax11 default. Pin version + verify sha256.
+  8. **Cloudflare `proxied: false` on wildcard**: bypasses Cloudflare DDoS protection AND blocks the free Universal SSL wildcard path. Flip to `true` and the TLS story (#1) becomes "Cloudflare handles it."
+- **Recommended next step:** at minimum answer #1 (TLS) since it unblocks comp-2 C5 and is the foundational decision. The rest are operational; I can implement once you decide the topology.
 
 - **Blocker class:** `decision`
 - **Source:** comp-3 Angle C
