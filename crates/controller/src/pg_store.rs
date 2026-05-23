@@ -49,6 +49,7 @@ impl PgStore {
                 sandbox_id UUID PRIMARY KEY,
                 agent_id UUID NOT NULL,
                 state TEXT NOT NULL DEFAULT 'creating',
+                error TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )",
         )
@@ -57,6 +58,16 @@ impl PgStore {
         .map_err(|e| ControllerError::Database {
             detail: e.to_string(),
         })?;
+
+        // Idempotent migration for pre-existing deployments. Safe to
+        // run on every startup; PostgreSQL silently no-ops if the
+        // column already exists.
+        sqlx::query("ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS error TEXT")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ControllerError::Database {
+                detail: e.to_string(),
+            })?;
 
         Ok(())
     }
@@ -231,15 +242,19 @@ impl ControllerStore for PgStore {
         sandbox_id: &SandboxId,
         agent_id: &AgentId,
         state: &str,
+        error: Option<&str>,
     ) -> Result<(), ControllerError> {
         sqlx::query(
-            "INSERT INTO sandboxes (sandbox_id, agent_id, state)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (sandbox_id) DO UPDATE SET state = EXCLUDED.state",
+            "INSERT INTO sandboxes (sandbox_id, agent_id, state, error)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (sandbox_id) DO UPDATE SET
+                state = EXCLUDED.state,
+                error = EXCLUDED.error",
         )
         .bind(sandbox_id.0)
         .bind(agent_id.0)
         .bind(state)
+        .bind(error)
         .execute(&self.pool)
         .await
         .map_err(|e| ControllerError::Database {
@@ -251,16 +266,16 @@ impl ControllerStore for PgStore {
     async fn get_sandbox_state(
         &self,
         sandbox_id: &SandboxId,
-    ) -> Result<Option<String>, ControllerError> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT state FROM sandboxes WHERE sandbox_id = $1")
+    ) -> Result<Option<crate::store::SandboxStateRow>, ControllerError> {
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT state, error FROM sandboxes WHERE sandbox_id = $1")
                 .bind(sandbox_id.0)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| ControllerError::Database {
                     detail: e.to_string(),
                 })?;
-        Ok(row.map(|r| r.0))
+        Ok(row.map(|(state, error)| crate::store::SandboxStateRow { state, error }))
     }
 }
 

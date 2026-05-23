@@ -33,6 +33,7 @@ impl MockService {
                 subdomain,
                 agent_id: "agent-1".into(),
                 status: "running".into(),
+                error: None,
             },
         }
     }

@@ -11,6 +11,11 @@ pub struct SandboxInfo {
     pub subdomain: String,
     pub agent_id: String,
     pub status: String,
+    /// Reason the sandbox is in its current state, when available.
+    /// Populated for terminal states like "failed" with the agent's
+    /// failure detail. `None` means no reason recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

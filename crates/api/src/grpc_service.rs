@@ -60,6 +60,9 @@ impl SandboxService for GrpcSandboxService {
             subdomain: resp.subdomain,
             agent_id: resp.agent_id,
             status: resp.status,
+            // CreateSandboxResponse doesn't carry an error field —
+            // failures show up later via the per-sandbox GET.
+            error: None,
         })
     }
 
@@ -78,6 +81,7 @@ impl SandboxService for GrpcSandboxService {
             subdomain: resp.subdomain,
             agent_id: resp.agent_id,
             status: resp.status,
+            error: empty_to_none(resp.error),
         })
     }
 
@@ -95,6 +99,7 @@ impl SandboxService for GrpcSandboxService {
                 subdomain: item.subdomain,
                 agent_id: item.agent_id,
                 status: item.status,
+                error: empty_to_none(item.error),
             });
         }
         Ok(out)
@@ -124,6 +129,10 @@ fn grpc_to_api(status: tonic::Status) -> ApiError {
             detail: status.message().to_string(),
         },
     }
+}
+
+fn empty_to_none(s: String) -> Option<String> {
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn parse_sandbox_id(id: &str) -> Result<SandboxId, ApiError> {

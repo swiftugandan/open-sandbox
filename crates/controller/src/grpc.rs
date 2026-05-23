@@ -174,8 +174,13 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                                 uuid::Uuid::parse_str(&status.sandbox_id).map(SandboxId::from);
                             if let Ok(sandbox_id) = sandbox_id {
                                 let state_str = sandbox_state_to_str(status.state());
+                                let error = if status.error_message.is_empty() {
+                                    None
+                                } else {
+                                    Some(status.error_message.as_str())
+                                };
                                 let _ = store
-                                    .save_sandbox_state(&sandbox_id, agent_id, state_str)
+                                    .save_sandbox_state(&sandbox_id, agent_id, state_str, error)
                                     .await;
                             }
                         }
@@ -286,17 +291,18 @@ impl<S: ControllerStore + 'static> Controller<S> {
         sandbox_id: &SandboxId,
         agent_id: &AgentId,
         state: &str,
+        error: Option<&str>,
     ) -> Result<(), ControllerError> {
         self.scheduler
             .store()
-            .save_sandbox_state(sandbox_id, agent_id, state)
+            .save_sandbox_state(sandbox_id, agent_id, state, error)
             .await
     }
 
     pub async fn get_sandbox_state(
         &self,
         sandbox_id: &SandboxId,
-    ) -> Result<Option<String>, ControllerError> {
+    ) -> Result<Option<crate::store::SandboxStateRow>, ControllerError> {
         self.scheduler.store().get_sandbox_state(sandbox_id).await
     }
 

@@ -36,6 +36,11 @@ message GetSandboxResponse {
   string agent_id = 2;
   string subdomain = 3;
   string status = 4;
+  // Reason the sandbox is in its current state, when available.
+  // Populated for terminal states like "failed" with the agent's
+  // failure detail (e.g. cgroup or image-pull errors). Empty string
+  // means "no reason recorded".
+  string error = 5;
 }
 
 message DeleteSandboxRequest {
