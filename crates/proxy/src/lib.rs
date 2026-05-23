@@ -1,5 +1,6 @@
 pub mod grpc;
 pub mod http_server;
+pub mod io_sessions;
 pub mod pg_store;
 pub mod router;
 pub mod routing_cache;

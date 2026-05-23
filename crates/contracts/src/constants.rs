@@ -39,6 +39,11 @@ pub const WS_IDLE_PING_TIMEOUT: Duration = Duration::from_secs(60);
 // the in-container process may be a shell with cleanup logic.
 pub const EXEC_KILL_GRACE: Duration = Duration::from_secs(5);
 
+// Env var holding the shared secret the API gateway uses to
+// authenticate to the proxy's internal OpenIoStream listener.
+// Defense in depth alongside network isolation (per D2 / SAD).
+pub const INTERNAL_TOKEN_ENV: &str = "OPEN_SANDBOX_INTERNAL_TOKEN";
+
 pub const PROXY_STARTUP_RETRY_ATTEMPTS: u32 = 15;
 
 pub const PROXY_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(2);
