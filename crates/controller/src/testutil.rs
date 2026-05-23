@@ -159,3 +159,115 @@ impl TokenValidator for RejectAllTokens {
         false
     }
 }
+
+/// Wraps an inner store and injects a Database error on the chosen method
+/// the next time it's called, then passes through.
+pub struct FailNextStore {
+    inner: InMemoryStore,
+    fail_update_agent_state: Mutex<bool>,
+}
+
+impl FailNextStore {
+    pub fn new() -> Self {
+        Self {
+            inner: InMemoryStore::new(),
+            fail_update_agent_state: Mutex::new(false),
+        }
+    }
+
+    pub fn arm_update_agent_state_failure(&self) {
+        *self.fail_update_agent_state.lock().unwrap() = true;
+    }
+
+    pub fn inner(&self) -> &InMemoryStore {
+        &self.inner
+    }
+}
+
+impl Default for FailNextStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ControllerStore for FailNextStore {
+    async fn save_agent(&self, record: AgentRecord) -> Result<(), ControllerError> {
+        self.inner.save_agent(record).await
+    }
+
+    async fn get_agent(&self, id: &AgentId) -> Result<Option<AgentRecord>, ControllerError> {
+        self.inner.get_agent(id).await
+    }
+
+    async fn remove_agent(&self, id: &AgentId) -> Result<(), ControllerError> {
+        self.inner.remove_agent(id).await
+    }
+
+    async fn list_active_agents(&self) -> Result<Vec<AgentRecord>, ControllerError> {
+        self.inner.list_active_agents().await
+    }
+
+    async fn update_agent_state(
+        &self,
+        id: &AgentId,
+        state: AgentState,
+    ) -> Result<(), ControllerError> {
+        let should_fail = {
+            let mut armed = self.fail_update_agent_state.lock().unwrap();
+            let was = *armed;
+            *armed = false;
+            was
+        };
+        if should_fail {
+            return Err(ControllerError::Database {
+                detail: "injected failure".into(),
+            });
+        }
+        self.inner.update_agent_state(id, state).await
+    }
+
+    async fn insert_routing_entry(&self, entry: RoutingEntry) -> Result<(), ControllerError> {
+        self.inner.insert_routing_entry(entry).await
+    }
+
+    async fn remove_routing_entries_for_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<(), ControllerError> {
+        self.inner.remove_routing_entries_for_agent(agent_id).await
+    }
+
+    async fn find_routing_entry(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<RoutingEntry>, ControllerError> {
+        self.inner.find_routing_entry(sandbox_id).await
+    }
+
+    async fn list_routing_entries(&self) -> Result<Vec<RoutingEntry>, ControllerError> {
+        self.inner.list_routing_entries().await
+    }
+
+    async fn remove_routing_entry(&self, sandbox_id: &SandboxId) -> Result<(), ControllerError> {
+        self.inner.remove_routing_entry(sandbox_id).await
+    }
+
+    async fn save_sandbox_state(
+        &self,
+        sandbox_id: &SandboxId,
+        agent_id: &AgentId,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<(), ControllerError> {
+        self.inner
+            .save_sandbox_state(sandbox_id, agent_id, state, error)
+            .await
+    }
+
+    async fn get_sandbox_state(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<SandboxStateRow>, ControllerError> {
+        self.inner.get_sandbox_state(sandbox_id).await
+    }
+}

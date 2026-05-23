@@ -533,4 +533,52 @@ mod tests {
         assert_eq!(agent.state, AgentState::Dead);
         assert!(store.routing_entries_for_agent(&agent_id).is_empty());
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweep_preserves_heartbeat_when_mark_dead_fails_transiently() {
+        let store = Arc::new(FailNextStore::new());
+        let controller = Controller::new(store.clone(), AcceptAllTokens);
+        let agent_id = AgentId::new();
+
+        controller
+            .registry
+            .register(
+                agent_id.clone(),
+                &JoinToken::new("token".into()),
+                AgentCapacity {
+                    cpu_cores: 4,
+                    memory_bytes: 8_000_000_000,
+                },
+            )
+            .await
+            .unwrap();
+        controller
+            .heartbeat_monitor
+            .record_heartbeat(agent_id.clone());
+
+        tokio::time::advance(DEAD_AGENT_TIMEOUT + Duration::from_secs(1)).await;
+
+        // Inject one failure into the next update_agent_state call.
+        store.arm_update_agent_state_failure();
+
+        let dead = controller.sweep_dead_agents().await;
+        assert_eq!(dead, vec![agent_id.clone()]);
+
+        // The Database error means mark_agent_dead failed. The next sweep
+        // must be able to retry, so the heartbeat entry MUST still be present.
+        let dead_again = controller.heartbeat_monitor.dead_agents();
+        assert_eq!(
+            dead_again,
+            vec![agent_id.clone()],
+            "heartbeat entry must survive a transient mark_agent_dead failure"
+        );
+
+        // Second sweep, without injected failure, completes the cleanup.
+        let dead = controller.sweep_dead_agents().await;
+        assert_eq!(dead, vec![agent_id.clone()]);
+        assert!(
+            controller.heartbeat_monitor.dead_agents().is_empty(),
+            "successful sweep clears the heartbeat entry"
+        );
+    }
 }
