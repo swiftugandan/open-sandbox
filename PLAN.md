@@ -255,9 +255,9 @@ Amended with ops-resilience-observability-api-feedback module. Tagged `plan/v0.5
 **Source of truth:** [`EXEC_STREAMING_DESIGN.md`](./EXEC_STREAMING_DESIGN.md)
 (design + decisions + spike confirmations + forward trajectory).
 **Detailed plan:** [`PLAN_EXEC_STREAMING.md`](./PLAN_EXEC_STREAMING.md)
-(six sub-modules, branches, exact file lists, type signatures, TDD
+(seven sub-modules, branches, exact file lists, type signatures, TDD
 cycle expectations, acceptance criteria, smoke tests, risks, effort,
-final confidence gate).
+observability requirements, final confidence gate).
 
 **Scope (high-level):** Reshape exec from a message exchange routed
 through the control plane (controller's ExecBroker + EXEC_TIMEOUT +
@@ -268,28 +268,36 @@ WebSocket. Adds first-class file ops in both runtime backends
 with explicit kill-on-disconnect plumbing (required by spikes 01+02:
 neither runtime propagates client disconnect to the in-container PID).
 
-**Six sub-modules** (see `PLAN_EXEC_STREAMING.md` for full detail):
+**Seven sub-modules** (see `PLAN_EXEC_STREAMING.md` for full detail):
 
 1. `module/exec-streaming-1-contracts-proto` — extend `proxy.proto`,
    remove `ExecCommand`/`ExecResult`/`ExecSandbox*`, freeze
-   `contracts/v1.0.0-frozen`.
+   `contracts/v1.0.0-frozen`. PTY fields intentionally deferred to
+   v1.1 (proto3-additive).
 2. `module/exec-streaming-2-agent-runtime` — reshape
    `ContainerRuntime` trait (start_exec → ExecHandle, add
    signal_exec, first-class read/write_file), add `ExecRegistry`,
-   both backends.
+   both backends. Docker uses `docker exec kill`; youki uses
+   `setns + kill(2)` (pure syscalls). Preserves v0.7's
+   `FileNotFound{resolved_path}` contract.
 3. `module/exec-streaming-3-proxy-originate` — proxy gains
-   `OpenIoStream` RPC and routes gateway-originated streams into
-   the agent tunnel by sandbox_id.
+   `OpenIoStream` RPC, routes gateway-originated streams into
+   the agent tunnel by sandbox_id, internal authn via separate
+   listener + shared-secret token.
 4. `module/exec-streaming-4-api-gateway-ws` — held-open gRPC pool
-   to proxy; WebSocket endpoints for streaming I/O with idle
-   ping/pong keepalive.
+   to proxy; WebSocket endpoints with `Authorization: Bearer` auth
+   on upgrade; idle ping/pong keepalive; ships `crates/ws-client`
+   as the SDK-shape thin client.
 5. `module/exec-streaming-5-controller-cleanup` — delete exec broker,
    EXEC_TIMEOUT, message-shaped exec types from controller +
-   controller.proto + api.proto.
+   controller.proto + api.proto + v0.7 test fixtures.
 6. `module/exec-streaming-6-live-e2e` — eight scripted scenarios
    (echo, backpressure, signal, disconnect-kills, idle keepalive,
    long-running >60s, command-not-found, write-then-exec) on the
    docker-compose.full stack, both runtimes.
+7. `module/exec-streaming-7-migration` — `MIGRATION_v0.7_to_v1.0.md`,
+   CHANGELOG, three runnable ws-client examples (echo,
+   long-running-build, interactive-bash), SPEC.md amendment.
 
 **Closes friction items:** H1 (60s timeout), H2 (no session
 persistence), H3 (disconnect doesn't kill), H4 (write_file shell
@@ -300,4 +308,9 @@ output), M4 (cwd default inconsistency), M5 (stdin utf8 footgun).
 agent API (free byproduct), v1.1 transparent WebSocket forwarding
 (VNC-from-browser), v1.2 desktop sandbox recipe.
 
-Amendment to be tagged `plan/v0.6.0`.
+Amendment to be tagged `plan/v0.6.1` (revised after pre-implementation
+review found 14 issues — frame envelope over-specification, premature
+PTY in proto, fuzzy first-frame format, missing auth + internal authn,
+absent observability requirements, missing migration sub-module,
+identifier conflation, plus smaller nits — all resolved before
+implementation start).
