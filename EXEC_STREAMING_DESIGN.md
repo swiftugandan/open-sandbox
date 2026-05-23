@@ -391,6 +391,113 @@ Per the protocol: this lives on `contracts/amendment-exec-streaming`
 with a `v1.0.0-frozen` tag on contract freeze (D6), then per-module
 loops for proxy, agent, controller, api, and CLI consumers.
 
+## Forward trajectory — what v1.0 unlocks downstream
+
+This section is intentionally part of the design doc, not a separate
+roadmap. It records *why the v1.0 design has the shape it does* — the
+data-plane-as-generic-stream-multiplex choice was not made for exec
+alone; it positions several downstream capabilities to fall out
+cleanly.
+
+### Computer-use agent API — free byproduct of v1.0
+
+Anthropic-style "computer use" (and the equivalent from other model
+providers) needs a high-frequency, bidirectional control loop:
+agent sends a UI action, sandbox sends back a screenshot, repeat. Per
+action this is one TCP round-trip if done well, or three (one HTTP
+exchange) if done naively.
+
+With v1.0 streaming exec, computer use is **just a long-lived
+streaming exec of a driver process**. No new platform primitive
+needed:
+
+- Sandbox image bundles `Xvfb` + `xdotool` (or `wtype`, etc.) + a
+  thin driver script that reads JSON action frames on stdin and
+  writes screenshot frames on stdout.
+- Agent opens `GET /v1/sandboxes/{id}/exec` with `Upgrade: websocket`
+  and `command: ["computer-use-driver"]`.
+- The loop is WebSocket frames, not HTTP round-trips. Per-action
+  latency is one RTT, not three.
+
+The fit is genuinely structural:
+
+- Bidirectional stream-shaped control loop → D3 (WebSocket).
+- Driver process IS the session — mouse state, modifiers, open
+  windows live in it → D5 (exec-is-session).
+- Disconnect kills the driver, which closes Xvfb input → spike-01/02
+  cleanup path covers it.
+- Backpressure (spike 03) bounds memory under slow agents pulling
+  large screenshots.
+
+The platform stays generic. It does not know about computer use.
+Users supply a desktop sandbox image. We may publish recipes
+(`opensandbox/desktop:*`) and SDK helpers, but those are image and
+SDK work — not contract changes.
+
+### VNC-from-browser — deliberate v1.1 follow-up
+
+The streaming-exec amendment does **not** directly enable users
+opening `https://<subdomain>.sandbox.example.com/vnc.html` in a
+browser and getting a live view. The reason is precise: v1.0 fixes
+the **gateway-side** data plane (where exec lives), not the
+**public-side** sandbox HTTP forwarding path. The public path still
+encapsulates traffic as `HttpRequest`/`HttpResponse` messages through
+the proxy tunnel — request/response semantics, not raw bytes.
+WebSocket Upgrade arriving on the public side has nowhere to go.
+
+But the v1.0 architectural choice positions v1.1 for a small
+follow-up:
+
+- v1.0 introduces "originate a multiplexed bidi stream into an
+  agent's tunnel" as a proxy primitive (for gateway-originated
+  exec).
+- v1.1 extends the same primitive to "promote an inbound HTTP
+  Upgrade into a raw bidi stream into the agent's tunnel." Same
+  shape, different trigger.
+
+That follow-up is a much smaller amendment than v1.0 because the
+hard architectural choice (data plane is a generic stream multiplex,
+not an HTTP forwarder) already lives at the heart of the proxy.
+
+### The co-driving picture (v1.1+)
+
+Once both v1.0 (streaming exec) and v1.1 (transparent WebSocket
+forwarding) exist, the AI-plus-human shared-desktop pattern drops
+out without further platform work:
+
+- Sandbox image bundles Xvfb + xdotool + x11vnc + websockify +
+  noVNC static HTML. Exposes port 6080 for HTTP→noVNC; x11vnc binds
+  to localhost.
+- AI opens `GET /v1/sandboxes/{id}/exec` (WebSocket) → talks JSON
+  actions to the xdotool driver.
+- Human opens `https://<subdomain>.sandbox.example.com/vnc.html` in
+  a browser → noVNC negotiates a WebSocket upgrade → proxy
+  raw-forwards into the agent's tunnel to port 6080 → user sees the
+  same Xvfb the AI is driving.
+- Optionally human takes input back by clicking in the noVNC view;
+  x11vnc routes those events to the same Xvfb. AI + human share
+  the screen.
+
+This is enabled because both paths terminate as streams on the
+agent's reverse tunnel, distinguished only by their entry point
+(gateway-originated exec stream vs. public-originated forwarded
+WebSocket). The platform exposes both as variations on one
+primitive.
+
+### Version trajectory
+
+| Version | Change | Unlocks |
+| ------- | ------ | ------- |
+| v0.7.0 ✓ | SDK ergonomics fixes | Basic agent workflows |
+| **v1.0.0** | This amendment — streaming exec via WebSocket on the gateway side | Computer-use agent API; long-running tasks; sessions; signals; binary-safe streaming I/O |
+| v1.1.0 | Transparent WebSocket forwarding through the proxy on the public side | VNC-from-browser; any WebSocket app inside a sandbox (LSP servers, devtools, Jupyter); AI + human co-driving |
+| v1.2.0 (provisional) | First-class "desktop sandbox" recipe and SDK helpers | Friction-free agent computer use |
+
+The trajectory is not a commitment to deliver v1.1 and v1.2 on any
+schedule. It is documented here so future-me understands why v1.0
+has its current shape: the data-plane-as-stream choice serves three
+downstream cases, not one.
+
 ## Consolidated friction snapshot (rounds 2–3)
 
 Open items at time of writing this design. Detailed root causes in the
