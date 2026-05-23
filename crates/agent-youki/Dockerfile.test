@@ -29,4 +29,35 @@ COPY proto proto/
 
 RUN cargo test -p open-sandbox-agent-youki --no-run 2>&1
 
+# Entrypoint script: cgroup v2 setup + exec the test command.
+#
+# On Docker Desktop's nested Linux VM (and on any host where this
+# container's cgroup hasn't pre-delegated controllers), libcontainer
+# fails to create sandboxes with:
+#
+#   failed to write +io to /sys/fs/cgroup/cgroup.subtree_control:
+#   Not supported (os error 95)
+#
+# The fix: move all current procs into a leaf "init" cgroup (so the
+# container's root cgroup has no processes, satisfying v2's no-internal-
+# process constraint), then enable every available controller in the
+# root's subtree_control. Libcontainer's own create_and_start can then
+# enable + populate its child cgroup hierarchy normally.
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'set -e' \
+    'if [ -d /sys/fs/cgroup ] && [ -f /sys/fs/cgroup/cgroup.controllers ]; then' \
+    '  mkdir -p /sys/fs/cgroup/init' \
+    '  while read -r pid; do' \
+    '    echo "$pid" > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true' \
+    '  done < /sys/fs/cgroup/cgroup.procs' \
+    '  for c in $(cat /sys/fs/cgroup/cgroup.controllers); do' \
+    '    echo "+$c" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true' \
+    '  done' \
+    'fi' \
+    'exec "$@"' \
+    > /usr/local/bin/cgroup-v2-entrypoint.sh \
+ && chmod +x /usr/local/bin/cgroup-v2-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/cgroup-v2-entrypoint.sh"]
 CMD ["cargo", "test", "-p", "open-sandbox-agent-youki", "--", "--nocapture"]

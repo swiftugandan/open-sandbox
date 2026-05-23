@@ -32,7 +32,7 @@ use open_sandbox_contracts::error::AgentError;
 
 use libcontainer::container::Container;
 
-fn container_pid(container_id: &str, state_dir: &Path) -> Result<i32, AgentError> {
+pub(crate) fn container_pid(container_id: &str, state_dir: &Path) -> Result<i32, AgentError> {
     let container_root = state_dir.join(container_id);
     let container = Container::load(container_root).map_err(|e| AgentError::Runtime {
         detail: format!("failed to load container: {e}"),

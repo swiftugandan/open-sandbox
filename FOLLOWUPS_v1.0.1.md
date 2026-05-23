@@ -113,7 +113,62 @@ without it, deployments that don't enforce network isolation
 between proxy and untrusted callers rely on a single shared
 secret.
 
-## P3 — youki file ops via `cat`/`tee`/`tar` instead of setns syscalls
+## P3 — youki file ops via `cat`/`tee`/`tar` instead of setns syscalls — **CLOSED**
+
+**Status:** Closed in `module/v1.0.1-youki-setns-file-ops`
+(tags `/green`, `/refactored`, `/live-verified`, `/done`).
+
+Resolution:
+
+- `crates/agent-youki/src/setns_ops.rs` performs `read_file`,
+  `write_file`, and `write_files_targz` by entering the
+  container's mount namespace via `setns(2)`. Each call runs
+  on a dedicated `std::thread::spawn` thread (NOT a pooled
+  tokio worker) because the kernel requires `fs->users == 1`
+  for `mntns_install`: we have to `unshare(CLONE_FS)` before
+  `setns(CLONE_NEWNS)`, and that unshare is irreversible. The
+  fresh-thread-per-call shape avoids tainting pool threads
+  for unrelated subsequent work. A Drop guard restores the
+  agent's original mount namespace on every exit path
+  (including panic) so any errno-extracting code outside the
+  closure runs in the home ns.
+
+- `YoukiRuntime::read_file` / `write_file` / `write_files_targz`
+  resolve to `exec::container_pid()` + the matching
+  `setns_ops::*_in_ns()`. Zero in-container binaries
+  (`cat` / `tee` / `tar` / `mkdir` / `mv`) are invoked.
+  Pure-distroless sandbox images are first-class for the
+  youki file plane.
+
+- `crates/agent-youki/Dockerfile.test` gains an ENTRYPOINT
+  shim that performs cgroup v2 setup before exec'ing the
+  test command. The kernel's "no internal process constraint"
+  requires moving all processes into a leaf cgroup before
+  enabling controllers on the root for children; without it,
+  `libcontainer` fails to create sandboxes with
+  `failed to write +io to /sys/fs/cgroup/cgroup.subtree_control:
+  Not supported (os error 95)`. The shim is no-op outside
+  cgroup v2 environments.
+
+- Stale v0.7-era `exec_sandbox` tests in `tests/e2e_mock.rs`
+  rewritten to exercise the new path:
+  `write_then_read_via_setns_round_trips` and
+  `write_files_targz_via_setns_round_trips`.
+
+Live verification (Docker Desktop's nested Linux VM):
+
+- 28/28 youki lib tests pass — including the four that
+  previously failed on Docker Desktop due to the cgroup
+  delegation issue (now fixed by the entrypoint shim).
+- 3/3 `e2e_mock` tests pass (sandbox lifecycle + both setns
+  round-trips).
+- 1/1 `live_e2e` test passes.
+
+**Total: 32/32 youki tests green.**
+
+The original text follows for historical context.
+
+---
 
 `crates/agent-youki/src/lib.rs` implements `read_file`,
 `write_file`, and `write_files_targz` by invoking

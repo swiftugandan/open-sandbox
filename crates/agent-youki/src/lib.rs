@@ -2,6 +2,7 @@ pub mod cni;
 pub mod dns;
 pub mod exec;
 pub mod image;
+pub mod setns_ops;
 pub mod spec;
 
 use std::collections::HashMap;
@@ -11,8 +12,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use open_sandbox_agent::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, EXEC_CHANNEL_CAPACITY,
-    ExecExitInfo, ExecHandle, ExecStart, detect_command_not_found,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecHandle, ExecStart,
 };
 use open_sandbox_contracts::constants::DEFAULT_WRITE_CWD;
 use open_sandbox_contracts::error::AgentError;
@@ -286,46 +286,8 @@ impl ContainerRuntime for YoukiRuntime {
         cwd: Option<&str>,
     ) -> Result<Bytes, AgentError> {
         let resolved = resolve_path(path, cwd);
-
-        let handle = self
-            .start_exec(
-                id,
-                ExecStart {
-                    command: vec!["cat".into(), resolved.clone()],
-                    cwd: String::new(),
-                    env: HashMap::new(),
-                },
-            )
-            .await?;
-        let mut handle = handle;
-        drop(handle.stdin);
-        let mut buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = handle.stdout.recv().await {
-            buf.extend_from_slice(&chunk);
-        }
-        let mut stderr: Vec<u8> = Vec::new();
-        while let Some(chunk) = handle.stderr.recv().await {
-            stderr.extend_from_slice(&chunk);
-        }
-        let info = handle.exited.await.map_err(|_| AgentError::Runtime {
-            detail: "read_file exec terminated without exit info".into(),
-        })?;
-        if info.exit_code != 0 {
-            let stderr_text = String::from_utf8_lossy(&stderr);
-            if stderr_text.contains("No such file") || stderr_text.contains("not found") {
-                return Err(AgentError::Runtime {
-                    detail: format!("No such file: {resolved}"),
-                });
-            }
-            return Err(AgentError::Runtime {
-                detail: format!(
-                    "read_file exit={} stderr={}",
-                    info.exit_code,
-                    stderr_text.trim()
-                ),
-            });
-        }
-        Ok(Bytes::from(buf))
+        let target_pid = exec::container_pid(&id.0, &self.state_dir())?;
+        setns_ops::read_file_in_ns(target_pid, resolved).await
     }
 
     async fn write_file(
@@ -336,64 +298,8 @@ impl ContainerRuntime for YoukiRuntime {
         content: Bytes,
     ) -> Result<(), AgentError> {
         let resolved = resolve_path(path, cwd);
-        let dir = parent_dir(&resolved);
-        let temp = format!("{dir}/.opensb.{}.tmp", uuid::Uuid::new_v4().simple());
-
-        let mkdir = self
-            .start_exec(
-                id,
-                ExecStart {
-                    command: vec!["mkdir".into(), "-p".into(), dir],
-                    cwd: String::new(),
-                    env: HashMap::new(),
-                },
-            )
-            .await?;
-        drain_to_exit(mkdir).await?;
-
-        let writer = self
-            .start_exec(
-                id,
-                ExecStart {
-                    command: vec!["tee".into(), temp.clone()],
-                    cwd: String::new(),
-                    env: HashMap::new(),
-                },
-            )
-            .await?;
-        let mut writer = writer;
-        let _ = writer.stdin.send(content).await;
-        drop(writer.stdin);
-        while writer.stdout.recv().await.is_some() {}
-        let mut stderr = Vec::new();
-        while let Some(chunk) = writer.stderr.recv().await {
-            stderr.extend_from_slice(&chunk);
-        }
-        let info = writer.exited.await.map_err(|_| AgentError::Runtime {
-            detail: "write_file tee exec terminated without exit info".into(),
-        })?;
-        if info.exit_code != 0 {
-            return Err(AgentError::Runtime {
-                detail: format!(
-                    "write_file tee exit={} stderr={}",
-                    info.exit_code,
-                    String::from_utf8_lossy(&stderr).trim()
-                ),
-            });
-        }
-
-        let mv = self
-            .start_exec(
-                id,
-                ExecStart {
-                    command: vec!["mv".into(), temp, resolved],
-                    cwd: String::new(),
-                    env: HashMap::new(),
-                },
-            )
-            .await?;
-        drain_to_exit(mv).await?;
-        Ok(())
+        let target_pid = exec::container_pid(&id.0, &self.state_dir())?;
+        setns_ops::write_file_in_ns(target_pid, resolved, content).await
     }
 
     async fn write_files_targz(
@@ -403,73 +309,9 @@ impl ContainerRuntime for YoukiRuntime {
         tarball: Bytes,
     ) -> Result<(), AgentError> {
         let target = cwd.unwrap_or(DEFAULT_WRITE_CWD).to_string();
-        let mkdir = self
-            .start_exec(
-                id,
-                ExecStart {
-                    command: vec!["mkdir".into(), "-p".into(), target.clone()],
-                    cwd: String::new(),
-                    env: HashMap::new(),
-                },
-            )
-            .await?;
-        drain_to_exit(mkdir).await?;
-
-        let extract = self
-            .start_exec(
-                id,
-                ExecStart {
-                    command: vec!["tar".into(), "xzf".into(), "-".into(), "-C".into(), target],
-                    cwd: String::new(),
-                    env: HashMap::new(),
-                },
-            )
-            .await?;
-        let mut extract = extract;
-        let _ = extract.stdin.send(tarball).await;
-        drop(extract.stdin);
-        while extract.stdout.recv().await.is_some() {}
-        let mut stderr = Vec::new();
-        while let Some(chunk) = extract.stderr.recv().await {
-            stderr.extend_from_slice(&chunk);
-        }
-        let info = extract.exited.await.map_err(|_| AgentError::Runtime {
-            detail: "write_files_targz tar exec terminated without exit info".into(),
-        })?;
-        if info.exit_code != 0 {
-            return Err(AgentError::Runtime {
-                detail: format!(
-                    "write_files_targz tar exit={} stderr={}",
-                    info.exit_code,
-                    String::from_utf8_lossy(&stderr).trim()
-                ),
-            });
-        }
-        Ok(())
+        let target_pid = exec::container_pid(&id.0, &self.state_dir())?;
+        setns_ops::extract_targz_in_ns(target_pid, target, tarball).await
     }
-}
-
-async fn drain_to_exit(handle: ExecHandle) -> Result<(), AgentError> {
-    let mut handle = handle;
-    drop(handle.stdin);
-    while handle.stdout.recv().await.is_some() {}
-    let mut stderr = Vec::new();
-    while let Some(chunk) = handle.stderr.recv().await {
-        stderr.extend_from_slice(&chunk);
-    }
-    let info = handle.exited.await.map_err(|_| AgentError::Runtime {
-        detail: "internal exec terminated without exit info".into(),
-    })?;
-    if info.exit_code != 0 {
-        return Err(AgentError::Runtime {
-            detail: format!(
-                "internal exec exit={} stderr={}",
-                info.exit_code,
-                String::from_utf8_lossy(&stderr).trim()
-            ),
-        });
-    }
-    Ok(())
 }
 
 fn resolve_path(path: &str, cwd: Option<&str>) -> String {
@@ -478,14 +320,6 @@ fn resolve_path(path: &str, cwd: Option<&str>) -> String {
     }
     let base = cwd.unwrap_or(DEFAULT_WRITE_CWD);
     format!("{}/{}", base.trim_end_matches('/'), path)
-}
-
-fn parent_dir(path: &str) -> String {
-    match path.rfind('/') {
-        Some(0) => "/".to_string(),
-        Some(n) => path[..n].to_string(),
-        None => ".".to_string(),
-    }
 }
 
 #[cfg(test)]
