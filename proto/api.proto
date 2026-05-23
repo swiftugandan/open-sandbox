@@ -1,12 +1,15 @@
 syntax = "proto3";
 package open_sandbox.api;
 
+// SandboxManagementService — lifecycle-only RPCs from the API
+// gateway to the controller. Exec was removed in v1.0; streaming
+// I/O (exec, file read) flows through the proxy via
+// SandboxIoService.OpenIoStream — see proxy.proto.
 service SandboxManagementService {
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
   rpc GetSandbox(GetSandboxRequest) returns (GetSandboxResponse);
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
-  rpc ExecSandbox(ExecSandboxRequest) returns (ExecSandboxResponse);
 }
 
 message CreateSandboxRequest {
@@ -41,23 +44,6 @@ message DeleteSandboxRequest {
 
 message DeleteSandboxResponse {
   bool deleted = 1;
-}
-
-message ExecSandboxRequest {
-  string sandbox_id = 1;
-  repeated string command = 2;
-  bytes stdin = 3;
-  // Working directory inside the container; empty for default.
-  string cwd = 4;
-}
-
-message ExecSandboxResponse {
-  int32 exit_code = 1;
-  bytes stdout = 2;
-  bytes stderr = 3;
-  // Runtime reported the executable could not be found. The REST envelope
-  // surfaces this as error_code: COMMAND_NOT_FOUND with exit_code=127.
-  bool command_not_found = 4;
 }
 
 message ListSandboxesRequest {

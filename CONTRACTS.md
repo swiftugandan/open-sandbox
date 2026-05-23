@@ -4,11 +4,18 @@
 
 ## Status
 
-Current frozen version: **contracts/v0.7.0-frozen**
+Current frozen version: **contracts/v1.0.0-frozen**
 
-*Frozen at `contracts/v0.7.0-frozen` on 2026-05-22 (paired with `spec/v0.7.0`). Changes require a `contracts/amendment-<desc>` branch and a version bump.*
+*Frozen at `contracts/v1.0.0-frozen` on 2026-05-23 (paired with `spec/v1.0.0`). Changes after this point require a `contracts/amendment-<desc>` branch and a version bump.*
 
-v0.7.0 is a **breaking** amendment introducing SDK-agent ergonomics fixes from the 10-item friction report: `ListSandboxes` RPC; `cwd` field on `ExecCommand`/`ExecSandboxRequest`; `command_not_found` on `ExecResult`/`ExecSandboxResponse`; new `ApiError` variants `InvalidRequest`, `InvalidUpload`, `CommandNotFound`; renamed `ApiError::FileNotFound.path` → `resolved_path` (callers were relying on `.path` — recompile required).
+v1.0.0 is the first stable contracts release. It is also a **breaking** reshape from v0.7: exec moves from a message exchange routed through the control plane (controller's ExecBroker, agent stream ExecCommand/ExecResult, gateway's unary ExecSandbox RPC) to a stream-shaped session on the data plane (proxy's SandboxIoService.OpenIoStream, agent's tunnel multiplex, gateway WebSocket). Reasons, decisions, spike evidence, and forward trajectory are documented in `EXEC_STREAMING_DESIGN.md`; the executable plan that produced this freeze is `PLAN_EXEC_STREAMING.md` (tag `plan/v0.6.3`).
+
+Summary of v1.0 changes vs v0.7:
+
+- `proxy.proto`: `TunnelService` renamed to `SandboxIoService`. New `OpenIoStream` RPC (gateway-originated bidi I/O sessions). New messages: `IoClientFrame`, `IoServerFrame`, `IoStart` (with `ExecParams` or `ReadFileParams` via oneof), `IoSignal`, `IoClose`, `IoStarted`, `IoExited`, `IoError`. `TunnelRequest`/`TunnelResponse` gain `IoClientFrame`/`IoServerFrame` oneof variants so I/O streams multiplex into the existing agent tunnel alongside HTTP forwarding.
+- `controller.proto`: `ControllerCommand.ExecCommand` and `AgentMessage.ExecResult` removed. The oneof fields are renumbered to close the gaps (no shipped binaries to be wire-compatible with).
+- `api.proto`: `ExecSandbox` RPC and its request/response messages removed. The gateway's external `POST /v1/sandboxes/{id}/exec` is replaced by `WS /v1/sandboxes/{id}/exec`.
+- `crates/contracts/`: `ApiError` gains `IoStreamFailed`, `SandboxGone`, `ProxyUnavailable`; loses `ExecFailed`, `CommandNotFound` (those failure modes are now reported via `IoExited` / `IoError` frames on the WebSocket stream itself). `EXEC_TIMEOUT` constant removed; `WS_IDLE_PING_INTERVAL`, `WS_IDLE_PING_TIMEOUT`, `EXEC_KILL_GRACE` added.
 
 ## Cross-cutting policies
 
@@ -59,23 +66,31 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
   - `StartSandbox` / `StopSandbox` — sandbox lifecycle commands from controller
   - `SandboxStatus` — agent reports sandbox state changes
   - `ResourceReport` — agent reports available capacity
-  - `ExecCommand` / `FetchLogsCommand` — operator-initiated sandbox operations
+  - `FetchLogsCommand` — operator-initiated log fetch
+- **Note:** `ExecCommand` / `ExecResult` were removed in v1.0. Exec is no longer routed through the controller; it flows on the proxy's data plane via `SandboxIoService.OpenIoStream`. The controller stream is now lifecycle-only.
 - **Invariants:** `agent_id` in `Heartbeat` and `ResourceReport` must match the `agent_id` from the initial `RegisterRequest` on the same stream. `SandboxStatus` may only be sent for sandboxes that the controller has assigned to this agent via `StartSandbox`.
 - **Compatibility:** Adding new `oneof` variants to `AgentMessage` or `ControllerCommand` is additive (minor bump). Changing existing message fields is breaking (major bump).
 
-### Tunnel service (`proxy.proto`)
+### Sandbox I/O service (`proxy.proto` — `SandboxIoService`)
 
-- **Producer:** Proxy (sends `TunnelRequest` to agents)
-- **Consumers:** Agent (sends `TunnelResponse` back)
-- **Purpose:** Reverse tunnel for forwarding public HTTP requests through the agent's outbound connection to local sandbox containers.
-- **Shape:** see `proto/proxy.proto`
-- **Key messages:**
-  - `TunnelReady` — agent sends on stream open to identify itself
-  - `HttpRequest` / `HttpResponse` — encapsulated HTTP request/response
-  - `DataChunk` — streaming body data for large payloads
-  - `StreamClose` — signals end of a virtual stream
-- **Invariants:** `stream_id` correlates request and response messages within a single tunnel. Each `stream_id` is unique within the lifetime of a tunnel connection. The proxy assigns `stream_id` values; the agent echoes them.
-- **Compatibility:** Same rules as controller service.
+The proxy's gRPC service, renamed in v1.0 from `TunnelService` to reflect its broadened role as the platform's sandbox I/O multiplex (not just HTTP forwarding).
+
+**Two RPCs:**
+
+1. **`OpenTunnel`** — agent → proxy long-lived reverse tunnel.
+   - **Producer:** Proxy (sends `TunnelRequest` to agents)
+   - **Consumers:** Agent (sends `TunnelResponse` back)
+   - **Purpose:** Carries BOTH inbound public HTTP forwarding AND gateway-originated I/O sessions, multiplexed as typed oneof variants on the same envelope.
+   - **Key messages:** `TunnelReady` (agent identifies on stream open), `HttpRequest` / `HttpResponse` (HTTP forwarding), `DataChunk` (streaming body), `StreamClose` (virtual stream end), and in v1.0 `IoClientFrame` / `IoServerFrame` (sandbox I/O).
+   - **Invariants:** `stream_id` correlates messages within a single tunnel. The proxy assigns `stream_id` for both HTTP and I/O virtual streams.
+
+2. **`OpenIoStream`** — gateway → proxy I/O session (new in v1.0).
+   - **Producer:** API gateway (sends `IoClientFrame`)
+   - **Consumer:** Proxy → bridges into the owning agent's `OpenTunnel` → agent emits `IoServerFrame` back.
+   - **Purpose:** Originate a single bidirectional I/O session for exec or file read. First `IoClientFrame` MUST be `IoStart` carrying `sandbox_id` and op-specific parameters; the proxy routes by `sandbox_id` to the agent that owns the sandbox and bridges the streams.
+   - **Key messages:** `IoStart` (with `ExecParams` or `ReadFileParams` via oneof), `IoStarted`, stdin/stdout/stderr bytes, `IoSignal`, `IoClose`, `IoExited`, `IoError`.
+   - **Invariants:** Exactly one `IoStart` per session, always the first client frame. Exactly one terminator (`IoExited` or `IoError`) per session. `stream_id` is the agent-side `ExecRegistry` key — the agent uses it to track the in-container PID for kill-on-disconnect cleanup.
+- **Compatibility:** Adding new I/O ops via new oneof variants in `IoStart.params` is additive (minor bump).
 
 ### Sandbox management service (`api.proto`)
 
@@ -86,19 +101,19 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
 - **Key messages:**
   - `CreateSandboxRequest` / `CreateSandboxResponse` — create a sandbox, returns sandbox_id + subdomain + status (initially `creating`)
   - `GetSandboxRequest` / `GetSandboxResponse` — query sandbox status
-  - `ListSandboxesRequest` / `ListSandboxesResponse` — enumerate all sandboxes the caller owns (added v0.7.0)
+  - `ListSandboxesRequest` / `ListSandboxesResponse` — enumerate all sandboxes the caller owns
   - `DeleteSandboxRequest` / `DeleteSandboxResponse` — stop and remove a sandbox
-  - `ExecSandboxRequest` / `ExecSandboxResponse` — run a command, returns stdout/stderr/exit_code. `cwd` (field 4, added v0.7.0) sets the working directory; empty string means default (`/home`). `stdin` (field 3) is the bytes written to the process's stdin before close. `command_not_found` (response field 4, added v0.7.0) is true when the runtime reported the executable was missing — distinguishes "command not found" from a process that ran and exited 127 of its own accord.
-- **Invariants:** `sandbox_id` in responses matches the ID from the create or get request. `subdomain` is always the first 12 hex chars of the sandbox UUID. `ExecSandboxResponse` blocks until the command completes or the exec timeout (60s) is reached. When `command_not_found` is true, `exit_code` is 127 and `stderr` contains the runtime's "executable file not found" message; `stdout` is never used to carry runtime-level errors.
+- **Note:** `ExecSandbox` RPC was removed in v1.0. Public exec is now a WebSocket session on the gateway (`WS /v1/sandboxes/{id}/exec`) backed by the proxy's `OpenIoStream`.
+- **Invariants:** `sandbox_id` in responses matches the ID from the create or get request. `subdomain` is always the first 12 hex chars of the sandbox UUID.
 - **Compatibility:** Adding new RPC methods is additive (minor bump). Changing existing message fields is breaking (major bump).
 
-### Exec result flow (`ExecResult` in `controller.proto`)
+### Exec lifecycle (v1.0 — streaming on the data plane)
 
-- **Producer:** Agent (sends exec output back to controller)
-- **Consumer:** Controller (correlates by `exec_id` and delivers to waiting API request)
-- **Purpose:** Closes the exec loop: API → Controller → Agent (ExecCommand) → Agent executes → Agent → Controller (ExecResult) → API → Client.
-- **Key fields:** `exec_id` correlates the result with the originating `ExecCommand`. `exit_code`, `stdout`, `stderr` carry the command output. `error` (field 6, added in v0.6.0) carries a runtime-level error message when the exec infrastructure itself fails (container not found, exec API error). When `error` is non-empty, `exit_code` is -1, `stdout`/`stderr` are empty, and the controller returns a gRPC Internal error rather than forwarding the result as a successful exec. `command_not_found` (field 7, added in v0.7.0) is true when the runtime determined the executable was missing; in that case `exit_code` is 127, `stderr` carries the runtime's diagnostic line, and `stdout` is empty.
-- **Invariant:** `exec_id` is unique per exec invocation (UUID). The controller holds a pending-exec map keyed by `exec_id`; when `ExecResult` arrives, the waiting API request is unblocked.
+- **Path:** API gateway → proxy (`OpenIoStream`) → agent (via the existing `OpenTunnel` reverse tunnel, multiplexed as an `io_client` / `io_server` virtual stream) → runtime (docker or youki) → in-container process.
+- **Identifiers:** the proxy assigns `stream_id` per session; the agent's runtime assigns `exec_id` per started process. The `ExecRegistry` is keyed on `stream_id`; `exec_id` is carried in `IoStarted` for diagnostic correlation only.
+- **Connection-bound lifetime:** closing the upstream WebSocket → gateway closes its `OpenIoStream` → proxy closes the virtual stream into the agent → agent's `drive_io_session` sees end-of-stream on its `IoClientFrame` source → invokes `exec_registry::on_stream_closed`, which SIGTERMs (then SIGKILLs after `EXEC_KILL_GRACE`) the in-container PID via the runtime trait.
+- **No global timeout:** sessions live as long as the WebSocket. Idle keepalive is application-level WebSocket ping/pong every `WS_IDLE_PING_INTERVAL` (30s); peer goes after `WS_IDLE_PING_TIMEOUT` (60s) of unanswered pings.
+- **Error reporting:** runtime-level failures during a live session arrive as `IoError` frames on the stream itself; `command_not_found` is signalled via `IoExited { exit_code: 127, command_not_found: true }`. The HTTP-layer `ApiError` only models failures that happen BEFORE the I/O stream is established (auth, sandbox lookup) or that the gateway observes between WS upgrade and stream open.
 
 ### Domain types (`types.rs`)
 
@@ -121,8 +136,8 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
   - `ControllerError`: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `NoAvailableAgents`, `Database`, `Internal`
   - `ProxyError`: `RoutingMiss`, `TunnelUnavailable`, `UpstreamTimeout`, `UpstreamRejected`, `Internal`
   - `AgentError`: `ControllerDisconnected`, `TunnelDisconnected`, `Runtime`, `SandboxNotFound`, `Internal`
-  - `ApiError`: `Unauthorized`, `SandboxNotFound`, `ControllerUnavailable`, `InvalidRequest`, `InvalidUpload`, `ExecFailed`, `CommandNotFound`, `FileNotFound`, `Internal`
-- **Error codes:** `ApiError` exposes `fn error_code(&self) -> &'static str` that maps each variant to a stable uppercase string identifier (`UNAUTHORIZED`, `SANDBOX_NOT_FOUND`, `CONTROLLER_UNAVAILABLE`, `INVALID_REQUEST`, `INVALID_UPLOAD`, `EXEC_FAILED`, `COMMAND_NOT_FOUND`, `FILE_NOT_FOUND`, `INTERNAL_ERROR`). These codes are included in REST API error response JSON bodies as the `error_code` field for programmatic handling. `INVALID_UPLOAD` covers empty/malformed tar.gz bodies for `write_files` (returned as HTTP 400). `COMMAND_NOT_FOUND` is returned with HTTP 200 (since the exec request itself was valid) but the response envelope carries this code to disambiguate from a process that ran and exited 127. `FileNotFound.resolved_path` carries the absolute path the agent attempted to read, so callers can debug path issues without a second round-trip.
+  - `ApiError`: `Unauthorized`, `SandboxNotFound`, `ControllerUnavailable`, `ProxyUnavailable`, `InvalidRequest`, `InvalidUpload`, `IoStreamFailed`, `SandboxGone`, `FileNotFound`, `Internal`
+- **Error codes:** `ApiError` exposes `fn error_code(&self) -> &'static str` that maps each variant to a stable uppercase string identifier (`UNAUTHORIZED`, `SANDBOX_NOT_FOUND`, `CONTROLLER_UNAVAILABLE`, `PROXY_UNAVAILABLE`, `INVALID_REQUEST`, `INVALID_UPLOAD`, `IO_STREAM_FAILED`, `SANDBOX_GONE`, `FILE_NOT_FOUND`, `INTERNAL_ERROR`). These codes are included in REST API error response JSON bodies as the `error_code` field for programmatic handling. In v1.0, `ExecFailed` and `CommandNotFound` are no longer `ApiError` variants — exec failure modes are reported via `IoError` and `IoExited{command_not_found:true}` frames on the WebSocket I/O stream itself. `FileNotFound.resolved_path` continues to carry the absolute path the agent attempted to read.
 - **Retry guidance:**
   - Retryable: `Database` (transient), `TunnelUnavailable` (agent may reconnect), `UpstreamTimeout` (sandbox may be slow)
   - Terminal: `InvalidToken`, `AgentNotFound`, `SandboxNotFound`, `RoutingMiss`, `NoAvailableAgents`
@@ -146,15 +161,18 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
   - `PROXY_STARTUP_RETRY_INTERVAL`: 2 seconds
   - `DEFAULT_WRITE_CWD`: `/home` (default target directory for file writes when no explicit cwd is provided)
   - `DEFAULT_SANDBOX_ENTRYPOINT`: `["sleep", "infinity"]` (overrides image CMD/ENTRYPOINT to keep sandbox idle for exec-based interaction)
+  - `WS_IDLE_PING_INTERVAL`: 30 seconds (gateway → client WebSocket ping cadence on idle exec sessions)
+  - `WS_IDLE_PING_TIMEOUT`: 60 seconds (peer-gone threshold; triggers ExecRegistry cleanup)
+  - `EXEC_KILL_GRACE`: 5 seconds (between SIGTERM and SIGKILL when the registry hook fires)
 
 ## Component-to-contract matrix
 
 | Component     | Produces                                                   | Consumes                                                  |
 |---------------|------------------------------------------------------------|-----------------------------------------------------------|
-| API Gateway   | REST responses, `SandboxManagement` RPCs (as client)       | `SandboxManagement` RPC responses (from controller)       |
-| Controller    | `ControllerCommand`, `RegisterResponse`, `RoutingEntry`, `SandboxManagement` RPC responses | `AgentMessage`, `RegisterRequest`, `SandboxManagement` RPCs, `ExecResult` |
-| Proxy         | `TunnelRequest`, HTTP responses                            | `TunnelResponse`, `RoutingEntry` (via PG)                 |
-| Agent         | `AgentMessage`, `RegisterRequest`, `TunnelResponse`, `ExecResult` | `ControllerCommand`, `TunnelRequest`                      |
+| API Gateway   | REST/WS responses, `SandboxManagement` RPCs (as client to controller), `IoClientFrame` (as client to proxy via `OpenIoStream`) | `SandboxManagement` RPC responses, `IoServerFrame`        |
+| Controller    | `ControllerCommand`, `RegisterResponse`, `RoutingEntry`, `SandboxManagement` RPC responses | `AgentMessage`, `RegisterRequest`, `SandboxManagement` RPCs |
+| Proxy         | `TunnelRequest` (HTTP and `io_client` variants), HTTP responses, `IoServerFrame` (to gateway) | `TunnelResponse`, `IoClientFrame` (from gateway), `RoutingEntry` (via PG) |
+| Agent         | `AgentMessage`, `RegisterRequest`, `TunnelResponse` (HTTP and `io_server` variants) | `ControllerCommand`, `TunnelRequest` (HTTP and `io_client` variants) |
 
 ---
 

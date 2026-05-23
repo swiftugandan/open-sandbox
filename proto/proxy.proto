@@ -1,9 +1,32 @@
 syntax = "proto3";
 package open_sandbox.proxy;
 
-service TunnelService {
+// SandboxIoService — the agent's outbound multiplex for sandbox I/O.
+//
+// The agent opens OpenTunnel as the long-lived reverse-tunnel
+// connection used for public HTTP forwarding AND for gateway-
+// originated I/O sessions (exec, file ops). The proxy multiplexes
+// virtual streams of either kind into the same agent connection,
+// distinguished by the oneof variant in TunnelRequest/TunnelResponse.
+//
+// The API gateway opens OpenIoStream against the proxy on an
+// internal listener to originate a single I/O session; the proxy
+// routes by the sandbox_id in the IoStart frame and bridges the
+// gateway-side stream to a virtual stream inside the owning agent's
+// tunnel.
+service SandboxIoService {
+  // Agent → proxy reverse tunnel (long-lived, one per agent).
+  // Carries both inbound public HTTP and gateway-originated I/O.
   rpc OpenTunnel(stream TunnelResponse) returns (stream TunnelRequest);
+
+  // Gateway → proxy I/O session (one per public WebSocket).
+  // First IoClientFrame MUST be IoStart carrying sandbox_id and
+  // op-specific params. The proxy routes by sandbox_id to the
+  // owning agent's tunnel and bridges the streams.
+  rpc OpenIoStream(stream IoClientFrame) returns (stream IoServerFrame);
 }
+
+// ===== Existing tunnel envelope (now carries both HTTP and I/O) =====
 
 message TunnelRequest {
   string stream_id = 1;
@@ -11,6 +34,7 @@ message TunnelRequest {
     HttpRequest http_request = 2;
     DataChunk data = 3;
     StreamClose close = 4;
+    IoClientFrame io_client = 5;
   }
 }
 
@@ -21,6 +45,7 @@ message TunnelResponse {
     DataChunk data = 3;
     StreamClose close = 4;
     TunnelReady ready = 5;
+    IoServerFrame io_server = 6;
   }
 }
 
@@ -49,4 +74,108 @@ message DataChunk {
 
 message StreamClose {
   string reason = 1;
+}
+
+// ===== Sandbox I/O streaming frames =====
+//
+// One IoClient/IoServer pair = one virtual stream on the agent's
+// tunnel = one streaming exec or file-read session at the public
+// WebSocket layer. Lifetime is connection-bound: closing the
+// upstream WebSocket → gateway closes its OpenIoStream → proxy
+// closes its virtual stream → agent receives end-of-stream and
+// SIGTERMs the in-container PID (via the ExecRegistry cleanup
+// hook).
+
+message IoClientFrame {
+  // The proxy assigns stream_id when bridging the gateway's
+  // OpenIoStream call into the agent's tunnel; it is unique per
+  // tunnel connection. ExecRegistry on the agent keys on this.
+  string stream_id = 1;
+  oneof payload {
+    // First client frame on every session. Carries sandbox_id and
+    // op-specific parameters.
+    IoStart start = 2;
+    // Raw stdin bytes flowing toward the in-container process.
+    bytes stdin = 3;
+    // POSIX signal to deliver to the in-container PID.
+    IoSignal signal = 4;
+    // Half-close stdin or end the session.
+    IoClose close = 5;
+  }
+}
+
+message IoServerFrame {
+  string stream_id = 1;
+  oneof payload {
+    // First server frame after handshake; carries the agent's
+    // runtime-side exec_id and the captured in-container PID
+    // (for diagnostics — clients should not key on them).
+    IoStarted started = 2;
+    // Raw stdout / stderr bytes flowing back to the caller.
+    bytes stdout = 3;
+    bytes stderr = 4;
+    // Process exited normally (may still be exit != 0).
+    IoExited exited = 5;
+    // Runtime-level error (container gone, exec API failed,
+    // signal delivery failed, etc). Terminates the stream.
+    IoError error = 6;
+  }
+}
+
+message IoStart {
+  string sandbox_id = 1;
+  // The oneof variant selects the operation. No separate enum;
+  // the variant IS the operation type.
+  oneof params {
+    ExecParams exec = 2;
+    ReadFileParams read_file = 3;
+  }
+}
+
+message ExecParams {
+  repeated string command = 1;
+  // Working directory inside the container. Empty = container default.
+  string cwd = 2;
+  // Additional environment variables overlaid on the container's env.
+  map<string, string> env = 3;
+  // PTY allocation deliberately NOT defined here. proto3 supports
+  // additive fields without a major bump; PTY arrives in v1.1 when
+  // it actually has an implementation.
+}
+
+message ReadFileParams {
+  string path = 1;
+  string cwd = 2;
+}
+
+message IoSignal {
+  // POSIX signal number (e.g. 15 = SIGTERM, 9 = SIGKILL, 2 = SIGINT).
+  uint32 signum = 1;
+}
+
+message IoClose {
+  // true → close stdin only (process keeps running, may still
+  //         emit stdout/stderr).
+  // false → end the entire session (agent SIGTERMs the in-container
+  //          PID via the ExecRegistry cleanup hook).
+  bool stdin_eof = 1;
+}
+
+message IoStarted {
+  string exec_id = 1;
+  int32 in_container_pid = 2;
+}
+
+message IoExited {
+  int32 exit_code = 1;
+  // True when the runtime reported the executable was missing
+  // (vs a process that ran and exited with code 127 on its own).
+  bool command_not_found = 2;
+}
+
+message IoError {
+  // Stable identifier (e.g. "RUNTIME_ERROR", "SANDBOX_GONE",
+  // "EXEC_FAILED", "READ_FAILED"). SDKs match on code.
+  string code = 1;
+  string detail = 2;
 }

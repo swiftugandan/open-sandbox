@@ -219,6 +219,18 @@ Amended with container entrypoint override (FR-3), SIGTERM signal handling (FR-3
 
 Amended for SDK agent ergonomics (breaking) — list sandboxes (FR-11), exec stdin and cwd (FR-12), single-file JSON write and GET-method read (FR-13), base64-encoded binary-safe exec output and `COMMAND_NOT_FOUND` / `INVALID_UPLOAD` error codes (NFR-API-1), exec log line includes command vector (NFR-OBS-1). New references: RFC 9110 §9.2.1, §15.5.1; RFC 4648; Rust `from_utf8_lossy` U+FFFD behavior. Tagged `spec/v0.7.0` (paired with `contracts/v0.7.0-frozen`).
 
+Amended for the v1.0 streaming exec reshape (breaking, first stable release) — exec is now a bidirectional stream-shaped session on the data plane (proxy's `SandboxIoService.OpenIoStream`), exposed publicly as WebSocket. The synchronous `POST /v1/sandboxes/{id}/exec` and its `EXEC_TIMEOUT` ceiling are removed; sessions live as long as the WebSocket. File reads gain a streaming WebSocket variant; unary `write_file`/`write_files`/`read` REST endpoints stay for small operations. `FR-12` and `FR-13` are superseded by the streaming surface; `NFR-API-1` no longer carries `COMMAND_NOT_FOUND` or `EXEC_FAILED` as `ApiError` codes — those failure modes are reported via `IoExited{command_not_found:true}` and `IoError` frames on the I/O stream itself. Detailed design and decisions: `EXEC_STREAMING_DESIGN.md`. Executable plan: `PLAN_EXEC_STREAMING.md`. Tagged `spec/v1.0.0` (paired with `contracts/v1.0.0-frozen`).
+
+```
+v1.0 confidence gate
+Confidence: high
+Residual risks:
+  - WebSocket-on-HTTP/1.1 vs HTTP/2 (RFC 8441) — using the well-supported HTTP/1.1 Upgrade path; HTTP/2 WebSocket is not widely deployed
+  - Docker backend's signal_exec requires `kill` in the sandbox image (alongside the existing `tar` requirement); youki backend bypasses this via setns+kill(2) syscalls
+  - Idle WebSocket sessions need application-level ping/pong (30s interval) to bound disconnect-detection latency past TCP keepalive defaults
+Known gaps: None blocking.
+```
+
 ```
 Amendment confidence: high
 Residual risks:
