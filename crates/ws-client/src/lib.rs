@@ -19,7 +19,8 @@
 //!         open_sandbox_ws_client::ServerFrame::Stdout(bytes) => {
 //!             print!("{}", String::from_utf8_lossy(&bytes));
 //!         }
-//!         open_sandbox_ws_client::ServerFrame::Exited(exit_code) => {
+//!         open_sandbox_ws_client::ServerFrame::Exited { exit_code, .. } => {
+//!             let _ = exit_code;
 //!             return Ok(());
 //!         }
 //!         _ => {}
