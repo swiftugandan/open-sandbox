@@ -10,7 +10,12 @@ A Rust-based sandbox platform where agents dial out to a controller/proxy over T
 
 **Shipped: `contracts/v1.0.1` on `main`** — the v1.0 streaming-exec amendment (sub-modules 12.1–12.7) plus the three v1.0.1 follow-ups (WS `/files/read-stream`, two-listener proxy split, youki `setns(2)` file ops). Exec is a bidirectional stream-shaped session on the proxy's data plane (`SandboxIoService.OpenIoStream`), exposed publicly as WebSocket. File ops share that same data plane. The agent-dials-out architecture, BYO-workers, and youki daemonless runtime (ADR-009) are unchanged.
 
-Runtime selection is via compile-time Cargo features (`docker` default; `youki` for Linux production via `crates/agent-youki`). Build constraint: full agent-youki build/test on Linux only — use `crates/agent-youki/Dockerfile.test` + `crates/agent-youki/docker-compose.test.yml`. The Dockerfile.test entrypoint handles cgroup v2 setup automatically for nested environments (Docker Desktop, Linux VMs); no manual prep needed.
+Runtime selection is via compile-time Cargo features (`docker` default; `youki` for Linux production via `crates/agent-youki`). Build constraint: full agent-youki build/test on Linux only — two flows live in `crates/agent-youki/`:
+
+- **Daily iteration** (any host, including macOS): `Dockerfile.dev` + `docker-compose.dev.yml`. Long-lived dev container with bind-mounted source and named volumes for `target/` + cargo registry. `docker compose -f crates/agent-youki/docker-compose.dev.yml up -d` once, then `docker compose -f ... exec dev cargo test -p open-sandbox-agent-youki -- --nocapture`. Cargo's incremental compile makes typical edits ~seconds.
+- **CI / self-contained reproducer**: `Dockerfile.test` + `docker-compose.test.yml`. Image bakes the test build via `cargo test --no-run`; reproducible but recompiles from scratch on every source change.
+
+Both entrypoints handle cgroup v2 setup automatically for nested environments (Docker Desktop, Linux VMs); no manual prep needed. A repo-root `.dockerignore` keeps the BuildKit context from shipping host-side `target/` into either image.
 
 **Outstanding v1.0.1 follow-ups** (deferred, visibility-only): see `FOLLOWUPS_v1.0.1.md` P4. Includes Prometheus metrics, four missing tracing event names, `run-all-youki.sh`, and a Rust rewrite of scenario 02. None of these block shipping.
 
@@ -41,6 +46,7 @@ git tag --list 'module/*/live-verified'
 - `EXEC_STREAMING_DESIGN.md` — **architectural-decision record** for the shipped v1.0 streaming exec refactor. The "why" behind the data-plane choice, the connection-as-lifetime model, and the five spike conclusions. Still the canonical reference for anyone touching exec timeouts, sessions, file ops, process control, computer-use APIs, or VNC-from-browser.
 - `PLAN_EXEC_STREAMING.md` — **historical implementation plan** for v1.0 (shipped). Tagged `plan/v0.6.3`. Preserved for archeology; do not act on its instructions as if they were pending work.
 - `FOLLOWUPS_v1.0.1.md` — closure log for P1/P2/P3 plus the deferred P4 visibility-only items.
+- `CODE_REVIEW_PLAN.md` — cross-session plan for running `/code-review` over the system one component at a time, with `proto/*.proto` + `crates/contracts` held frozen as the anchor. Consult and update the progress table when running component reviews.
 - `CHANGELOG.md` — public-facing API + behavior changes, organized by contracts version.
 - `spikes/exec-streaming/spike-0{1..5}-*/RESULT.md` — five confirmed spike outcomes the v1.0 design + implementation rely on:
   - 01: docker exec does NOT propagate disconnect → agent must kill explicitly

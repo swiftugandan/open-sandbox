@@ -66,14 +66,17 @@ services:
         ipv4_address: 10.0.0.5
 
   # The youki runtime agent — built with --features youki. Needs
-  # privileged cgroup + namespace access. The platform requires
-  # CNI plugins (baked into the Dockerfile.youki image).
+  # privileged cgroup + namespace access. INSTALL_CNI=1 pulls in the
+  # CNI plugins (bridge/portmap/loopback) that libcontainer needs; the
+  # other services build the same Dockerfile with INSTALL_CNI=0 default
+  # and don't carry those plugins.
   agent:
     build:
       context: ../..
       dockerfile: infra/e2e/Dockerfile.youki
       args:
         FEATURES: youki
+        INSTALL_CNI: "1"
     command: agent --controller-url http://10.0.0.3:50051 --proxy-url http://10.0.0.4:50052
     environment:
       OPEN_SANDBOX_JOIN_TOKEN: e2e-token

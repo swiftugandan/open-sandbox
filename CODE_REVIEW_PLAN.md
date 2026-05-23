@@ -1,0 +1,83 @@
+# Component Code-Review Plan
+
+A cross-session plan for running `/code-review` over the system one component at a time while holding `proto/*.proto` + `crates/contracts` frozen as the anchor.
+
+## Guiding constraint
+
+`proto/*.proto` and `crates/contracts` are **frozen** for the duration of this pass at `contracts/v1.0.1`. Any finding that would require a contract change is **logged, not applied** — contract drift invalidates every other component's review. If a contract change becomes unavoidable, halt the pass, re-tag, and re-plan.
+
+## Mechanics
+
+> Note: `/code-review` is a Claude Code slash command (formerly `/simplify`). It is user-invoked from the CLI; Claude does not call it as a tool.
+
+`/code-review` operates on the current diff. To scope a review to one component, diff that crate against the anchor tag:
+
+```sh
+# Review entire crate as if it were a new contribution against the anchor
+git diff contracts/v1.0.1 HEAD -- crates/<name>/
+
+# Or, against an empty tree (full-content review)
+git diff $(git hash-object -t tree /dev/null) HEAD -- crates/<name>/
+```
+
+Per component:
+
+1. Branch off `main`.
+2. Run `/code-review` — start at `medium`, escalate to `high` for trust-boundary code.
+3. Fix findings in a focused PR.
+4. Re-run `/code-review` on the fix diff.
+5. Merge; move to next component.
+
+One component in flight at a time so reviewer context stays scoped.
+
+## Order (bottom-up by dependency)
+
+| # | Component | Scope | Effort | Why this slot |
+|---|---|---|---|---|
+| 0 | `proto/` + `crates/contracts` | Audit-only, no edits | `high` | Anchor for everything else. Findings deferred to a separate contract-bump cycle. |
+| 1 | `crates/controller` | gRPC handlers, scheduling, token mgmt, PG writes, LISTEN/NOTIFY emit | `high` | Central trust anchor; authority over routing + agent lifecycle. |
+| 2 | `crates/proxy` | TLS term, host routing, reverse-tunnel pool, `SandboxIoService.OpenIoStream`, two-listener split, DB cache + miss fallback | `high` | Public attack surface + data-plane correctness (exec/file streaming). |
+| 3 | `crates/agent` (core) | Outbound dial, heartbeat, sandbox lifecycle FSM, tunnel forwarding, exec session lifetime | `high` | Reverse trust boundary; carries spike-validated invariants (disconnect → kill, SIGTERM propagation). |
+| 4 | `crates/agent-docker` | Docker runtime backend, bollard usage | `medium` | Default dev backend; check against spike 04 backpressure assumptions. |
+| 5 | `crates/agent-youki` | libcontainer in-process, CNI exec, oci-client pull, `setns(2)` file ops, cgroup v2 | `high` | Production runtime; kernel-adjacent; PID-capture race (spike 05). |
+| 6 | `crates/api` | REST → gRPC translation, API-key auth, error mapping, `/v1/sandboxes/{id}` surface | `medium` | Boundary translator — focus on auth, validation, error shape. |
+| 7 | `crates/ws-client` | WS framing for exec + file streams | `medium` | Client of the same data plane the proxy exposes — review as a pair with proxy IO. |
+| 8 | `crates/cli` | Operator UX | `low` | Thin client; correctness over surface area. |
+| 9 | `infra/` (Pulumi TS) | Topology, DNS, secrets handling | `medium` | Different language → separate pass; not bundled with Rust crates. |
+
+## Per-component checklist (applied every round)
+
+1. **Contract conformance** — respects `contracts/v1.0.1` exactly; no private extensions, no untyped escapes.
+2. **Trust boundary** — every untrusted input is validated on entry; every output to a less-trusted layer is sanitized.
+3. **Lifetime / cancellation** — for streaming code, disconnect propagates the way the spikes proved it must (see `EXEC_STREAMING_DESIGN.md` spike conclusions).
+4. **State authority** — no crate other than `controller` writes routing/agent/sandbox state.
+5. **Error mapping** — errors cross boundaries as `contracts::Error`, not panics or string-typed leakage.
+6. **Concurrency** — no shared mutability without a documented invariant; no `unwrap()` on cross-task channels.
+
+## Deliverables
+
+- One PR per component, with `/code-review` findings addressed; PR description links the review output.
+- A running `REVIEW_LOG.md` (created on the first PR) capturing: deferred contract-change candidates, cross-component findings, spike-invariant violations.
+- End of pass: re-tag `contracts/v1.0.2` only if the deferred list justifies it; otherwise close the pass clean.
+
+## Progress tracking
+
+Each row gets ticked as it merges. Update this table as components land.
+
+| # | Component | Status | PR | Notes |
+|---|---|---|---|---|
+| 0 | contracts (audit) | not started | — | |
+| 1 | controller | not started | — | |
+| 2 | proxy | not started | — | |
+| 3 | agent (core) | not started | — | |
+| 4 | agent-docker | not started | — | |
+| 5 | agent-youki | not started | — | |
+| 6 | api | not started | — | |
+| 7 | ws-client | not started | — | |
+| 8 | cli | not started | — | |
+| 9 | infra | not started | — | |
+
+## Out of scope for this pass
+
+- Performance tuning, refactors, new features.
+- P4 visibility-only items in `FOLLOWUPS_v1.0.1.md` (metrics, tracing event names, Rust scenario-02 rewrite) — tracked separately.

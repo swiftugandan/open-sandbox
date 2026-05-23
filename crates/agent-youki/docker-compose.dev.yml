@@ -1,0 +1,53 @@
+# Dev-loop compose file for crates/agent-youki on non-Linux hosts.
+#
+# Usage:
+#   docker compose -f crates/agent-youki/docker-compose.dev.yml up -d
+#   docker compose -f crates/agent-youki/docker-compose.dev.yml \
+#       exec dev cargo test -p open-sandbox-agent-youki -- --nocapture
+#
+# The dev container runs `sleep infinity`. You `exec` cargo into it. The
+# source tree is bind-mounted at /build, and target/ + the cargo registry
+# live on named Docker volumes so cargo's incremental compile survives
+# across runs and rebuilds.
+#
+# For CI / a clean reproducer, use docker-compose.test.yml instead.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: open_sandbox_test
+      POSTGRES_PASSWORD: test
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 2s
+      retries: 15
+
+  dev:
+    build:
+      context: ../..
+      dockerfile: crates/agent-youki/Dockerfile.dev
+    # Source is bind-mounted; cargo writes to a named volume so target/
+    # is not stored on the slow VirtioFS bind mount.
+    volumes:
+      - ../..:/build:delegated
+      - youki-target:/build/target
+      - youki-cargo-registry:/usr/local/cargo/registry
+      - youki-cargo-git:/usr/local/cargo/git
+    environment:
+      DATABASE_URL: postgres://postgres:test@postgres:5432/open_sandbox_test
+      CARGO_TERM_COLOR: always
+      # Match Dockerfile.test's static-seccomp link configuration.
+      LIBSECCOMP_LINK_TYPE: static
+      LIBSECCOMP_LIB_PATH: /usr/lib
+    depends_on:
+      postgres:
+        condition: service_healthy
+    privileged: true
+    # Keep the container alive so cargo invocations land via `docker exec`.
+    command: ["sleep", "infinity"]
+
+volumes:
+  youki-target:
+  youki-cargo-registry:
+  youki-cargo-git:

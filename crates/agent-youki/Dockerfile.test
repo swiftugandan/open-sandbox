@@ -1,3 +1,15 @@
+# CI / self-contained reproducer image for crates/agent-youki.
+#
+# For day-to-day iteration on macOS or any non-Linux host, prefer
+# Dockerfile.dev + docker-compose.dev.yml: that flow keeps cargo's
+# incremental compile alive across runs. This image rebuilds from scratch
+# on every source change by design — reproducibility over iteration speed.
+# A BuildKit cache mount was considered and rejected here: it would orphan
+# the compiled artifacts from the image (cache mounts are build-time only),
+# breaking the runtime `cargo test` invocation. If cold CI compile time
+# becomes the bottleneck, the correct fix is multi-stage with explicit
+# COPY of target/debug/deps into the runtime stage.
+
 FROM rust:1.88-alpine
 
 RUN apk add --no-cache \

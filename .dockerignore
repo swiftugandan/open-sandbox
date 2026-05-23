@@ -1,0 +1,28 @@
+# Keep the BuildKit context small. The repo root is ~46 GB on disk;
+# without this file every `docker build` ships all of it (mostly target/)
+# into the build daemon before any layer caching can help.
+
+# Rust build artifacts (host-side; container has its own /build/target volume)
+target/
+**/target/
+
+# Node deps (infra/ Pulumi)
+node_modules/
+**/node_modules/
+
+# VCS
+.git/
+.gitignore
+
+# Editor / IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local Claude Code state
+.claude/
+
+# Logs and scratch
+*.log
+/tmp/

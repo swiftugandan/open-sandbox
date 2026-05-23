@@ -1,3 +1,8 @@
+# Minimal mock smoke topology — drives infra/e2e/run.sh, which only
+# checks that the agent registers and reaches `active` state. Intentionally
+# leaner than docker-compose.full.yml (no api service, no internal token,
+# no log config). For full streaming-exec scenarios use docker-compose.full.yml.
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -31,8 +36,6 @@ services:
       context: ../..
       dockerfile: infra/e2e/Dockerfile
     command: proxy --database-url postgres://postgres:test@10.0.0.2:5432/open_sandbox
-    environment:
-      OPEN_SANDBOX_DATABASE_URL: postgres://postgres:test@10.0.0.2:5432/open_sandbox
     depends_on:
       postgres:
         condition: service_healthy

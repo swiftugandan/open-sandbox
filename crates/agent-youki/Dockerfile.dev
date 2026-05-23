@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1.7
+#
+# Dev image for crates/agent-youki on macOS / non-Linux hosts.
+#
+# Differences vs Dockerfile.test:
+#  - No source COPY, no `cargo build` baked into a layer. Iteration runs
+#    `cargo test` inside a *running* container against bind-mounted source,
+#    so cargo's incremental compilation actually works.
+#  - target/ and the cargo registry live on named Docker volumes (see
+#    docker-compose.dev.yml), surviving across runs and rebuilds.
+#  - Same toolchain + system deps + CNI plugins + cgroup-v2 entrypoint as
+#    Dockerfile.test, so the runtime environment matches production.
+#
+# Dockerfile.test remains the authoritative CI / reproducer image. Do not
+# add source COPY here without also explaining why the bind-mount model
+# stopped working.
+
+FROM rust:1.88-alpine
+
+RUN apk add --no-cache \
+    musl-dev \
+    gcc \
+    libseccomp-dev \
+    libseccomp-static \
+    pkgconf \
+    protobuf-dev \
+    git \
+    iptables \
+    util-linux
+
+ENV LIBSECCOMP_LINK_TYPE=static
+ENV LIBSECCOMP_LIB_PATH=/usr/lib
+
+RUN wget -q https://github.com/containernetworking/plugins/releases/download/v1.6.2/cni-plugins-linux-amd64-v1.6.2.tgz \
+    -O /tmp/cni-plugins.tgz \
+    && mkdir -p /opt/cni/bin \
+    && tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin \
+    && rm /tmp/cni-plugins.tgz
+
+WORKDIR /build
+
+# Same cgroup-v2 entrypoint as Dockerfile.test. See that file for the
+# rationale (Docker Desktop's nested VM doesn't pre-delegate controllers).
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'set -e' \
+    'if [ -d /sys/fs/cgroup ] && [ -f /sys/fs/cgroup/cgroup.controllers ]; then' \
+    '  mkdir -p /sys/fs/cgroup/init' \
+    '  while read -r pid; do' \
+    '    echo "$pid" > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true' \
+    '  done < /sys/fs/cgroup/cgroup.procs' \
+    '  for c in $(cat /sys/fs/cgroup/cgroup.controllers); do' \
+    '    echo "+$c" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true' \
+    '  done' \
+    'fi' \
+    'exec "$@"' \
+    > /usr/local/bin/cgroup-v2-entrypoint.sh \
+ && chmod +x /usr/local/bin/cgroup-v2-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/cgroup-v2-entrypoint.sh"]
+CMD ["sleep", "infinity"]
