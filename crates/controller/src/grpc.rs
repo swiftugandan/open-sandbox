@@ -739,6 +739,58 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_sandbox_rolls_back_routing_entry_when_send_command_fails() {
+        // F8: scheduler.assign_sandbox INSERTS the routing entry to PG. If
+        // send_command then fails (agent in list_active_agents but missing
+        // from in-memory AgentConnections — a real race after disconnect),
+        // the routing row must NOT be left orphaned.
+        let store = Arc::new(InMemoryStore::new());
+        let controller = Controller::new(store.clone(), AcceptAllTokens);
+
+        // Seed an Active agent in the store but DO NOT connect it (no entry
+        // in AgentConnections), so send_command will return AgentNotFound.
+        let agent_id = AgentId::new();
+        store
+            .save_agent(crate::store::AgentRecord {
+                agent_id: agent_id.clone(),
+                capacity: AgentCapacity {
+                    cpu_cores: 4,
+                    memory_bytes: 8_000_000_000,
+                },
+                available: crate::store::AvailableResources {
+                    cpu_millicores: 4000,
+                    memory_bytes: 8_000_000_000,
+                    running_sandboxes: 0,
+                },
+                state: crate::store::AgentState::Active,
+            })
+            .await
+            .unwrap();
+
+        let sandbox_id = SandboxId::new();
+        let result = controller
+            .create_sandbox(CreateSandboxRequest {
+                sandbox_id: sandbox_id.clone(),
+                image: "nginx:latest".into(),
+                requirements: SandboxRequirements {
+                    cpu_millicores: 1000,
+                    memory_bytes: 512_000_000,
+                },
+                env_vars: std::collections::HashMap::new(),
+                exposed_port: 8080,
+            })
+            .await;
+
+        assert!(result.is_err(), "create_sandbox should fail when send_command fails");
+
+        // Atomicity: NO routing entry must remain for the unreachable agent.
+        assert!(
+            store.routing_entries_for_agent(&agent_id).is_empty(),
+            "orphan routing entry must be rolled back when send_command fails"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn sweep_preserves_heartbeat_when_mark_dead_fails_transiently() {
         let store = Arc::new(FailNextStore::new());
