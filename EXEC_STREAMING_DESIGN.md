@@ -272,6 +272,15 @@ type prefix: stdin/stdout/stderr/signal/exit), universally supported
 gives clean disconnect semantics matching the spike-01/02 cleanup
 path.
 
+**Idle-session keepalive (from spike 03 follow-up).** The 7ms
+disconnect detection only holds while the server is actively sending.
+For long-idle sessions (e.g., a `bash -i` exec sitting at a prompt),
+detection latency depends on TCP keepalive defaults (often hours).
+The gateway therefore sends a WebSocket **ping** frame every ~30s on
+idle sessions and treats two missed pongs as a peer-gone signal,
+triggering the same cleanup path as a `BrokenPipe` from send. This is
+standard WebSocket usage; tungstenite supports ping/pong directly.
+
 Lifecycle endpoints (`POST /v1/sandboxes`, `GET`, `DELETE`,
 `GET /v1/sandboxes/{id}`) stay REST because they are unary
 RPC-shaped. Two surfaces because two different shapes — which is
@@ -420,6 +429,7 @@ chat log; one-line summary below for cross-session continuity.
 | ----- | -------- | --------------- |
 | 01 | Does docker exec kill the in-container process when bollard's attached stream is dropped? | `spikes/exec-streaming/spike-01-docker-exec-disconnect/RESULT.md` |
 | 02 | Does killing host-side `nsenter` propagate SIGTERM to the in-namespace child? | `spikes/exec-streaming/spike-02-nsenter-signal-propagation/RESULT.md` |
+| 03 | Does axum's WebSocket `send().await` backpressure cleanly, and how fast does the server notice an abrupt client disconnect? | `spikes/exec-streaming/spike-03-axum-websocket-properties/RESULT.md` |
 
 Spike results are committed alongside this doc so the conclusions are
 auditable. If a spike contradicts an assumption above, this doc is
