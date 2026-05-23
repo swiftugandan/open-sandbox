@@ -107,6 +107,10 @@ impl<R: ContainerRuntime> SandboxManager<R> {
         self.sandboxes.lock().unwrap().values().cloned().collect()
     }
 
+    pub fn runtime(&self) -> &Arc<R> {
+        &self.runtime
+    }
+
     pub fn host_port_for(&self, sandbox_id: &SandboxId) -> Result<u16, AgentError> {
         self.sandboxes
             .lock()

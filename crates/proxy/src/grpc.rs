@@ -142,115 +142,152 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
             }
         }
 
-        let mut inbound = request.into_inner();
-
-        // First frame MUST be IoStart with sandbox_id.
-        let first = match inbound.message().await {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                return Err(Status::invalid_argument(
-                    "OpenIoStream closed before first frame",
-                ));
-            }
-            Err(e) => return Err(Status::internal(e.to_string())),
-        };
-
-        let start = match first.payload {
-            Some(io_client_frame::Payload::Start(s)) => s,
-            Some(_) => {
-                return Err(Status::invalid_argument(
-                    "first frame must be IoStart",
-                ));
-            }
-            None => return Err(Status::invalid_argument("empty first frame")),
-        };
-
-        let sandbox_uuid = uuid::Uuid::parse_str(&start.sandbox_id)
-            .map_err(|_| Status::invalid_argument("invalid sandbox_id"))?;
-        let sandbox_id = SandboxId::from(sandbox_uuid);
-
-        let route = self.routing.lookup(&sandbox_id.subdomain()).ok_or_else(|| {
-            Status::not_found(format!("sandbox {sandbox_id} not in routing table"))
-        })?;
-        let agent_id = route.agent_id;
-
-        let agent_sender = self
-            .pool
-            .get_sender(&agent_id)
-            .ok_or_else(|| Status::unavailable(format!("agent {agent_id} not connected")))?;
-
-        // Allocate proxy-side stream_id and register the session.
-        let stream_id = self.sessions.next_stream_id();
+        let inbound = request.into_inner();
         let (server_tx, server_rx) = mpsc::channel::<Result<IoServerFrame, Status>>(32);
-        self.sessions.insert(
-            stream_id.clone(),
-            IoSessionRecord {
-                agent_id: agent_id.clone(),
-                server_tx,
-            },
-        );
 
-        info!(
-            stream_id = %stream_id,
-            sandbox_id = %sandbox_id,
-            agent_id = %agent_id,
-            "io_session.start"
-        );
-
-        // Send IoStart to the agent, wrapped in the tunnel envelope.
-        let start_frame = TunnelRequest {
-            stream_id: stream_id.clone(),
-            payload: Some(tunnel_request::Payload::IoClient(IoClientFrame {
-                stream_id: stream_id.clone(),
-                payload: Some(io_client_frame::Payload::Start(start)),
-            })),
-        };
-        if agent_sender.send(start_frame).await.is_err() {
-            self.sessions.remove(&stream_id);
-            return Err(Status::unavailable("agent tunnel dropped"));
-        }
-
-        // Spawn a task to pump subsequent client frames into the
-        // agent's tunnel.
+        // tonic bidi-streaming requires that we return the Response
+        // BEFORE the client can flush messages on the request body.
+        // So we must NOT await inbound.message() inline here — we
+        // spawn a task that does the IoStart handshake + frame
+        // pumping, and return the server_rx immediately.
         let pool = self.pool.clone();
         let sessions = self.sessions.clone();
-        let agent_id_for_pump = agent_id.clone();
-        let stream_id_for_pump = stream_id.clone();
-        tokio::spawn(async move {
-            while let Ok(Some(frame)) = inbound.message().await {
-                let wrapped = TunnelRequest {
-                    stream_id: stream_id_for_pump.clone(),
-                    payload: Some(tunnel_request::Payload::IoClient(IoClientFrame {
-                        stream_id: stream_id_for_pump.clone(),
-                        payload: frame.payload,
-                    })),
-                };
-                let Some(sender) = pool.get_sender(&agent_id_for_pump) else {
-                    warn!(
-                        stream_id = %stream_id_for_pump,
-                        agent_id = %agent_id_for_pump,
-                        "agent tunnel dropped mid-session"
-                    );
-                    break;
-                };
-                if sender.send(wrapped).await.is_err() {
-                    break;
-                }
-            }
-            // Client side closed — remove from sessions. The agent
-            // will see the stream end via its own
-            // io_client_frame stream (the agent's IoClientFrame
-            // source returning None) and run its ExecRegistry
-            // cleanup.
-            sessions.remove(&stream_id_for_pump);
-            info!(
-                stream_id = %stream_id_for_pump,
-                "io_session.client_closed"
-            );
-        });
+        let routing = self.routing.clone();
+
+        tokio::spawn(dispatch_io_stream(pool, sessions, routing, inbound, server_tx));
 
         Ok(Response::new(ReceiverStream::new(server_rx)))
     }
+}
+
+async fn dispatch_io_stream<S: RoutingStore + 'static>(
+    pool: Arc<TunnelPool>,
+    sessions: Arc<IoSessions>,
+    routing: Arc<RoutingCache<S>>,
+    mut inbound: Streaming<IoClientFrame>,
+    server_tx: mpsc::Sender<Result<IoServerFrame, Status>>,
+) {
+    // Read first IoStart frame.
+    let first = match inbound.message().await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            let _ = server_tx
+                .send(Err(Status::invalid_argument(
+                    "OpenIoStream closed before first frame",
+                )))
+                .await;
+            return;
+        }
+        Err(e) => {
+            let _ = server_tx.send(Err(Status::internal(e.to_string()))).await;
+            return;
+        }
+    };
+
+    let start = match first.payload {
+        Some(io_client_frame::Payload::Start(s)) => s,
+        _ => {
+            let _ = server_tx
+                .send(Err(Status::invalid_argument("first frame must be IoStart")))
+                .await;
+            return;
+        }
+    };
+
+    let sandbox_uuid = match uuid::Uuid::parse_str(&start.sandbox_id) {
+        Ok(u) => u,
+        Err(_) => {
+            let _ = server_tx
+                .send(Err(Status::invalid_argument("invalid sandbox_id")))
+                .await;
+            return;
+        }
+    };
+    let sandbox_id = SandboxId::from(sandbox_uuid);
+
+    let route = match routing.lookup(&sandbox_id.subdomain()) {
+        Some(r) => r,
+        None => {
+            let _ = server_tx
+                .send(Err(Status::not_found(format!(
+                    "sandbox {sandbox_id} not in routing table"
+                ))))
+                .await;
+            return;
+        }
+    };
+    let agent_id = route.agent_id;
+
+    let agent_sender = match pool.get_sender(&agent_id) {
+        Some(s) => s,
+        None => {
+            let _ = server_tx
+                .send(Err(Status::unavailable(format!(
+                    "agent {agent_id} not connected"
+                ))))
+                .await;
+            return;
+        }
+    };
+
+    let stream_id = sessions.next_stream_id();
+    sessions.insert(
+        stream_id.clone(),
+        IoSessionRecord {
+            agent_id: agent_id.clone(),
+            server_tx: server_tx.clone(),
+        },
+    );
+
+    info!(
+        stream_id = %stream_id,
+        sandbox_id = %sandbox_id,
+        agent_id = %agent_id,
+        "io_session.start"
+    );
+
+    // Forward the original IoStart frame to the agent first.
+    let start_frame = TunnelRequest {
+        stream_id: stream_id.clone(),
+        payload: Some(tunnel_request::Payload::IoClient(IoClientFrame {
+            stream_id: stream_id.clone(),
+            payload: Some(io_client_frame::Payload::Start(start)),
+        })),
+    };
+    if agent_sender.send(start_frame).await.is_err() {
+        sessions.remove(&stream_id);
+        let _ = server_tx
+            .send(Err(Status::unavailable("agent tunnel dropped")))
+            .await;
+        return;
+    }
+
+    // Pump remaining client frames to the agent.
+    while let Ok(Some(frame)) = inbound.message().await {
+        let wrapped = TunnelRequest {
+            stream_id: stream_id.clone(),
+            payload: Some(tunnel_request::Payload::IoClient(IoClientFrame {
+                stream_id: stream_id.clone(),
+                payload: frame.payload,
+            })),
+        };
+        let Some(sender) = pool.get_sender(&agent_id) else {
+            warn!(
+                stream_id = %stream_id,
+                agent_id = %agent_id,
+                "agent tunnel dropped mid-session"
+            );
+            break;
+        };
+        if sender.send(wrapped).await.is_err() {
+            break;
+        }
+    }
+    sessions.remove(&stream_id);
+    info!(
+        stream_id = %stream_id,
+        "io_session.client_closed"
+    );
 }
 
 pub fn sandbox_io_service<S: RoutingStore + 'static>(

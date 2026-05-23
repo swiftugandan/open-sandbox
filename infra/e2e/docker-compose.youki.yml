@@ -20,28 +20,14 @@ services:
         FEATURES: docker
     command: controller --database-url postgres://postgres:test@10.0.0.2:5432/open_sandbox
     environment:
-      OPEN_SANDBOX_JOIN_TOKEN: e2e-youki-token
+      OPEN_SANDBOX_JOIN_TOKEN: e2e-token
+      RUST_LOG: info
     depends_on:
       postgres:
         condition: service_healthy
     networks:
       platform:
         ipv4_address: 10.0.0.3
-
-  api:
-    build:
-      context: ../..
-      dockerfile: infra/e2e/Dockerfile.youki
-      args:
-        FEATURES: docker
-    command: api --controller-url http://10.0.0.3:50051
-    depends_on:
-      - controller
-    ports:
-      - "8081:8081"
-    networks:
-      platform:
-        ipv4_address: 10.0.0.5
 
   proxy:
     build:
@@ -50,12 +36,55 @@ services:
       args:
         FEATURES: docker
     command: proxy --database-url postgres://postgres:test@10.0.0.2:5432/open_sandbox
+    environment:
+      OPEN_SANDBOX_INTERNAL_TOKEN: e2e-internal-token
+      RUST_LOG: info
     depends_on:
-      postgres:
-        condition: service_healthy
+      - controller
     networks:
       platform:
         ipv4_address: 10.0.0.4
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/e2e/Dockerfile.youki
+      args:
+        FEATURES: docker
+    command: api --controller-url http://10.0.0.3:50051 --proxy-url http://10.0.0.4:50052
+    environment:
+      OPEN_SANDBOX_API_KEY: e2e-api-key
+      OPEN_SANDBOX_INTERNAL_TOKEN: e2e-internal-token
+      RUST_LOG: info
+    depends_on:
+      - controller
+      - proxy
+    ports:
+      - "18082:8081"
+    networks:
+      platform:
+        ipv4_address: 10.0.0.5
+
+  # The youki runtime agent — built with --features youki. Needs
+  # privileged cgroup + namespace access. The platform requires
+  # CNI plugins (baked into the Dockerfile.youki image).
+  agent:
+    build:
+      context: ../..
+      dockerfile: infra/e2e/Dockerfile.youki
+      args:
+        FEATURES: youki
+    command: agent --controller-url http://10.0.0.3:50051 --proxy-url http://10.0.0.4:50052
+    environment:
+      OPEN_SANDBOX_JOIN_TOKEN: e2e-token
+      RUST_LOG: info
+    depends_on:
+      - controller
+      - proxy
+    privileged: true
+    networks:
+      platform:
+        ipv4_address: 10.0.0.10
 
 networks:
   platform:

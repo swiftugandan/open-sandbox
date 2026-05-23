@@ -12,13 +12,14 @@
 //! Worst observed on Linux: 12ms.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use open_sandbox_agent::container::{
     EXEC_CHANNEL_CAPACITY, ExecExitInfo, ExecHandle, ExecStart, detect_command_not_found,
@@ -101,6 +102,12 @@ pub async fn start_exec_streaming(
     let (stderr_tx, stderr_rx) = mpsc::channel::<Bytes>(EXEC_CHANNEL_CAPACITY);
     let (exited_tx, exited_rx) = oneshot::channel::<ExecExitInfo>();
 
+    // Shared cnf-sniff buffers between the pump tasks (which read
+    // the first ~4 KiB into them) and the exit watcher (which
+    // applies `detect_command_not_found` after the child exits).
+    let stdout_cnf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stderr_cnf = Arc::new(Mutex::new(Vec::<u8>::new()));
+
     // stdin pump.
     tokio::spawn(async move {
         while let Some(bytes) = stdin_rx.recv().await {
@@ -112,18 +119,20 @@ pub async fn start_exec_streaming(
     });
 
     // stdout pump.
-    let stdout_tx_clone = stdout_tx.clone();
-    let mut stdout_for_cnf: Vec<u8> = Vec::new();
-    tokio::spawn(async move {
+    let stdout_cnf_pump = stdout_cnf.clone();
+    let stdout_pump = tokio::spawn(async move {
         let mut buf = [0u8; 64 * 1024];
         loop {
             match stdout.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if stdout_for_cnf.len() < 4096 {
-                        stdout_for_cnf.extend_from_slice(&buf[..n]);
+                    {
+                        let mut g = stdout_cnf_pump.lock().unwrap();
+                        if g.len() < 4096 {
+                            g.extend_from_slice(&buf[..n]);
+                        }
                     }
-                    if stdout_tx_clone
+                    if stdout_tx
                         .send(Bytes::copy_from_slice(&buf[..n]))
                         .await
                         .is_err()
@@ -133,21 +142,24 @@ pub async fn start_exec_streaming(
                 }
             }
         }
+        drop(stdout_tx);
     });
 
     // stderr pump.
-    let stderr_tx_clone = stderr_tx.clone();
-    let mut stderr_for_cnf: Vec<u8> = Vec::new();
-    tokio::spawn(async move {
+    let stderr_cnf_pump = stderr_cnf.clone();
+    let stderr_pump = tokio::spawn(async move {
         let mut buf = [0u8; 64 * 1024];
         loop {
             match stderr.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if stderr_for_cnf.len() < 4096 {
-                        stderr_for_cnf.extend_from_slice(&buf[..n]);
+                    {
+                        let mut g = stderr_cnf_pump.lock().unwrap();
+                        if g.len() < 4096 {
+                            g.extend_from_slice(&buf[..n]);
+                        }
                     }
-                    if stderr_tx_clone
+                    if stderr_tx
                         .send(Bytes::copy_from_slice(&buf[..n]))
                         .await
                         .is_err()
@@ -157,26 +169,24 @@ pub async fn start_exec_streaming(
                 }
             }
         }
+        drop(stderr_tx);
     });
 
-    // exit watcher.
+    // exit watcher. Awaits the child + both pumps so the cnf
+    // buffers are fully populated before we read them.
     tokio::spawn(async move {
         let status = child.wait().await;
-        let exit_code = status
-            .ok()
-            .and_then(|s| s.code())
-            .unwrap_or(-1);
-        // Drop the tx clones so the pump tasks exit cleanly before
-        // we send the exit info. (The actual draining is the
-        // responsibility of io_stream.rs which awaits the pump
-        // tasks before emitting Exited.)
-        drop(stdout_tx);
-        drop(stderr_tx);
+        let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+        let _ = stdout_pump.await;
+        let _ = stderr_pump.await;
 
-        // Detect command-not-found per the shared heuristic.
-        let cnf = exit_code == 127
-            && (detect_command_not_found(&stderr_for_cnf)
-                || detect_command_not_found(&stdout_for_cnf));
+        let cnf = if exit_code == 127 {
+            let stderr_g = stderr_cnf.lock().unwrap();
+            let stdout_g = stdout_cnf.lock().unwrap();
+            detect_command_not_found(&stderr_g) || detect_command_not_found(&stdout_g)
+        } else {
+            false
+        };
 
         let _ = exited_tx.send(ExecExitInfo {
             exit_code,
