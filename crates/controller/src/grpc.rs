@@ -317,9 +317,28 @@ impl<S: ControllerStore + 'static> Controller<S> {
                 }),
             })),
         };
-        self.connections
+        if let Err(err) = self
+            .connections
             .send_command(&assignment.agent_id, command)
-            .await?;
+            .await
+        {
+            // F8: roll back the routing entry the scheduler just inserted.
+            // If the rollback itself fails, log but surface the original
+            // send_command error — that's the actionable one for the caller.
+            if let Err(rollback_err) = self
+                .scheduler
+                .store()
+                .remove_routing_entry(&assignment.sandbox_id)
+                .await
+            {
+                tracing::error!(
+                    sandbox = %assignment.sandbox_id,
+                    error = %rollback_err,
+                    "failed to roll back routing entry after send_command failure"
+                );
+            }
+            return Err(err);
+        }
 
         Ok(assignment)
     }
