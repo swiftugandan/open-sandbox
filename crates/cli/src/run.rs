@@ -404,18 +404,49 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
         "connecting to platform"
     );
 
-    let ctrl_handle = tokio::spawn(async move { controller_conn.run(&controller_url).await });
-    let proxy_handle = tokio::spawn(async move { proxy_conn.run(&proxy_url).await });
+    // Comp-3 A1/B2/C1: each connection runs in its own reconnect loop.
+    // The agent process stays alive across controller / proxy blips, and
+    // sandboxes are only torn down on a real SIGTERM/SIGINT shutdown
+    // (handled below). The two loops are independent so a controller
+    // outage doesn't restart the proxy session, and vice versa.
+    let ctrl_handle = tokio::spawn(async move {
+        let mut backoff = open_sandbox_agent::reconnect::ExponentialBackoff::new();
+        loop {
+            match controller_conn.run(&controller_url).await {
+                Ok(()) => {
+                    warn!("controller stream closed; reconnecting");
+                }
+                Err(e) => {
+                    warn!(error = %e, "controller connection lost; reconnecting");
+                }
+            }
+            let delay = backoff.next_delay();
+            info!(reconnect_delay_ms = delay.as_millis() as u64, "controller reconnect backoff");
+            tokio::time::sleep(delay).await;
+        }
+    });
+    let proxy_handle = tokio::spawn(async move {
+        let mut backoff = open_sandbox_agent::reconnect::ExponentialBackoff::new();
+        loop {
+            match proxy_conn.run(&proxy_url).await {
+                Ok(()) => {
+                    warn!("proxy stream closed; reconnecting");
+                }
+                Err(e) => {
+                    warn!(error = %e, "proxy connection lost; reconnecting");
+                }
+            }
+            let delay = backoff.next_delay();
+            info!(reconnect_delay_ms = delay.as_millis() as u64, "proxy reconnect backoff");
+            tokio::time::sleep(delay).await;
+        }
+    });
 
-    tokio::select! {
-        result = ctrl_handle => {
-            result??;
-        }
-        result = proxy_handle => {
-            result??;
-        }
-        () = shutdown_signal() => {}
-    }
+    // Block until a real shutdown signal — neither reconnect loop ever
+    // returns of its own accord.
+    shutdown_signal().await;
+    ctrl_handle.abort();
+    proxy_handle.abort();
 
     let sandboxes = sandbox_manager.list_sandboxes();
     if !sandboxes.is_empty() {
