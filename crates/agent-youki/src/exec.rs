@@ -7,9 +7,12 @@
 //! and explicitly issue signals on stream close via
 //! `signal_in_container` (used by the ExecRegistry cleanup hook).
 //!
-//! PID capture strategy per spike 05: poll
-//! `/proc/<nsenter_pid>/task/*/children` with 5×10ms backoff.
-//! Worst observed on Linux: 12ms.
+//! In-container PID capture: the wrapped command emits
+//! `OPENSB_INPID=<pid>\n` on stderr before exec'ing the user's
+//! command (see `container::wrap_command_with_inpid_marker`). The
+//! stderr pump strips and forwards it. Replaces the v0.7-era
+//! `/proc/<nsenter_pid>/task/*/children` walk, which captured the
+//! HOST pid — wrong for kill inside the container's PID namespace.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -22,14 +25,12 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
 use open_sandbox_agent::container::{
-    EXEC_CHANNEL_CAPACITY, ExecExitInfo, ExecHandle, ExecStart, detect_command_not_found,
+    EXEC_CHANNEL_CAPACITY, ExecExitInfo, ExecHandle, ExecStart, consume_inpid_marker,
+    detect_command_not_found, wrap_command_with_inpid_marker,
 };
 use open_sandbox_contracts::error::AgentError;
 
 use libcontainer::container::Container;
-
-const PID_CAPTURE_ATTEMPTS: usize = 5;
-const PID_CAPTURE_INTERVAL: Duration = Duration::from_millis(10);
 
 fn container_pid(container_id: &str, state_dir: &Path) -> Result<i32, AgentError> {
     let container_root = state_dir.join(container_id);
@@ -65,7 +66,12 @@ pub async fn start_exec_streaming(
     for (k, v) in &start.env {
         cmd.env(k, v);
     }
-    cmd.arg("--").args(&start.command);
+    // Wrap so the in-container process self-reports its
+    // namespace-local PID. nsenter's child pid (host PID) is not
+    // valid inside the container's PID namespace where signals
+    // must be delivered. See container::wrap_command_with_inpid_marker.
+    let wrapped = wrap_command_with_inpid_marker(start.command);
+    cmd.arg("--").args(&wrapped);
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -76,16 +82,6 @@ pub async fn start_exec_streaming(
     let nsenter_pid = child.id().ok_or_else(|| AgentError::Runtime {
         detail: "spawned nsenter has no PID".into(),
     })? as i32;
-
-    // Capture in-container PID per spike 05.
-    let mut in_container_pid = 0;
-    for _ in 0..PID_CAPTURE_ATTEMPTS {
-        if let Some(pid) = read_first_child(nsenter_pid) {
-            in_container_pid = pid;
-            break;
-        }
-        tokio::time::sleep(PID_CAPTURE_INTERVAL).await;
-    }
 
     let mut stdin = child.stdin.take().ok_or_else(|| AgentError::Runtime {
         detail: "nsenter stdin not available".into(),
@@ -101,6 +97,7 @@ pub async fn start_exec_streaming(
     let (stdout_tx, stdout_rx) = mpsc::channel::<Bytes>(EXEC_CHANNEL_CAPACITY);
     let (stderr_tx, stderr_rx) = mpsc::channel::<Bytes>(EXEC_CHANNEL_CAPACITY);
     let (exited_tx, exited_rx) = oneshot::channel::<ExecExitInfo>();
+    let (inpid_tx, inpid_rx) = oneshot::channel::<i32>();
 
     // Shared cnf-sniff buffers between the pump tasks (which read
     // the first ~4 KiB into them) and the exit watcher (which
@@ -145,30 +142,73 @@ pub async fn start_exec_streaming(
         drop(stdout_tx);
     });
 
-    // stderr pump.
+    // stderr pump. Strips the leading `OPENSB_INPID=<n>\n` marker
+    // (emitted by the shell wrapper) and forwards the pid via
+    // `inpid_tx`; subsequent bytes pass through unchanged.
     let stderr_cnf_pump = stderr_cnf.clone();
     let stderr_pump = tokio::spawn(async move {
         let mut buf = [0u8; 64 * 1024];
+        let mut inpid_scan_buf: Vec<u8> = Vec::new();
+        let mut inpid_done = false;
+        let mut inpid_tx_slot = Some(inpid_tx);
         loop {
             match stderr.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    {
-                        let mut g = stderr_cnf_pump.lock().unwrap();
-                        if g.len() < 4096 {
-                            g.extend_from_slice(&buf[..n]);
+                    let bytes = &buf[..n];
+                    if !inpid_done {
+                        inpid_scan_buf.extend_from_slice(bytes);
+                        match consume_inpid_marker(&mut inpid_scan_buf) {
+                            Ok(Some(pid)) => {
+                                if let Some(tx) = inpid_tx_slot.take() {
+                                    let _ = tx.send(pid);
+                                }
+                                inpid_done = true;
+                                if inpid_scan_buf.is_empty() {
+                                    continue;
+                                }
+                                let rest = std::mem::take(&mut inpid_scan_buf);
+                                {
+                                    let mut g = stderr_cnf_pump.lock().unwrap();
+                                    if g.len() < 4096 {
+                                        g.extend_from_slice(&rest);
+                                    }
+                                }
+                                if stderr_tx.send(Bytes::from(rest)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(None) => continue,
+                            Err(()) => {
+                                inpid_tx_slot.take();
+                                inpid_done = true;
+                                let rest = std::mem::take(&mut inpid_scan_buf);
+                                {
+                                    let mut g = stderr_cnf_pump.lock().unwrap();
+                                    if g.len() < 4096 {
+                                        g.extend_from_slice(&rest);
+                                    }
+                                }
+                                if stderr_tx.send(Bytes::from(rest)).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
-                    }
-                    if stderr_tx
-                        .send(Bytes::copy_from_slice(&buf[..n]))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    } else {
+                        {
+                            let mut g = stderr_cnf_pump.lock().unwrap();
+                            if g.len() < 4096 {
+                                g.extend_from_slice(bytes);
+                            }
+                        }
+                        if stderr_tx.send(Bytes::copy_from_slice(bytes)).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
         }
+        drop(inpid_tx_slot);
         drop(stderr_tx);
     });
 
@@ -193,6 +233,20 @@ pub async fn start_exec_streaming(
             command_not_found: cnf,
         });
     });
+
+    // Wait briefly for the wrapper to emit OPENSB_INPID on stderr.
+    let in_container_pid = tokio::time::timeout(Duration::from_secs(1), inpid_rx)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or(0);
+
+    debug!(
+        exec_id = %exec_id,
+        nsenter_pid = nsenter_pid,
+        in_container_pid = in_container_pid,
+        "youki exec started"
+    );
 
     Ok(ExecHandle {
         exec_id,
@@ -239,36 +293,8 @@ pub async fn signal_in_container(
         // already exited. Treat as success.
         debug!(
             in_container_pid,
-            signum,
-            "nsenter kill returned non-zero (process likely already exited)"
+            signum, "nsenter kill returned non-zero (process likely already exited)"
         );
     }
     Ok(())
-}
-
-fn read_first_child(nsenter_pid: i32) -> Option<i32> {
-    let pattern = format!("/proc/{nsenter_pid}/task");
-    let entries = std::fs::read_dir(&pattern).ok()?;
-    for entry in entries.flatten() {
-        let children_path = entry.path().join("children");
-        if let Ok(content) = std::fs::read_to_string(&children_path) {
-            for token in content.split_whitespace() {
-                if let Ok(pid) = token.parse::<i32>() {
-                    return Some(pid);
-                }
-            }
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_first_child_handles_missing_proc() {
-        // PID 0 doesn't have /proc/0/task — should return None.
-        assert!(read_first_child(0).is_none());
-    }
 }

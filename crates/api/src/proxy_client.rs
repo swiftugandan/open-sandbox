@@ -84,28 +84,34 @@ impl ProxyClientPool {
         if let Some(tok) = &self.internal_token {
             let header = format!("Bearer {tok}");
             let parsed: tonic::metadata::MetadataValue<_> =
-                header.parse().map_err(|e: tonic::metadata::errors::InvalidMetadataValue| ApiError::Internal {
-                    detail: format!("invalid internal-token: {e}"),
-                })?;
+                header
+                    .parse()
+                    .map_err(|e: tonic::metadata::errors::InvalidMetadataValue| {
+                        ApiError::Internal {
+                            detail: format!("invalid internal-token: {e}"),
+                        }
+                    })?;
             request.metadata_mut().insert("authorization", parsed);
         }
 
-        let response = client.open_io_stream(request).await.map_err(|status| {
-            match status.code() {
-                tonic::Code::NotFound => ApiError::SandboxGone {
-                    sandbox_id: status.message().to_string(),
-                },
-                tonic::Code::Unauthenticated => ApiError::IoStreamFailed {
-                    detail: format!("proxy auth: {}", status.message()),
-                },
-                tonic::Code::Unavailable => ApiError::ProxyUnavailable {
-                    detail: status.message().to_string(),
-                },
-                _ => ApiError::IoStreamFailed {
-                    detail: status.message().to_string(),
-                },
-            }
-        })?;
+        let response =
+            client
+                .open_io_stream(request)
+                .await
+                .map_err(|status| match status.code() {
+                    tonic::Code::NotFound => ApiError::SandboxGone {
+                        sandbox_id: status.message().to_string(),
+                    },
+                    tonic::Code::Unauthenticated => ApiError::IoStreamFailed {
+                        detail: format!("proxy auth: {}", status.message()),
+                    },
+                    tonic::Code::Unavailable => ApiError::ProxyUnavailable {
+                        detail: status.message().to_string(),
+                    },
+                    _ => ApiError::IoStreamFailed {
+                        detail: status.message().to_string(),
+                    },
+                })?;
 
         let mut inbound = response.into_inner();
 

@@ -61,12 +61,10 @@ pub fn generate_conflist(network_name: &str) -> CniConfList {
         ),
     ]);
 
-    let portmap_config = HashMap::from([
-        (
-            "capabilities".to_string(),
-            serde_json::json!({ "portMappings": true }),
-        ),
-    ]);
+    let portmap_config = HashMap::from([(
+        "capabilities".to_string(),
+        serde_json::json!({ "portMappings": true }),
+    )]);
 
     CniConfList {
         cni_version: "1.0.0".to_string(),
@@ -105,9 +103,12 @@ pub fn allocate_port() -> Result<u16, AgentError> {
         detail: format!("failed to bind for port allocation: {e}"),
     })?;
 
-    let port = listener.local_addr().map_err(|e| AgentError::Runtime {
-        detail: format!("failed to get local address: {e}"),
-    })?.port();
+    let port = listener
+        .local_addr()
+        .map_err(|e| AgentError::Runtime {
+            detail: format!("failed to get local address: {e}"),
+        })?
+        .port();
 
     drop(listener);
     Ok(port)
@@ -120,7 +121,13 @@ pub async fn invoke_cni(
     netns: &str,
     cni_path: &Path,
 ) -> Result<CniResult, AgentError> {
-    let env = build_cni_env(command, container_id, netns, "eth0", &cni_path.to_string_lossy());
+    let env = build_cni_env(
+        command,
+        container_id,
+        netns,
+        "eth0",
+        &cni_path.to_string_lossy(),
+    );
 
     let mut prev_result: Option<serde_json::Value> = None;
 
@@ -162,24 +169,36 @@ pub async fn invoke_cni(
             })?;
 
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(&plugin_json).await.map_err(|e| AgentError::Runtime {
-                detail: format!("failed to write to CNI plugin stdin: {e}"),
-            })?;
+            stdin
+                .write_all(&plugin_json)
+                .await
+                .map_err(|e| AgentError::Runtime {
+                    detail: format!("failed to write to CNI plugin stdin: {e}"),
+                })?;
         }
 
-        let output = child.wait_with_output().await.map_err(|e| AgentError::Runtime {
-            detail: format!("CNI plugin {} failed: {e}", plugin.plugin_type),
-        })?;
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| AgentError::Runtime {
+                detail: format!("CNI plugin {} failed: {e}", plugin.plugin_type),
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if let Ok(cni_err) = parse_cni_error(&output.stdout) {
                 return Err(AgentError::Runtime {
-                    detail: format!("CNI plugin {} error: {} ({})", plugin.plugin_type, cni_err.msg, stderr),
+                    detail: format!(
+                        "CNI plugin {} error: {} ({})",
+                        plugin.plugin_type, cni_err.msg, stderr
+                    ),
                 });
             }
             return Err(AgentError::Runtime {
-                detail: format!("CNI plugin {} exited with {}: {}", plugin.plugin_type, output.status, stderr),
+                detail: format!(
+                    "CNI plugin {} exited with {}: {}",
+                    plugin.plugin_type, output.status, stderr
+                ),
             });
         }
 
@@ -259,7 +278,11 @@ mod tests {
             ports.insert(port);
         }
         // Most ports should be unique; kernel can reuse after close
-        assert!(ports.len() >= 5, "too many duplicate ports: only {} unique out of 10", ports.len());
+        assert!(
+            ports.len() >= 5,
+            "too many duplicate ports: only {} unique out of 10",
+            ports.len()
+        );
     }
 
     #[test]
@@ -294,7 +317,8 @@ mod tests {
 
     #[test]
     fn parse_valid_cni_result() {
-        let json = br#"{"cniVersion":"1.0.0","ips":[{"address":"10.88.0.2/16","gateway":"10.88.0.1"}]}"#;
+        let json =
+            br#"{"cniVersion":"1.0.0","ips":[{"address":"10.88.0.2/16","gateway":"10.88.0.1"}]}"#;
         let result = parse_cni_result(json).unwrap();
 
         assert_eq!(result.cni_version, "1.0.0");

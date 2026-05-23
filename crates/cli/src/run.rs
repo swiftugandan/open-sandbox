@@ -5,7 +5,9 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tracing::{info, warn};
 
-use open_sandbox_contracts::constants::{PROXY_STARTUP_RETRY_ATTEMPTS, PROXY_STARTUP_RETRY_INTERVAL};
+use open_sandbox_contracts::constants::{
+    PROXY_STARTUP_RETRY_ATTEMPTS, PROXY_STARTUP_RETRY_INTERVAL,
+};
 use open_sandbox_contracts::controller::{AgentResources, Architecture};
 use open_sandbox_contracts::types::{AgentId, JoinToken};
 
@@ -127,18 +129,10 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
     // Optional internal authn token for OpenIoStream (gateway-side).
     // None disables verification — only safe when the proxy is
     // network-isolated from public traffic (default deployment).
-    let internal_token = std::env::var(
-        open_sandbox_contracts::constants::INTERNAL_TOKEN_ENV,
-    )
-    .ok();
+    let internal_token = std::env::var(open_sandbox_contracts::constants::INTERNAL_TOKEN_ENV).ok();
 
-    let grpc_service = sandbox_io_service(
-        mux,
-        tunnel_pool,
-        sessions,
-        cache.clone(),
-        internal_token,
-    );
+    let grpc_service =
+        sandbox_io_service(mux, tunnel_pool, sessions, cache.clone(), internal_token);
 
     let grpc_addr = format!("0.0.0.0:{}", args.grpc_port);
     let grpc_listener = TcpListener::bind(&grpc_addr).await?;
@@ -248,12 +242,14 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
         for entry in &sandboxes {
             let stop_cmd = open_sandbox_contracts::controller::StopSandbox {
                 sandbox_id: entry.sandbox_id.to_string(),
-                timeout_seconds: open_sandbox_contracts::constants::SANDBOX_STOP_TIMEOUT
-                    .as_secs() as u32,
+                timeout_seconds: open_sandbox_contracts::constants::SANDBOX_STOP_TIMEOUT.as_secs()
+                    as u32,
             };
             match sandbox_manager.stop_sandbox(stop_cmd).await {
                 Ok(_) => info!(sandbox_id = %entry.sandbox_id, "stopped sandbox"),
-                Err(e) => warn!(sandbox_id = %entry.sandbox_id, error = %e, "failed to stop sandbox"),
+                Err(e) => {
+                    warn!(sandbox_id = %entry.sandbox_id, error = %e, "failed to stop sandbox")
+                }
             }
         }
     }
@@ -275,10 +271,7 @@ pub async fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("failed to connect to controller: {e}"))?,
     );
 
-    let internal_token = std::env::var(
-        open_sandbox_contracts::constants::INTERNAL_TOKEN_ENV,
-    )
-    .ok();
+    let internal_token = std::env::var(open_sandbox_contracts::constants::INTERNAL_TOKEN_ENV).ok();
 
     let proxy = Arc::new(
         ProxyClientPool::connect(&args.proxy_url, DEFAULT_POOL_SIZE, internal_token)
@@ -309,9 +302,8 @@ async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
         tokio::select! {
             _ = ctrl_c => {}
             _ = sigterm.recv() => {}

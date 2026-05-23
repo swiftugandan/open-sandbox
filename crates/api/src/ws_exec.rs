@@ -17,8 +17,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -33,8 +33,8 @@ use open_sandbox_contracts::types::SandboxId;
 
 use crate::frame;
 use crate::proxy_client::SharedProxyClient;
-use crate::state::ApiState;
 use crate::service::SandboxService;
+use crate::state::ApiState;
 
 const AUTH_HEADER: &str = "authorization";
 
@@ -47,7 +47,11 @@ pub async fn ws_exec<S: SandboxService>(
 ) -> Response {
     // Validate sandbox_id.
     let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
-        return error_response(StatusCode::BAD_REQUEST, "INVALID_REQUEST", "invalid sandbox_id");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "invalid sandbox_id",
+        );
     };
     let sandbox_id = SandboxId::from(uuid);
 
@@ -175,9 +179,18 @@ async fn pump_ws_session(
     let mut ping_interval = tokio::time::interval(WS_IDLE_PING_INTERVAL);
     ping_interval.reset();
 
+    let mut recv_task_handle = recv_task;
     loop {
         tokio::select! {
             biased;
+            // If the WS recv task ends (client closed the socket
+            // or transport error) bring the session down
+            // immediately — don't wait up to 30s for the next
+            // keepalive ping to fail. Without this the agent
+            // doesn't see the synthetic IoClose until after the
+            // next ping → its ExecRegistry cleanup is delayed
+            // accordingly.
+            _ = &mut recv_task_handle => break,
             frame = server_rx.recv() => match frame {
                 None => break,
                 Some(Err(e)) => {
@@ -244,7 +257,7 @@ async fn pump_ws_session(
     // client stream → agent cleans up.
     drop(client_tx);
     // Wait briefly for the recv task to finish (it observes WS close).
-    let _ = tokio::time::timeout(Duration::from_secs(2), recv_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), recv_task_handle).await;
 
     info!(
         sandbox_id = %sandbox_id,

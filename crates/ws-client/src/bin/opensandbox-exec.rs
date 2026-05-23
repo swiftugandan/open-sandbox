@@ -10,6 +10,7 @@
 
 use std::io::Write;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
 use open_sandbox_ws_client::{ExecParams, ExecSession, ServerFrame};
@@ -29,6 +30,12 @@ struct Args {
     /// Working directory inside the container.
     #[arg(long)]
     cwd: Option<String>,
+    /// Read stdout/stderr for at most N seconds then exit cleanly.
+    /// Used by idle-keepalive and long-running scenarios that
+    /// don't care about waiting for the in-container process to
+    /// exit on its own. 0 = no limit (default).
+    #[arg(long, default_value_t = 0)]
+    read_for_secs: u64,
     /// Command and arguments to run.
     #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
@@ -41,20 +48,39 @@ async fn main() -> ExitCode {
     if let Some(cwd) = args.cwd {
         params = params.cwd(cwd);
     }
-    let mut session = match ExecSession::connect(&args.base, &args.sandbox, &args.api_key, params)
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("connect: {e}");
-            return ExitCode::from(2);
-        }
-    };
+    let mut session =
+        match ExecSession::connect(&args.base, &args.sandbox, &args.api_key, params).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("connect: {e}");
+                return ExitCode::from(2);
+            }
+        };
 
-    let exit_code: i32;
+    let mut exit_code: i32 = 0;
+    let deadline = if args.read_for_secs > 0 {
+        Some(tokio::time::Instant::now() + Duration::from_secs(args.read_for_secs))
+    } else {
+        None
+    };
     loop {
-        match session.next_frame().await {
-            Ok(Some(ServerFrame::Started { exec_id, in_container_pid })) => {
+        let frame_res = if let Some(d) = deadline {
+            tokio::select! {
+                f = session.next_frame() => f,
+                _ = tokio::time::sleep_until(d) => {
+                    eprintln!("# read deadline reached after {}s — exiting cleanly", args.read_for_secs);
+                    return ExitCode::from(0);
+                }
+            }
+        } else {
+            session.next_frame().await
+        };
+
+        match frame_res {
+            Ok(Some(ServerFrame::Started {
+                exec_id,
+                in_container_pid,
+            })) => {
                 eprintln!("# started exec_id={exec_id} pid={in_container_pid}");
             }
             Ok(Some(ServerFrame::Stdout(b))) => {

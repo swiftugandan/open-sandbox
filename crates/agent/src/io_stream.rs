@@ -98,8 +98,15 @@ pub async fn drive_io_session<R, S>(
             drive_read_file(runtime, stream_id, container_id, params, server_tx).await;
         }
         Some(io_start::Params::WriteFile(params)) => {
-            drive_write_file(runtime, stream_id, container_id, params, client_frames, server_tx)
-                .await;
+            drive_write_file(
+                runtime,
+                stream_id,
+                container_id,
+                params,
+                client_frames,
+                server_tx,
+            )
+            .await;
         }
         Some(io_start::Params::WriteFilesTargz(params)) => {
             drive_write_files_targz(
@@ -459,7 +466,9 @@ async fn drive_read_file<R>(
         }
         Err(e) => {
             let code = match &e {
-                AgentError::Runtime { detail } if detail.contains("No such file") => "FILE_NOT_FOUND",
+                AgentError::Runtime { detail } if detail.contains("No such file") => {
+                    "FILE_NOT_FOUND"
+                }
                 _ => "READ_FAILED",
             };
             send_error(&server_tx, &stream_id, code, &e.to_string()).await;
@@ -493,7 +502,12 @@ async fn drive_write_file<R, S>(
     // Collect stdin chunks until Close{stdin_eof}, EOF, or non-Stdin frame.
     let mut content: Vec<u8> = Vec::new();
     while let Some(frame) = client_frames.next().await {
-        let Ok(IoClientFrame { payload: Some(p), .. }) = frame else { break };
+        let Ok(IoClientFrame {
+            payload: Some(p), ..
+        }) = frame
+        else {
+            break;
+        };
         match p {
             io_client_frame::Payload::Stdin(bytes) => content.extend_from_slice(&bytes),
             io_client_frame::Payload::Close(_) => break,
@@ -552,7 +566,12 @@ async fn drive_write_files_targz<R, S>(
 
     let mut tarball: Vec<u8> = Vec::new();
     while let Some(frame) = client_frames.next().await {
-        let Ok(IoClientFrame { payload: Some(p), .. }) = frame else { break };
+        let Ok(IoClientFrame {
+            payload: Some(p), ..
+        }) = frame
+        else {
+            break;
+        };
         match p {
             io_client_frame::Payload::Stdin(bytes) => tarball.extend_from_slice(&bytes),
             io_client_frame::Payload::Close(_) => break,
@@ -698,12 +717,17 @@ mod tests {
         let registry = Arc::new(ExecRegistry::new());
         let (tx, rx, h) = spawn_session(runtime.clone(), registry.clone(), "s1");
 
-        tx.send(Ok(iostart_exec(vec!["echo", "hello"]))).await.unwrap();
+        tx.send(Ok(iostart_exec(vec!["echo", "hello"])))
+            .await
+            .unwrap();
         drop(tx);
 
         let frames = collect_until_exit(rx).await;
         // Expect: Started, Stdout("hello\n"), Exited(0)
-        assert!(matches!(frames.first(), Some(io_server_frame::Payload::Started(_))));
+        assert!(matches!(
+            frames.first(),
+            Some(io_server_frame::Payload::Started(_))
+        ));
         let stdout_chunks: Vec<_> = frames
             .iter()
             .filter_map(|p| match p {
@@ -798,7 +822,9 @@ mod tests {
         let registry = Arc::new(ExecRegistry::new());
         let (tx, _rx, h) = spawn_session(runtime.clone(), registry, "s4");
 
-        tx.send(Ok(iostart_exec(vec!["sleep", "30"]))).await.unwrap();
+        tx.send(Ok(iostart_exec(vec!["sleep", "30"])))
+            .await
+            .unwrap();
         // Give the runtime a moment to start the sleep.
         tokio::time::sleep(Duration::from_millis(50)).await;
         tx.send(Ok(IoClientFrame {
@@ -830,16 +856,23 @@ mod tests {
         let registry = Arc::new(ExecRegistry::new());
         let (tx, mut rx, h) = spawn_session(runtime.clone(), registry.clone(), "s5");
 
-        tx.send(Ok(iostart_exec(vec!["sleep", "30"]))).await.unwrap();
+        tx.send(Ok(iostart_exec(vec!["sleep", "30"])))
+            .await
+            .unwrap();
         // Wait for Started so the registry is populated.
         let started = rx.recv().await.unwrap();
-        assert!(matches!(started.payload, Some(io_server_frame::Payload::Started(_))));
+        assert!(matches!(
+            started.payload,
+            Some(io_server_frame::Payload::Started(_))
+        ));
         assert_eq!(registry.len(), 1, "registry should have one entry");
 
         // Send Close { stdin_eof: false } to end the session.
         tx.send(Ok(IoClientFrame {
             stream_id: "s5".into(),
-            payload: Some(io_client_frame::Payload::Close(IoClose { stdin_eof: false })),
+            payload: Some(io_client_frame::Payload::Close(IoClose {
+                stdin_eof: false,
+            })),
         }))
         .await
         .unwrap();
@@ -852,14 +885,16 @@ mod tests {
         let signums: Vec<i32> = signals.iter().map(|s| s.signum).collect();
         assert!(signums.contains(&15), "SIGTERM should have been sent");
         assert!(signums.contains(&9), "SIGKILL should have been sent");
-        assert!(registry.is_empty(), "registry should be drained after cleanup");
+        assert!(
+            registry.is_empty(),
+            "registry should be drained after cleanup"
+        );
     }
 
     #[tokio::test]
     async fn read_file_returns_contents() {
-        let runtime = Arc::new(
-            MockContainerRuntime::new().with_file("/home/data.txt", "file body"),
-        );
+        let runtime =
+            Arc::new(MockContainerRuntime::new().with_file("/home/data.txt", "file body"));
         let registry = Arc::new(ExecRegistry::new());
         let (tx, rx, h) = spawn_session(runtime, registry, "s6");
 
@@ -942,7 +977,9 @@ mod tests {
         let registry = Arc::new(ExecRegistry::new());
         let (tx, mut rx, h) = spawn_session(runtime.clone(), registry.clone(), "s8");
 
-        tx.send(Ok(iostart_exec(vec!["sleep", "30"]))).await.unwrap();
+        tx.send(Ok(iostart_exec(vec!["sleep", "30"])))
+            .await
+            .unwrap();
         let _started = rx.recv().await.unwrap();
         // Now send a second IoStart — protocol error.
         tx.send(Ok(iostart_exec(vec!["echo", "no"]))).await.unwrap();

@@ -126,17 +126,16 @@ impl ExecSession {
     ) -> Result<Self, WsClientError> {
         // base_url is "ws://host:port" or "wss://host:port".
         let url = format!("{base_url}/v1/sandboxes/{sandbox_id}/exec");
-        let mut request = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
-            url,
-        )
-        .map_err(|e| WsClientError::Connect(e.to_string()))?;
+        let mut request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+                .map_err(|e| WsClientError::Connect(e.to_string()))?;
         request.headers_mut().insert(
             "authorization",
-            format!("Bearer {api_key}")
-                .parse()
-                .map_err(|e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| {
+            format!("Bearer {api_key}").parse().map_err(
+                |e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| {
                     WsClientError::Connect(e.to_string())
-                })?,
+                },
+            )?,
         );
         let (mut ws, _) = connect_async(request)
             .await
@@ -236,27 +235,31 @@ fn decode_server(bytes: &[u8]) -> Result<ServerFrame, WsClientError> {
         KIND_STDOUT => Ok(ServerFrame::Stdout(Bytes::copy_from_slice(payload))),
         KIND_STDERR => Ok(ServerFrame::Stderr(Bytes::copy_from_slice(payload))),
         KIND_EXITED => {
-            let e = IoExited::decode(payload).map_err(|e| WsClientError::Protocol(e.to_string()))?;
+            let e =
+                IoExited::decode(payload).map_err(|e| WsClientError::Protocol(e.to_string()))?;
             Ok(ServerFrame::Exited {
                 exit_code: e.exit_code,
                 command_not_found: e.command_not_found,
             })
         }
         KIND_ERROR => {
-            let e =
-                IoErrorProto::decode(payload).map_err(|e| WsClientError::Protocol(e.to_string()))?;
+            let e = IoErrorProto::decode(payload)
+                .map_err(|e| WsClientError::Protocol(e.to_string()))?;
             Ok(ServerFrame::Error {
                 code: e.code,
                 detail: e.detail,
             })
         }
         KIND_STARTED => {
-            let s = IoStarted::decode(payload).map_err(|e| WsClientError::Protocol(e.to_string()))?;
+            let s =
+                IoStarted::decode(payload).map_err(|e| WsClientError::Protocol(e.to_string()))?;
             Ok(ServerFrame::Started {
                 exec_id: s.exec_id,
                 in_container_pid: s.in_container_pid,
             })
         }
-        k => Err(WsClientError::Protocol(format!("unknown frame kind 0x{k:02x}"))),
+        k => Err(WsClientError::Protocol(format!(
+            "unknown frame kind 0x{k:02x}"
+        ))),
     }
 }

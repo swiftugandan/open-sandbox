@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::proxy::sandbox_io_service_client::SandboxIoServiceClient;
@@ -61,7 +61,10 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
                 agent_id: self.agent_id.to_string(),
             })),
         };
-        outbound_tx.send(ready).await.map_err(|_| AgentError::TunnelDisconnected)?;
+        outbound_tx
+            .send(ready)
+            .await
+            .map_err(|_| AgentError::TunnelDisconnected)?;
 
         let io_sessions: IoSessions = Arc::new(Mutex::new(HashMap::new()));
         let forwarder = self.forwarder.clone();
@@ -112,13 +115,7 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
                 }
                 tunnel_request::Payload::Data(_) | tunnel_request::Payload::Close(_) => {}
                 tunnel_request::Payload::IoClient(io_frame) => {
-                    handle_io_client_frame(
-                        &forwarder,
-                        &io_sessions,
-                        &outbound_tx,
-                        io_frame,
-                    )
-                    .await;
+                    handle_io_client_frame(&forwarder, &io_sessions, &outbound_tx, io_frame).await;
                 }
             }
         }
@@ -137,10 +134,7 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
 
     // If this is the first frame (Start), spawn the per-session
     // drive_io_session task. Otherwise route to the existing session.
-    let is_start = matches!(
-        io_frame.payload,
-        Some(io_client_frame::Payload::Start(_))
-    );
+    let is_start = matches!(io_frame.payload, Some(io_client_frame::Payload::Start(_)));
 
     if is_start {
         let start_inner = match &io_frame.payload {
@@ -148,8 +142,7 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
             _ => unreachable!(),
         };
 
-        let sandbox_id = match uuid::Uuid::parse_str(&start_inner.sandbox_id).map(SandboxId::from)
-        {
+        let sandbox_id = match uuid::Uuid::parse_str(&start_inner.sandbox_id).map(SandboxId::from) {
             Ok(id) => id,
             Err(_) => {
                 let _ = outbound_tx
@@ -180,7 +173,10 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
         let (in_tx, in_rx) = mpsc::channel::<IoClientFrame>(32);
         let (server_tx, mut server_rx) = mpsc::channel::<IoServerFrame>(32);
 
-        io_sessions.lock().unwrap().insert(stream_id.clone(), in_tx.clone());
+        io_sessions
+            .lock()
+            .unwrap()
+            .insert(stream_id.clone(), in_tx.clone());
 
         // Forward the initial Start frame.
         let _ = in_tx.send(io_frame).await;
@@ -188,8 +184,7 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
         // Spawn the driver.
         let runtime = forwarder.sandbox_manager().runtime().clone();
         let registry = forwarder.registry().clone();
-        let client_stream =
-            ReceiverStream::new(in_rx).map(Ok::<_, AgentError>);
+        let client_stream = ReceiverStream::new(in_rx).map(Ok::<_, AgentError>);
         let stream_id_for_drive = stream_id.clone();
         tokio::spawn(drive_io_session(
             runtime,

@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use open_sandbox_agent_docker::DockerRuntime;
 use open_sandbox_agent::container::{ContainerConfig, ContainerRuntime};
 use open_sandbox_agent::sandbox::SandboxManager;
+use open_sandbox_agent_docker::DockerRuntime;
 use open_sandbox_contracts::controller::{SandboxConfig, StartSandbox};
 use open_sandbox_contracts::types::SandboxId;
 
@@ -32,11 +32,7 @@ async fn sandbox_lifecycle_create_exec_stop() {
     );
 
     let output = sandbox_manager
-        .exec_sandbox(
-            &sandbox_id,
-            vec!["echo".into(), "hello".into()],
-            vec![],
-        )
+        .exec_sandbox(&sandbox_id, vec!["echo".into(), "hello".into()], vec![])
         .await
         .unwrap();
     assert_eq!(output.exit_code, 0);

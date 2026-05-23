@@ -321,7 +321,10 @@ async fn unary_via_io_stream<S: SandboxService>(
                     return Ok(());
                 }
                 return Err(ApiError::IoStreamFailed {
-                    detail: format!("exit={} command_not_found={}", e.exit_code, e.command_not_found),
+                    detail: format!(
+                        "exit={} command_not_found={}",
+                        e.exit_code, e.command_not_found
+                    ),
                 });
             }
             Some(io_server_frame::Payload::Error(err)) => {

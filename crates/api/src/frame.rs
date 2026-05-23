@@ -185,7 +185,10 @@ mod tests {
 
     #[test]
     fn unknown_kind_errors() {
-        assert!(matches!(decode_client(&[0xFF]), Err(FrameError::UnknownKind(0xFF))));
+        assert!(matches!(
+            decode_client(&[0xFF]),
+            Err(FrameError::UnknownKind(0xFF))
+        ));
     }
 
     #[test]

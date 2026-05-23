@@ -6,9 +6,9 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn};
 
 use open_sandbox_contracts::proxy::{
-    IoClientFrame, IoServerFrame, TunnelRequest, TunnelResponse, io_client_frame, tunnel_request,
-    tunnel_response,
+    IoClientFrame, IoClose, IoServerFrame, TunnelRequest, TunnelResponse, io_client_frame,
     sandbox_io_service_server::{SandboxIoService, SandboxIoServiceServer},
+    tunnel_request, tunnel_response,
 };
 use open_sandbox_contracts::types::{AgentId, SandboxId};
 
@@ -154,7 +154,9 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
         let sessions = self.sessions.clone();
         let routing = self.routing.clone();
 
-        tokio::spawn(dispatch_io_stream(pool, sessions, routing, inbound, server_tx));
+        tokio::spawn(dispatch_io_stream(
+            pool, sessions, routing, inbound, server_tx,
+        ));
 
         Ok(Response::new(ReceiverStream::new(server_rx)))
     }
@@ -262,27 +264,73 @@ async fn dispatch_io_stream<S: RoutingStore + 'static>(
         return;
     }
 
-    // Pump remaining client frames to the agent.
-    while let Ok(Some(frame)) = inbound.message().await {
-        let wrapped = TunnelRequest {
-            stream_id: stream_id.clone(),
-            payload: Some(tunnel_request::Payload::IoClient(IoClientFrame {
-                stream_id: stream_id.clone(),
-                payload: frame.payload,
-            })),
-        };
-        let Some(sender) = pool.get_sender(&agent_id) else {
-            warn!(
-                stream_id = %stream_id,
-                agent_id = %agent_id,
-                "agent tunnel dropped mid-session"
-            );
-            break;
-        };
-        if sender.send(wrapped).await.is_err() {
-            break;
+    // Spawn the inbound→agent pump. Decoupled from the lifetime of
+    // this function so we can keep the response channel alive
+    // while the agent finishes work — typical for unary REST
+    // callers (write_file, write_files, read_file) that close
+    // their request stream immediately after sending all frames.
+    let pool_for_pump = pool.clone();
+    let agent_id_for_pump = agent_id.clone();
+    let stream_id_for_pump = stream_id.clone();
+    tokio::spawn(async move {
+        let mut saw_explicit_close = false;
+        while let Ok(Some(frame)) = inbound.message().await {
+            if matches!(&frame.payload, Some(io_client_frame::Payload::Close(_))) {
+                saw_explicit_close = true;
+            }
+            let wrapped = TunnelRequest {
+                stream_id: stream_id_for_pump.clone(),
+                payload: Some(tunnel_request::Payload::IoClient(IoClientFrame {
+                    stream_id: stream_id_for_pump.clone(),
+                    payload: frame.payload,
+                })),
+            };
+            let Some(sender) = pool_for_pump.get_sender(&agent_id_for_pump) else {
+                warn!(
+                    stream_id = %stream_id_for_pump,
+                    agent_id = %agent_id_for_pump,
+                    "agent tunnel dropped mid-session"
+                );
+                return;
+            };
+            if sender.send(wrapped).await.is_err() {
+                return;
+            }
         }
-    }
+        // Gateway closed its request stream. If the caller never
+        // sent an explicit IoClose (e.g., a WebSocket peer that
+        // simply dropped the socket) the agent has no way to know
+        // the session is over — it would keep the in-container
+        // process running until natural exit. Forward a synthetic
+        // Close so the agent's pump_exec_session fires its
+        // ExecRegistry cleanup.
+        if !saw_explicit_close {
+            let synthetic_close = TunnelRequest {
+                stream_id: stream_id_for_pump.clone(),
+                payload: Some(tunnel_request::Payload::IoClient(IoClientFrame {
+                    stream_id: stream_id_for_pump.clone(),
+                    payload: Some(io_client_frame::Payload::Close(IoClose {
+                        stdin_eof: false,
+                    })),
+                })),
+            };
+            if let Some(sender) = pool_for_pump.get_sender(&agent_id_for_pump) {
+                let _ = sender.send(synthetic_close).await;
+            }
+        }
+    });
+
+    // Hold the session record alive until the gateway-side
+    // response receiver is dropped. This fires when:
+    //  - unary_via_io_stream sees an Exited/Error terminal frame
+    //    and returns (dropping its mpsc::Receiver), OR
+    //  - the public WebSocket caller hung up (gateway closes
+    //    its proxy stream).
+    // Without this wait, dispatch_io_stream would return as soon
+    // as the gateway's request stream closes, dropping the
+    // server_tx and causing the gateway to see "proxy stream
+    // ended without terminal frame".
+    server_tx.closed().await;
     sessions.remove(&stream_id);
     info!(
         stream_id = %stream_id,
@@ -363,14 +411,7 @@ mod tests {
         let mux = Arc::new(StreamMux::new(pool.clone()));
         let sessions = Arc::new(IoSessions::new());
         let routing = empty_cache();
-        let addr = start_proxy_grpc(
-            mux,
-            pool.clone(),
-            sessions,
-            routing,
-            None,
-        )
-        .await;
+        let addr = start_proxy_grpc(mux, pool.clone(), sessions, routing, None).await;
 
         let channel = tonic::transport::Channel::from_shared(addr)
             .unwrap()
@@ -402,14 +443,7 @@ mod tests {
         let mux = Arc::new(StreamMux::new(pool.clone()));
         let sessions = Arc::new(IoSessions::new());
         let routing = empty_cache();
-        let addr = start_proxy_grpc(
-            mux,
-            pool,
-            sessions,
-            routing,
-            None,
-        )
-        .await;
+        let addr = start_proxy_grpc(mux, pool, sessions, routing, None).await;
 
         let channel = tonic::transport::Channel::from_shared(addr)
             .unwrap()
@@ -493,14 +527,7 @@ mod tests {
         let agent_id = AgentId::new();
         routing.insert(sandbox_id.clone(), agent_id.clone());
 
-        let addr = start_proxy_grpc(
-            mux,
-            pool.clone(),
-            sessions.clone(),
-            routing,
-            None,
-        )
-        .await;
+        let addr = start_proxy_grpc(mux, pool.clone(), sessions.clone(), routing, None).await;
 
         // Connect "agent" side.
         let agent_channel = tonic::transport::Channel::from_shared(addr.clone())
@@ -511,7 +538,11 @@ mod tests {
         let mut agent_client = SandboxIoServiceClient::new(agent_channel);
         let (agent_tx, agent_rx) = mpsc::channel::<TunnelResponse>(32);
         let agent_stream = ReceiverStream::new(agent_rx);
-        let mut agent_inbound = agent_client.open_tunnel(agent_stream).await.unwrap().into_inner();
+        let mut agent_inbound = agent_client
+            .open_tunnel(agent_stream)
+            .await
+            .unwrap()
+            .into_inner();
         // Send Ready frame.
         agent_tx
             .send(TunnelResponse {
@@ -564,12 +595,14 @@ mod tests {
                 stream_id: stream_id_on_tunnel.clone(),
                 payload: Some(tunnel_response::Payload::IoServer(IoServerFrame {
                     stream_id: stream_id_on_tunnel,
-                    payload: Some(open_sandbox_contracts::proxy::io_server_frame::Payload::Exited(
-                        open_sandbox_contracts::proxy::IoExited {
-                            exit_code: 0,
-                            command_not_found: false,
-                        },
-                    )),
+                    payload: Some(
+                        open_sandbox_contracts::proxy::io_server_frame::Payload::Exited(
+                            open_sandbox_contracts::proxy::IoExited {
+                                exit_code: 0,
+                                command_not_found: false,
+                            },
+                        ),
+                    ),
                 })),
             })
             .await

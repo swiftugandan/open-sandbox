@@ -73,7 +73,10 @@ impl MockContainerRuntime {
     }
 
     pub fn with_file(self, path: impl Into<String>, content: impl Into<Bytes>) -> Self {
-        self.files.lock().unwrap().insert(path.into(), content.into());
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.into(), content.into());
         self
     }
 
@@ -139,7 +142,9 @@ impl ContainerRuntime for MockContainerRuntime {
         let (exited_tx, exited_rx) = oneshot::channel::<ExecExitInfo>();
 
         let cmd = start.command.clone();
-        tokio::spawn(simulate_exec(cmd, stdin_rx, stdout_tx, stderr_tx, exited_tx));
+        tokio::spawn(simulate_exec(
+            cmd, stdin_rx, stdout_tx, stderr_tx, exited_tx,
+        ));
 
         Ok(ExecHandle {
             exec_id,

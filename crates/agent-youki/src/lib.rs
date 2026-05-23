@@ -23,8 +23,8 @@ const CGROUP_PATH_PREFIX: &str = "/open-sandbox";
 const NETWORK_NAME: &str = "open-sandbox";
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
-use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::container::Container;
+use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::syscall::syscall::SyscallType;
 
 pub struct YoukiConfig {
@@ -77,7 +77,9 @@ impl YoukiRuntime {
         self.config.root_dir.join("state")
     }
 
-    fn lock_containers(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, ContainerMetadata>>, AgentError> {
+    fn lock_containers(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<String, ContainerMetadata>>, AgentError> {
         self.containers.lock().map_err(|_| AgentError::Runtime {
             detail: "container metadata lock poisoned".into(),
         })
@@ -85,21 +87,14 @@ impl YoukiRuntime {
 }
 
 impl ContainerRuntime for YoukiRuntime {
-    async fn create_and_start(
-        &self,
-        config: ContainerConfig,
-    ) -> Result<ContainerInfo, AgentError> {
+    async fn create_and_start(&self, config: ContainerConfig) -> Result<ContainerInfo, AgentError> {
         let rootfs = self.image_manager.pull_and_unpack(&config.image).await?;
         dns::write_resolv_conf(&rootfs).await?;
 
         let host_port = cni::allocate_port()?;
         let container_id = format!("{CONTAINER_ID_PREFIX}-{}", uuid::Uuid::new_v4());
 
-        let container_dir = self
-            .config
-            .root_dir
-            .join("containers")
-            .join(&container_id);
+        let container_dir = self.config.root_dir.join("containers").join(&container_id);
         let bundle_dir = container_dir.join("bundle");
         tokio::fs::create_dir_all(&bundle_dir)
             .await
@@ -109,8 +104,7 @@ impl ContainerRuntime for YoukiRuntime {
 
         let cgroup_path = format!("{CGROUP_PATH_PREFIX}/{container_id}");
         let rootfs_str = rootfs.to_string_lossy().to_string();
-        let oci_spec =
-            spec::generate_full_spec(&config, &rootfs_str, Some(&cgroup_path))?;
+        let oci_spec = spec::generate_full_spec(&config, &rootfs_str, Some(&cgroup_path))?;
         let spec_json = serde_json::to_vec_pretty(&oci_spec).map_err(|e| AgentError::Runtime {
             detail: format!("failed to serialize OCI spec: {e}"),
         })?;
@@ -150,9 +144,10 @@ impl ContainerRuntime for YoukiRuntime {
 
         let netns_path = format!("/proc/{init_pid}/ns/net");
 
-        let container_port = u16::try_from(config.exposed_port).map_err(|_| AgentError::Runtime {
-            detail: format!("exposed_port {} exceeds u16 range", config.exposed_port),
-        })?;
+        let container_port =
+            u16::try_from(config.exposed_port).map_err(|_| AgentError::Runtime {
+                detail: format!("exposed_port {} exceeds u16 range", config.exposed_port),
+            })?;
 
         let mut conflist = cni::generate_conflist(NETWORK_NAME);
         cni::inject_port_mappings(&mut conflist, host_port, container_port);
@@ -201,11 +196,7 @@ impl ContainerRuntime for YoukiRuntime {
         })
     }
 
-    async fn stop_and_remove(
-        &self,
-        id: &ContainerId,
-        timeout: Duration,
-    ) -> Result<(), AgentError> {
+    async fn stop_and_remove(&self, id: &ContainerId, timeout: Duration) -> Result<(), AgentError> {
         let container_id = id.0.clone();
         let metadata = self.lock_containers()?.remove(&container_id);
 
@@ -300,7 +291,7 @@ impl ContainerRuntime for YoukiRuntime {
             .start_exec(
                 id,
                 ExecStart {
-                    command: vec!["cat".into(), "--".into(), resolved.clone()],
+                    command: vec!["cat".into(), resolved.clone()],
                     cwd: String::new(),
                     env: HashMap::new(),
                 },
@@ -352,7 +343,7 @@ impl ContainerRuntime for YoukiRuntime {
             .start_exec(
                 id,
                 ExecStart {
-                    command: vec!["mkdir".into(), "-p".into(), "--".into(), dir],
+                    command: vec!["mkdir".into(), "-p".into(), dir],
                     cwd: String::new(),
                     env: HashMap::new(),
                 },
@@ -364,7 +355,7 @@ impl ContainerRuntime for YoukiRuntime {
             .start_exec(
                 id,
                 ExecStart {
-                    command: vec!["tee".into(), "--".into(), temp.clone()],
+                    command: vec!["tee".into(), temp.clone()],
                     cwd: String::new(),
                     env: HashMap::new(),
                 },
@@ -395,7 +386,7 @@ impl ContainerRuntime for YoukiRuntime {
             .start_exec(
                 id,
                 ExecStart {
-                    command: vec!["mv".into(), "--".into(), temp, resolved],
+                    command: vec!["mv".into(), temp, resolved],
                     cwd: String::new(),
                     env: HashMap::new(),
                 },
@@ -416,7 +407,7 @@ impl ContainerRuntime for YoukiRuntime {
             .start_exec(
                 id,
                 ExecStart {
-                    command: vec!["mkdir".into(), "-p".into(), "--".into(), target.clone()],
+                    command: vec!["mkdir".into(), "-p".into(), target.clone()],
                     cwd: String::new(),
                     env: HashMap::new(),
                 },
@@ -428,13 +419,7 @@ impl ContainerRuntime for YoukiRuntime {
             .start_exec(
                 id,
                 ExecStart {
-                    command: vec![
-                        "tar".into(),
-                        "xzf".into(),
-                        "-".into(),
-                        "-C".into(),
-                        target,
-                    ],
+                    command: vec!["tar".into(), "xzf".into(), "-".into(), "-C".into(), target],
                     cwd: String::new(),
                     env: HashMap::new(),
                 },

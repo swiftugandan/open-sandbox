@@ -6,8 +6,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use open_sandbox_contracts::controller::{
-    AgentMessage, ControllerCommand, HeartbeatAck, RegisterResponse, SandboxState,
-    SandboxConfig as ProtoSandboxConfig, StartSandbox, agent_message, controller_command,
+    AgentMessage, ControllerCommand, HeartbeatAck, RegisterResponse,
+    SandboxConfig as ProtoSandboxConfig, SandboxState, StartSandbox, agent_message,
+    controller_command,
     controller_service_server::{ControllerService, ControllerServiceServer},
 };
 use open_sandbox_contracts::error::ControllerError;
@@ -169,8 +170,8 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
 
                     agent_message::Payload::SandboxStatus(status) => {
                         if let Some(ref agent_id) = registered_agent_id {
-                            let sandbox_id = uuid::Uuid::parse_str(&status.sandbox_id)
-                                .map(SandboxId::from);
+                            let sandbox_id =
+                                uuid::Uuid::parse_str(&status.sandbox_id).map(SandboxId::from);
                             if let Ok(sandbox_id) = sandbox_id {
                                 let state_str = sandbox_state_to_str(status.state());
                                 let _ = store

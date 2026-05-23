@@ -15,7 +15,8 @@ use tracing::{info, warn};
 
 use open_sandbox_agent::container::{
     ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, EXEC_CHANNEL_CAPACITY,
-    ExecExitInfo, ExecHandle, ExecStart, detect_command_not_found,
+    ExecExitInfo, ExecHandle, ExecStart, consume_inpid_marker, detect_command_not_found,
+    wrap_command_with_inpid_marker,
 };
 use open_sandbox_contracts::constants::DEFAULT_WRITE_CWD;
 use open_sandbox_contracts::error::AgentError;
@@ -184,8 +185,15 @@ impl ContainerRuntime for DockerRuntime {
             start.env.iter().map(|(k, v)| format!("{k}={v}")).collect()
         };
 
+        // Wrap so the in-container process self-reports its
+        // namespace-local PID on stderr before exec'ing the user's
+        // command. See `wrap_command_with_inpid_marker` for the why
+        // — bollard's `inspect_exec.pid` is the HOST PID, useless
+        // for `kill` inside the container's PID namespace.
+        let wrapped_cmd = wrap_command_with_inpid_marker(start.command);
+
         let exec_opts = CreateExecOptions {
-            cmd: Some(start.command),
+            cmd: Some(wrapped_cmd),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             attach_stdin: Some(true),
@@ -219,37 +227,15 @@ impl ContainerRuntime for DockerRuntime {
             });
         };
 
-        // The Pid is populated by dockerd shortly after start. Poll
-        // briefly — same shape as spike 05's strategy for youki, but
-        // here via the bollard inspect API.
-        let in_container_pid = {
-            let mut found: Option<i32> = None;
-            for _ in 0..10 {
-                let info = self
-                    .client
-                    .inspect_exec(&exec_id)
-                    .await
-                    .map_err(runtime_err)?;
-                if let Some(pid) = info.pid
-                    && pid > 0
-                {
-                    found = Some(pid as i32);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            // It's not fatal if we don't capture a PID: a
-            // microsecond-lifetime exec may have already exited. The
-            // registry will then have nothing to clean up (already
-            // dead). Use 0 as a sentinel meaning "no PID captured."
-            found.unwrap_or(0)
-        };
-
         // Build the caller-facing channels.
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Bytes>(EXEC_CHANNEL_CAPACITY);
         let (stdout_tx, stdout_rx) = mpsc::channel::<Bytes>(EXEC_CHANNEL_CAPACITY);
         let (stderr_tx, stderr_rx) = mpsc::channel::<Bytes>(EXEC_CHANNEL_CAPACITY);
         let (exited_tx, exited_rx) = oneshot::channel::<ExecExitInfo>();
+        // The output pump consumes the leading `OPENSB_INPID=<n>\n`
+        // line from stderr and sends the pid here. start_exec
+        // awaits with a small timeout before returning.
+        let (inpid_tx, inpid_rx) = oneshot::channel::<i32>();
 
         // stdin pump: receive from caller, write to bollard input.
         // Drop of stdin_rx (channel closed) triggers input.shutdown().
@@ -264,14 +250,23 @@ impl ContainerRuntime for DockerRuntime {
         });
 
         // output pump + exit watcher: consume bollard output Stream,
-        // demux StdOut/StdErr to the two channels, then on stream end
-        // inspect_exec for the exit code and signal exited.
+        // demux StdOut/StdErr to the two channels, strip the
+        // leading OPENSB_INPID marker from stderr, then on stream
+        // end inspect_exec for the exit code and signal exited.
         let client = self.client.clone();
         let exec_id_for_watch = exec_id.clone();
         tokio::spawn(async move {
             let mut output = output;
             let mut stdout_buf_for_cnf: Vec<u8> = Vec::new();
             let mut stderr_buf_for_cnf: Vec<u8> = Vec::new();
+            // INPID extraction state: keep buffering stderr bytes
+            // into `inpid_scan_buf` until we either parse the
+            // marker (good) or give up (parser returns Err). Once
+            // we leave this mode (`inpid_done`), stderr passes
+            // through unchanged.
+            let mut inpid_scan_buf: Vec<u8> = Vec::new();
+            let mut inpid_done = false;
+            let mut inpid_tx_slot = Some(inpid_tx);
             while let Some(chunk_res) = output.next().await {
                 let Ok(chunk) = chunk_res else { break };
                 match chunk {
@@ -287,16 +282,59 @@ impl ContainerRuntime for DockerRuntime {
                     }
                     bollard::container::LogOutput::StdErr { message } => {
                         let m: Bytes = message;
-                        if stderr_buf_for_cnf.len() < 4096 {
-                            stderr_buf_for_cnf.extend_from_slice(&m);
-                        }
-                        if stderr_tx.send(m).await.is_err() {
-                            return;
+                        if !inpid_done {
+                            inpid_scan_buf.extend_from_slice(&m);
+                            match consume_inpid_marker(&mut inpid_scan_buf) {
+                                Ok(Some(pid)) => {
+                                    if let Some(tx) = inpid_tx_slot.take() {
+                                        let _ = tx.send(pid);
+                                    }
+                                    inpid_done = true;
+                                    if inpid_scan_buf.is_empty() {
+                                        continue;
+                                    }
+                                    let rest = std::mem::take(&mut inpid_scan_buf);
+                                    if stderr_buf_for_cnf.len() < 4096 {
+                                        stderr_buf_for_cnf.extend_from_slice(&rest);
+                                    }
+                                    if stderr_tx.send(Bytes::from(rest)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Ok(None) => {
+                                    // keep waiting for the newline
+                                }
+                                Err(()) => {
+                                    // Marker did not arrive; drop
+                                    // the inpid sender so the
+                                    // waiter unblocks with a None.
+                                    inpid_tx_slot.take();
+                                    inpid_done = true;
+                                    let rest = std::mem::take(&mut inpid_scan_buf);
+                                    if stderr_buf_for_cnf.len() < 4096 {
+                                        stderr_buf_for_cnf.extend_from_slice(&rest);
+                                    }
+                                    if stderr_tx.send(Bytes::from(rest)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        } else {
+                            if stderr_buf_for_cnf.len() < 4096 {
+                                stderr_buf_for_cnf.extend_from_slice(&m);
+                            }
+                            if stderr_tx.send(m).await.is_err() {
+                                return;
+                            }
                         }
                     }
                     _ => {}
                 }
             }
+            // Stream ended before the marker arrived (e.g. a
+            // microsecond-lived exec). Make sure the start_exec
+            // waiter unblocks.
+            drop(inpid_tx_slot);
 
             // Stream ended — fetch exit code.
             let inspect = match client.inspect_exec(&exec_id_for_watch).await {
@@ -323,6 +361,18 @@ impl ContainerRuntime for DockerRuntime {
                 command_not_found: cnf,
             });
         });
+
+        // Wait briefly for the wrapper to emit OPENSB_INPID. If it
+        // doesn't arrive (sender dropped or 1s elapsed) we fall back
+        // to 0 — the ExecRegistry cleanup hook becomes a no-op for
+        // this exec. Better than the v0.7.x bug of using a host PID
+        // that resolves to the wrong (or no) process inside the
+        // container's PID namespace.
+        let in_container_pid = tokio::time::timeout(Duration::from_secs(1), inpid_rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
 
         Ok(ExecHandle {
             exec_id,
@@ -402,7 +452,7 @@ impl ContainerRuntime for DockerRuntime {
             .start_exec(
                 id,
                 ExecStart {
-                    command: vec!["cat".into(), "--".into(), resolved.clone()],
+                    command: vec!["cat".into(), resolved.clone()],
                     cwd: String::new(),
                     env: HashMap::new(),
                 },
@@ -421,12 +471,9 @@ impl ContainerRuntime for DockerRuntime {
         while let Some(chunk) = handle.stderr.recv().await {
             stderr.extend_from_slice(&chunk);
         }
-        let info = handle
-            .exited
-            .await
-            .map_err(|_| AgentError::Runtime {
-                detail: "read_file exec terminated without exit info".into(),
-            })?;
+        let info = handle.exited.await.map_err(|_| AgentError::Runtime {
+            detail: "read_file exec terminated without exit info".into(),
+        })?;
 
         if info.exit_code != 0 {
             let stderr_text = String::from_utf8_lossy(&stderr);
@@ -461,12 +508,13 @@ impl ContainerRuntime for DockerRuntime {
         let dir = parent_dir(&resolved);
         let temp = format!("{dir}/.opensb.{}.tmp", uuid::Uuid::new_v4().simple());
 
-        // Step 1: ensure the directory exists.
+        // Step 1: ensure the directory exists. Note: no `--` —
+        // busybox utilities in alpine images don't accept it.
         let mkdir = self
             .start_exec(
                 id,
                 ExecStart {
-                    command: vec!["mkdir".into(), "-p".into(), "--".into(), dir.clone()],
+                    command: vec!["mkdir".into(), "-p".into(), dir.clone()],
                     cwd: String::new(),
                     env: HashMap::new(),
                 },
@@ -479,7 +527,7 @@ impl ContainerRuntime for DockerRuntime {
             .start_exec(
                 id,
                 ExecStart {
-                    command: vec!["tee".into(), "--".into(), temp.clone()],
+                    command: vec!["tee".into(), temp.clone()],
                     cwd: String::new(),
                     env: HashMap::new(),
                 },
@@ -496,12 +544,9 @@ impl ContainerRuntime for DockerRuntime {
         while let Some(chunk) = writer.stderr.recv().await {
             stderr.extend_from_slice(&chunk);
         }
-        let info = writer
-            .exited
-            .await
-            .map_err(|_| AgentError::Runtime {
-                detail: "write_file tee exec terminated without exit info".into(),
-            })?;
+        let info = writer.exited.await.map_err(|_| AgentError::Runtime {
+            detail: "write_file tee exec terminated without exit info".into(),
+        })?;
         if info.exit_code != 0 {
             return Err(AgentError::Runtime {
                 detail: format!(
@@ -517,7 +562,7 @@ impl ContainerRuntime for DockerRuntime {
             .start_exec(
                 id,
                 ExecStart {
-                    command: vec!["mv".into(), "--".into(), temp.clone(), resolved.clone()],
+                    command: vec!["mv".into(), temp.clone(), resolved.clone()],
                     cwd: String::new(),
                     env: HashMap::new(),
                 },
@@ -542,7 +587,7 @@ impl ContainerRuntime for DockerRuntime {
             .start_exec(
                 id,
                 ExecStart {
-                    command: vec!["mkdir".into(), "-p".into(), "--".into(), target_cwd.clone()],
+                    command: vec!["mkdir".into(), "-p".into(), target_cwd.clone()],
                     cwd: String::new(),
                     env: HashMap::new(),
                 },
@@ -574,12 +619,9 @@ impl ContainerRuntime for DockerRuntime {
         while let Some(chunk) = extract.stderr.recv().await {
             stderr.extend_from_slice(&chunk);
         }
-        let info = extract
-            .exited
-            .await
-            .map_err(|_| AgentError::Runtime {
-                detail: "write_files_targz tar exec terminated without exit info".into(),
-            })?;
+        let info = extract.exited.await.map_err(|_| AgentError::Runtime {
+            detail: "write_files_targz tar exec terminated without exit info".into(),
+        })?;
         if info.exit_code != 0 {
             return Err(AgentError::Runtime {
                 detail: format!(
@@ -602,12 +644,9 @@ async fn drain_to_exit(handle: ExecHandle) -> Result<(), AgentError> {
     while let Some(chunk) = handle.stderr.recv().await {
         stderr.extend_from_slice(&chunk);
     }
-    let info = handle
-        .exited
-        .await
-        .map_err(|_| AgentError::Runtime {
-            detail: "internal exec terminated without exit info".into(),
-        })?;
+    let info = handle.exited.await.map_err(|_| AgentError::Runtime {
+        detail: "internal exec terminated without exit info".into(),
+    })?;
     if info.exit_code != 0 {
         warn!(
             exit_code = info.exit_code,

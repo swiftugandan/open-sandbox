@@ -166,6 +166,87 @@ pub trait ContainerRuntime: Send + Sync {
     ) -> impl Future<Output = Result<(), AgentError>> + Send;
 }
 
+/// Wrap a user command so the in-container process emits its own
+/// in-namespace `$$` on stderr as the very first line, then `exec`s
+/// the real command. This is how both runtime backends capture the
+/// in-container PID — the runtime-reported "pid" (bollard's
+/// `inspect_exec.pid`, youki's `nsenter` child pid) is always the
+/// HOST PID, which is meaningless inside the container's PID
+/// namespace where signals must be delivered.
+///
+/// The wrapper preserves stdin, working directory, environment, and
+/// exit code (because `exec` replaces the shell in place).
+///
+/// The agreed-upon marker line is:
+///
+///   `OPENSB_INPID=<pid>\n`
+///
+/// The runtime backend's stderr pump consumes this first line via
+/// [`consume_inpid_marker`] before forwarding bytes to the caller.
+pub fn wrap_command_with_inpid_marker(cmd: Vec<String>) -> Vec<String> {
+    let mut wrapped = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "printf 'OPENSB_INPID=%s\\n' \"$$\" 1>&2; exec \"$@\"".to_string(),
+        // $0 — the wrapper's argv[0]; the user's argv starts at $1.
+        "opensb-wrapper".to_string(),
+    ];
+    wrapped.extend(cmd);
+    wrapped
+}
+
+/// Maximum bytes the stderr pump will buffer while waiting for the
+/// `OPENSB_INPID=...\n` marker. If the marker doesn't arrive within
+/// this many bytes (e.g. the user's command writes a huge first
+/// stderr burst before the shell's printf flushes), we give up
+/// capturing the pid but still forward the bytes verbatim.
+pub const INPID_MARKER_MAX_BUFFER: usize = 256;
+
+/// Attempt to extract the `OPENSB_INPID=<n>\n` marker from the head
+/// of a pending stderr buffer. Returns:
+///
+/// - `Ok(Some(pid))` — marker found and consumed; `buf` now starts
+///   at the byte after the trailing newline.
+/// - `Ok(None)` — no newline yet AND the buffer is still under the
+///   patience window; caller should keep accumulating.
+/// - `Err(())` — the head does not match `OPENSB_INPID=` OR the
+///   buffer exceeded the patience window; caller should stop
+///   trying to extract and just forward everything in `buf`.
+///
+/// Pure parser; safe to call without any I/O.
+#[allow(clippy::result_unit_err)] // Err carries no info; caller branches on Err vs Ok variants.
+pub fn consume_inpid_marker(buf: &mut Vec<u8>) -> Result<Option<i32>, ()> {
+    const PREFIX: &[u8] = b"OPENSB_INPID=";
+    // Head must match the prefix (or be a strict prefix of it while
+    // we are still receiving).
+    if buf.len() < PREFIX.len() {
+        if !PREFIX.starts_with(buf) {
+            return Err(());
+        }
+        if buf.len() > INPID_MARKER_MAX_BUFFER {
+            return Err(());
+        }
+        return Ok(None);
+    }
+    if &buf[..PREFIX.len()] != PREFIX {
+        return Err(());
+    }
+    // Look for the terminating newline within the patience window.
+    let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
+        if buf.len() > INPID_MARKER_MAX_BUFFER {
+            return Err(());
+        }
+        return Ok(None);
+    };
+    // Parse the digits between PREFIX.len() and nl.
+    let digits = &buf[PREFIX.len()..nl];
+    let s = std::str::from_utf8(digits).map_err(|_| ())?;
+    let pid: i32 = s.parse().map_err(|_| ())?;
+    // Consume the marker line (including the trailing newline).
+    buf.drain(..=nl);
+    Ok(Some(pid))
+}
+
 /// Heuristic shared by all runtimes: scan stderr (or stdout, when
 /// the runtime is known to pipe the diagnostic to the wrong stream)
 /// for the canonical OCI "executable file not found" message
@@ -174,7 +255,77 @@ pub trait ContainerRuntime: Send + Sync {
 pub fn detect_command_not_found(text: &[u8]) -> bool {
     let s = String::from_utf8_lossy(text);
     let lower = s.to_ascii_lowercase();
-    lower.contains("executable file not found")
-        || lower.contains("no such file or directory")
-            && (lower.contains("exec:") || lower.contains("starting container process"))
+    // Pattern A: OCI runtime diagnostic (runc, crun, youki).
+    if lower.contains("executable file not found") {
+        return true;
+    }
+    // Pattern B: shell-wrapper failure. With v1.0's
+    // `wrap_command_with_inpid_marker`, an unresolvable command is
+    // raised by `exec` inside the shell, which prints
+    //   "opensb-wrapper: exec: line N: <cmd>: not found"
+    // on stderr and exits 127. Match the wrapper marker so we don't
+    // false-positive on user programs that legitimately print
+    // "not found".
+    if lower.contains("opensb-wrapper") && lower.contains("not found") {
+        return true;
+    }
+    // Pattern C: legacy "no such file or directory" emitted by the
+    // runtime when starting the container process — preserved for
+    // backends that wrap exec failures this way.
+    lower.contains("no such file or directory")
+        && (lower.contains("exec:") || lower.contains("starting container process"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inpid_marker_full_line_in_one_chunk() {
+        let mut buf = b"OPENSB_INPID=7\nhello\n".to_vec();
+        assert_eq!(consume_inpid_marker(&mut buf), Ok(Some(7)));
+        assert_eq!(&buf[..], b"hello\n");
+    }
+
+    #[test]
+    fn inpid_marker_split_across_chunks() {
+        let mut buf = b"OPENSB_INPID=".to_vec();
+        assert_eq!(consume_inpid_marker(&mut buf), Ok(None));
+        buf.extend_from_slice(b"42\n");
+        assert_eq!(consume_inpid_marker(&mut buf), Ok(Some(42)));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn inpid_marker_absent_short_buffer() {
+        let mut buf = b"hi".to_vec();
+        assert_eq!(consume_inpid_marker(&mut buf), Err(()));
+    }
+
+    #[test]
+    fn inpid_marker_absent_long_buffer() {
+        let mut buf = b"OPENSB_INPID=".to_vec();
+        buf.extend(std::iter::repeat_n(b'x', INPID_MARKER_MAX_BUFFER + 1));
+        // exceeds patience without newline
+        assert_eq!(consume_inpid_marker(&mut buf), Err(()));
+    }
+
+    #[test]
+    fn inpid_marker_non_numeric_payload() {
+        let mut buf = b"OPENSB_INPID=abc\n".to_vec();
+        assert_eq!(consume_inpid_marker(&mut buf), Err(()));
+    }
+
+    #[test]
+    fn wrap_preserves_user_command() {
+        let wrapped = wrap_command_with_inpid_marker(vec!["echo".into(), "hi".into()]);
+        // Wrapper must be a shell that exec's the user's argv via $@.
+        assert_eq!(wrapped[0], "sh");
+        assert_eq!(wrapped[1], "-c");
+        assert!(wrapped[2].contains("OPENSB_INPID"));
+        assert!(wrapped[2].contains("exec \"$@\""));
+        // $0 is reserved for the wrapper; user args start at $1.
+        assert_eq!(wrapped[3], "opensb-wrapper");
+        assert_eq!(&wrapped[4..], &["echo", "hi"]);
+    }
 }
