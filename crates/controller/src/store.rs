@@ -115,6 +115,21 @@ pub trait ControllerStore: Send + Sync {
         &self,
         sandbox_id: &SandboxId,
     ) -> impl Future<Output = Result<Option<AgentId>, ControllerError>> + Send;
+
+    /// Record that the given agent is alive as of now. Persists to durable
+    /// storage so heartbeat liveness survives a controller restart and is
+    /// visible across replicas. See REVIEW_LOG.md F6.
+    fn record_heartbeat(
+        &self,
+        agent_id: &AgentId,
+    ) -> impl Future<Output = Result<(), ControllerError>> + Send;
+
+    /// Return the agents whose last_heartbeat_at is older than DEAD_AGENT_TIMEOUT
+    /// AND whose state is still Active. Used by sweep_dead_agents to drive
+    /// eviction; the threshold lives in contracts/v1.0.1 (DEAD_AGENT_TIMEOUT).
+    fn dead_agents(
+        &self,
+    ) -> impl Future<Output = Result<Vec<AgentId>, ControllerError>> + Send;
 }
 
 #[derive(Debug, Clone)]

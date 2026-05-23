@@ -19,6 +19,7 @@ pub struct InMemoryStore {
     routing: Mutex<Vec<RoutingEntry>>,
     sandbox_states: Mutex<HashMap<SandboxId, SandboxStateRow>>,
     reservations: Mutex<HashMap<SandboxId, Reservation>>,
+    heartbeats: Mutex<HashMap<AgentId, tokio::time::Instant>>,
 }
 
 impl InMemoryStore {
@@ -28,6 +29,7 @@ impl InMemoryStore {
             routing: Mutex::new(Vec::new()),
             sandbox_states: Mutex::new(HashMap::new()),
             reservations: Mutex::new(HashMap::new()),
+            heartbeats: Mutex::new(HashMap::new()),
         }
     }
 
@@ -39,6 +41,11 @@ impl InMemoryStore {
             .filter(|e| e.agent_id == *agent_id)
             .cloned()
             .collect()
+    }
+
+    /// Test-only: agents that have ever called record_heartbeat.
+    pub fn heartbeated_agents(&self) -> Vec<AgentId> {
+        self.heartbeats.lock().unwrap().keys().cloned().collect()
     }
 }
 
@@ -237,6 +244,30 @@ impl ControllerStore for InMemoryStore {
         routing.retain(|e| e.sandbox_id != *sandbox_id);
         Ok(Some(reservation.agent_id))
     }
+
+    async fn record_heartbeat(&self, agent_id: &AgentId) -> Result<(), ControllerError> {
+        self.heartbeats
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), tokio::time::Instant::now());
+        Ok(())
+    }
+
+    async fn dead_agents(&self) -> Result<Vec<AgentId>, ControllerError> {
+        use open_sandbox_contracts::constants::DEAD_AGENT_TIMEOUT;
+        let now = tokio::time::Instant::now();
+        let heartbeats = self.heartbeats.lock().unwrap();
+        let agents = self.agents.lock().unwrap();
+        Ok(heartbeats
+            .iter()
+            .filter(|(_, last)| now.duration_since(**last) > DEAD_AGENT_TIMEOUT)
+            .filter_map(|(id, _)| {
+                agents.get(id).and_then(|a| {
+                    (a.state == AgentState::Active).then(|| id.clone())
+                })
+            })
+            .collect())
+    }
 }
 
 pub struct AcceptAllTokens;
@@ -418,5 +449,13 @@ impl ControllerStore for FailNextStore {
         sandbox_id: &SandboxId,
     ) -> Result<Option<AgentId>, ControllerError> {
         self.inner.release_sandbox(sandbox_id).await
+    }
+
+    async fn record_heartbeat(&self, agent_id: &AgentId) -> Result<(), ControllerError> {
+        self.inner.record_heartbeat(agent_id).await
+    }
+
+    async fn dead_agents(&self) -> Result<Vec<AgentId>, ControllerError> {
+        self.inner.dead_agents().await
     }
 }

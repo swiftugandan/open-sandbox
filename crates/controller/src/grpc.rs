@@ -65,7 +65,7 @@ impl AgentConnections {
 
 pub struct GrpcHandler<S: ControllerStore> {
     registry: Arc<AgentRegistry<S>>,
-    heartbeat_monitor: Arc<HeartbeatMonitor>,
+    heartbeat_monitor: Arc<HeartbeatMonitor<S>>,
     connections: Arc<AgentConnections>,
     store: Arc<S>,
 }
@@ -114,7 +114,11 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                         let response = match result {
                             Ok(RegistrationResult::Accepted) => {
                                 connections.add(agent_id.clone(), tx.clone());
-                                heartbeat_monitor.record_heartbeat(agent_id.clone());
+                                if let Err(e) =
+                                    heartbeat_monitor.record_heartbeat(&agent_id).await
+                                {
+                                    tracing::warn!(error = %e, "record_heartbeat at register failed");
+                                }
                                 registered_agent_id = Some(agent_id);
                                 RegisterResponse {
                                     accepted: true,
@@ -175,7 +179,9 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                             break;
                         }
 
-                        heartbeat_monitor.record_heartbeat(agent_id);
+                        if let Err(e) = heartbeat_monitor.record_heartbeat(&agent_id).await {
+                            tracing::warn!(error = %e, "record_heartbeat failed");
+                        }
 
                         let ack = HeartbeatAck {
                             timestamp: Some(prost_types::Timestamp::from(
@@ -268,7 +274,7 @@ pub struct CreateSandboxRequest {
 
 pub struct Controller<S: ControllerStore> {
     pub(crate) registry: Arc<AgentRegistry<S>>,
-    pub(crate) heartbeat_monitor: Arc<HeartbeatMonitor>,
+    pub(crate) heartbeat_monitor: Arc<HeartbeatMonitor<S>>,
     pub(crate) scheduler: Arc<Scheduler<S>>,
     pub(crate) connections: Arc<AgentConnections>,
 }
@@ -276,7 +282,7 @@ pub struct Controller<S: ControllerStore> {
 impl<S: ControllerStore + 'static> Controller<S> {
     pub fn new(store: Arc<S>, validator: impl TokenValidator + 'static) -> Self {
         let registry = Arc::new(AgentRegistry::new(store.clone(), validator));
-        let heartbeat_monitor = Arc::new(HeartbeatMonitor::new());
+        let heartbeat_monitor = Arc::new(HeartbeatMonitor::new(store.clone()));
         let scheduler = Arc::new(Scheduler::new(store));
         let connections = Arc::new(AgentConnections::new());
         Self {
@@ -392,18 +398,27 @@ impl<S: ControllerStore + 'static> Controller<S> {
     }
 
     pub async fn sweep_dead_agents(&self) -> Vec<AgentId> {
-        let dead = self.heartbeat_monitor.dead_agents();
+        let dead = match self.heartbeat_monitor.dead_agents().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "dead_agents query failed; sweep skipped");
+                return Vec::new();
+            }
+        };
         for agent_id in &dead {
             match self.registry.mark_agent_dead(agent_id).await {
                 Ok(()) | Err(ControllerError::AgentNotFound { .. }) => {
+                    // F6 + F7: state is now Dead in the store, so the next
+                    // dead_agents() query naturally excludes this agent. The
+                    // in-memory connections entry is the only thing left to
+                    // clean up.
                     self.connections.remove(agent_id);
-                    self.heartbeat_monitor.remove(agent_id);
                 }
                 Err(err) => {
                     tracing::warn!(
                         agent = %agent_id,
                         error = %err,
-                        "mark_agent_dead failed; preserving heartbeat entry for retry"
+                        "mark_agent_dead failed; next sweep will retry"
                     );
                 }
             }
@@ -609,7 +624,9 @@ mod tests {
             .unwrap();
         controller
             .heartbeat_monitor
-            .record_heartbeat(agent_id.clone());
+            .record_heartbeat(&agent_id)
+            .await
+            .unwrap();
 
         store
             .insert_routing_entry(RoutingEntry {
@@ -643,17 +660,26 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn heartbeat_with_mismatched_agent_id_is_ignored() {
         // F3: agent registered as A sends Heartbeat{agent_id: B} where B is a
-        // legitimately-registered peer (so registry.heartbeat(&B) would
-        // succeed). The controller MUST NOT refresh B's liveness — otherwise
-        // any agent can keep a dead peer alive in HeartbeatMonitor and
-        // prevent eviction.
-        let (controller, addr) = start_controller(AcceptAllTokens).await;
+        // legitimately-registered peer. The controller MUST NOT call
+        // store.record_heartbeat(B) — otherwise A can keep a dead B alive in
+        // the liveness store indefinitely.
+        let store = Arc::new(InMemoryStore::new());
+        let controller = Controller::new(store.clone(), AcceptAllTokens);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let service = controller.grpc_service();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
 
         let agent_a = AgentId::new();
         let agent_b = AgentId::new();
 
-        // Pre-register B directly so registry.heartbeat(&B) succeeds — this is
-        // the precondition that makes the bug exploitable.
+        // Pre-register B directly so registry.heartbeat(&B) succeeds.
         controller
             .registry
             .register(
@@ -666,8 +692,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // Crucially, B is NOT in heartbeat_monitor (it never streamed).
-        assert!(!controller.heartbeat_monitor.tracked_agents().contains(&agent_b));
+        // B has NEVER recorded a heartbeat — confirm precondition.
+        assert!(!store.heartbeated_agents().contains(&agent_b));
 
         let (tx, mut inbound) = connect_agent(&addr).await;
         tx.send(register_message(&agent_a, "token")).await.unwrap();
@@ -677,7 +703,7 @@ mod tests {
         tx.send(heartbeat_message(&agent_b)).await.unwrap();
 
         // Barrier: legitimate heartbeat for A so we know the prior message has
-        // been processed before we observe the monitor.
+        // been processed before we observe the store.
         tx.send(heartbeat_message(&agent_a)).await.unwrap();
         let msg = inbound.message().await.unwrap().unwrap();
         assert!(matches!(
@@ -685,12 +711,12 @@ mod tests {
             Some(controller_command::Payload::HeartbeatAck(_))
         ));
 
-        let tracked = controller.heartbeat_monitor.tracked_agents();
+        let heartbeated = store.heartbeated_agents();
         assert!(
-            !tracked.contains(&agent_b),
-            "B must NOT be in heartbeat monitor; current tracked: {tracked:?}"
+            !heartbeated.contains(&agent_b),
+            "B must NOT have a recorded heartbeat; current set: {heartbeated:?}"
         );
-        assert!(tracked.contains(&agent_a));
+        assert!(heartbeated.contains(&agent_a));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -837,7 +863,9 @@ mod tests {
             .unwrap();
         controller
             .heartbeat_monitor
-            .record_heartbeat(agent_id.clone());
+            .record_heartbeat(&agent_id)
+            .await
+            .unwrap();
 
         tokio::time::advance(DEAD_AGENT_TIMEOUT + Duration::from_secs(1)).await;
 
@@ -848,20 +876,20 @@ mod tests {
         assert_eq!(dead, vec![agent_id.clone()]);
 
         // The Database error means mark_agent_dead failed. The next sweep
-        // must be able to retry, so the heartbeat entry MUST still be present.
-        let dead_again = controller.heartbeat_monitor.dead_agents();
+        // must be able to retry, so dead_agents() MUST still return this agent.
+        let dead_again = controller.heartbeat_monitor.dead_agents().await.unwrap();
         assert_eq!(
             dead_again,
             vec![agent_id.clone()],
-            "heartbeat entry must survive a transient mark_agent_dead failure"
+            "dead_agents must continue to surface a transient mark_agent_dead failure"
         );
 
         // Second sweep, without injected failure, completes the cleanup.
         let dead = controller.sweep_dead_agents().await;
         assert_eq!(dead, vec![agent_id.clone()]);
         assert!(
-            controller.heartbeat_monitor.dead_agents().is_empty(),
-            "successful sweep clears the heartbeat entry"
+            controller.heartbeat_monitor.dead_agents().await.unwrap().is_empty(),
+            "successful sweep should leave dead_agents empty (state flipped to Dead)"
         );
     }
 }

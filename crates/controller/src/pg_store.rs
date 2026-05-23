@@ -89,6 +89,17 @@ impl PgStore {
             detail: e.to_string(),
         })?;
 
+        // F6: heartbeat liveness is persisted so dead-agent detection survives
+        // a controller restart and is visible across replicas.
+        sqlx::query(
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+
         Ok(())
     }
 }
@@ -420,6 +431,34 @@ impl ControllerStore for PgStore {
             detail: e.to_string(),
         })?;
         Ok(true)
+    }
+
+    async fn record_heartbeat(&self, agent_id: &AgentId) -> Result<(), ControllerError> {
+        sqlx::query("UPDATE agents SET last_heartbeat_at = now() WHERE agent_id = $1")
+            .bind(agent_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ControllerError::Database {
+                detail: e.to_string(),
+            })?;
+        Ok(())
+    }
+
+    async fn dead_agents(&self) -> Result<Vec<AgentId>, ControllerError> {
+        use open_sandbox_contracts::constants::DEAD_AGENT_TIMEOUT;
+        let threshold_secs = DEAD_AGENT_TIMEOUT.as_secs() as f64;
+        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
+            "SELECT agent_id FROM agents
+             WHERE state = 'active'
+               AND last_heartbeat_at < now() - ($1::float8 * interval '1 second')",
+        )
+        .bind(threshold_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ControllerError::Database {
+            detail: e.to_string(),
+        })?;
+        Ok(rows.into_iter().map(|(id,)| AgentId(id)).collect())
     }
 
     async fn release_sandbox(
