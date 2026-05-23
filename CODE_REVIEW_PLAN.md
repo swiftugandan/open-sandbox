@@ -69,7 +69,7 @@ Each row gets ticked as it merges. Update this table as components land.
 | 2 | proxy | fixes-landed; awaiting merge | `review/02-proxy` | 11 findings closed (A1-A6, B1-B6 minus 3 deferred-with-decision: B2, C5, C2). LISTEN side of comp-1 F4 closed here. |
 | 3 | agent (core) | fixes-landed; awaiting merge | `review/03-agent-core` | 7 closed (A1/B2/C1, A2, A5, A6, B5, C6); 7 deferred-with-decision in `NEEDS_HUMAN_ATTENTION.md`. CLI reconnect-loop follow-up from comp-1 closed. |
 | 4 | agent-docker | fixes-landed; awaiting merge | `review/04-agent-docker` | 5 closed (PID fail-loud, read cap, create rollback, stdin error, tmp cleanup); 3 deferred in NEEDS_HUMAN_ATTENTION. |
-| 5 | agent-youki | not started | — | |
+| 5 | agent-youki | audit-only; all deferred | `review/05-agent-youki` | macOS can't compile (procfs Linux-only). All 8 findings logged to NEEDS_HUMAN_ATTENTION; biggest is OCI hardening (caps/seccomp/userns/readonly_rootfs) which needs SPEC decisions. |
 | 6 | api | not started | — | |
 | 7 | ws-client | not started | — | |
 | 8 | cli | not started | — | |

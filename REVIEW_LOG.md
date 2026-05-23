@@ -240,6 +240,22 @@ comp-1 cross-component CLI reconnect-loop follow-up closed here.
 
 ---
 
+## Component 5 — agent-youki (audit-only; Linux-only crate)
+
+8 findings; **0 closed, all 8 deferred** to `NEEDS_HUMAN_ATTENTION.md`. agent-youki uses procfs and cannot compile on macOS where the rest of this review pass runs — fixes here must be validated on the Linux dev env via `crates/agent-youki/Dockerfile.dev` / `docker-compose.dev.yml`. I won't ship code without a Linux compile-check, and the OCI hardening choices (caps, seccomp, userns, readonly_rootfs) each need an SPEC decision before implementation.
+
+The eight deferred items are listed in `NEEDS_HUMAN_ATTENTION.md` (search `comp-5`):
+1. OCI security defaults — single largest production-safety gap (cap drop / readonly / seccomp / userns / pids)
+2. Tar layer extraction path-traversal vulnerability (malicious image → host file write)
+3. Image install is non-atomic (partial extract corrupts subsequent pulls)
+4. setns(2) thread doesn't enter PID namespace (/proc-based host file/memory read primitive)
+5. create_and_start no rollback on partial CNI/start failures (state_dir + CNI leaks)
+6. Image layer unbounded buffering (multi-GiB layer = host RAM spike)
+7. write_files_targz target_dir client-controlled with no allowlist
+8. Multiple `.lock().unwrap()` calls in exec.rs may poison-panic the io pump
+
+---
+
 ## Component 4 — agent-docker (in-crate findings)
 
 8 findings; 5 closed in `review/04-agent-docker`, 3 deferred (image-pull retry, signal_exec stream drain, inspect_exec/exit_code conflation).
