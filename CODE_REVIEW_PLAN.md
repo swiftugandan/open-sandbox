@@ -66,7 +66,7 @@ Each row gets ticked as it merges. Update this table as components land.
 |---|---|---|---|---|
 | 0 | contracts (audit) | done | audit-only (no PR) | 10 findings logged in `REVIEW_LOG.md`; all deferred to potential `contracts/v1.0.2`. |
 | 1 | controller | fixes-landed; awaiting merge | `review/01-controller` | 10 findings F1–F10 closed; PG-side verification deferred to `tests/live_e2e.rs`. Cross-component follow-ups for cli/proxy logged in `REVIEW_LOG.md`. |
-| 2 | proxy | not started | — | |
+| 2 | proxy | fixes-landed; awaiting merge | `review/02-proxy` | 11 findings closed (A1-A6, B1-B6 minus 3 deferred-with-decision: B2, C5, C2). LISTEN side of comp-1 F4 closed here. |
 | 3 | agent (core) | not started | — | |
 | 4 | agent-docker | not started | — | |
 | 5 | agent-youki | not started | — | |
