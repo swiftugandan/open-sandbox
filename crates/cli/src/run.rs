@@ -514,11 +514,20 @@ async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = sigterm.recv() => {}
+        // Comp-8: fall back to Ctrl-C only if SIGTERM registration fails
+        // (e.g. restricted seccomp profile). Previously expect()-panicked
+        // during startup before any resources could be cleaned up.
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "could not register SIGTERM handler; falling back to Ctrl-C only");
+                ctrl_c.await.ok();
+            }
         }
     }
     #[cfg(not(unix))]
@@ -534,8 +543,24 @@ fn num_cpus() -> usize {
 }
 
 fn total_memory_bytes() -> u64 {
-    // Conservative default; real detection requires platform-specific APIs
-    // or a crate like sysinfo. 4 GiB is a safe lower bound.
+    // Comp-8: read MemTotal from /proc/meminfo on Linux (where the agent
+    // production deployment lives — agent-youki is Linux-only). On
+    // non-Linux dev hosts, fall back to a conservative 4 GiB. Without
+    // this, the controller's scheduler treated every agent as 4 GiB and
+    // refused to place sandboxes >4 GiB onto otherwise-idle 64 GiB boxes.
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+            for line in contents.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    let trimmed = rest.trim().trim_end_matches(" kB").trim();
+                    if let Ok(kb) = trimmed.parse::<u64>() {
+                        return kb.saturating_mul(1024);
+                    }
+                }
+            }
+        }
+    }
     4 * 1024 * 1024 * 1024
 }
 

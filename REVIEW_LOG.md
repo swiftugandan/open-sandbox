@@ -240,6 +240,28 @@ comp-1 cross-component CLI reconnect-loop follow-up closed here.
 
 ---
 
+## Component 8 — cli (in-crate findings)
+
+6 findings; 3 closed in `review/08-cli`, 3 deferred (non-ASCII headers, RUST_LOG silent fallback, secret-in-Debug).
+
+### [comp-8 · high] reqwest::Client::new() had no timeouts — **closed**
+
+- **Fix:** connect_timeout=2s, request timeout=30s (matches proxy UPSTREAM_TIMEOUT).
+
+### [comp-8 · high] total_memory_bytes was hardcoded 4 GiB — **closed**
+
+- **Fix:** read MemTotal from /proc/meminfo on Linux; 4 GiB fallback on other platforms.
+
+### [comp-8 · med] shutdown_signal expected SIGTERM registration to succeed — **closed**
+
+- **Fix:** warn-and-fall-back-to-Ctrl-C on registration error instead of panic.
+
+### [comp-8 · DEFERRED] non-ASCII headers, RUST_LOG silent fallback, secret-in-Debug
+
+- See `NEEDS_HUMAN_ATTENTION.md`.
+
+---
+
 ## Component 7 — ws-client (in-crate findings)
 
 6 findings; 3 closed in `review/07-ws-client`, 3 deferred (read timeout, frame size, interactive-bash raw mode).
