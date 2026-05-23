@@ -76,7 +76,12 @@ fn check_auth(headers: &HeaderMap, expected: &str) -> Result<(), Response> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
     match got {
-        Some(token) if token == expected => Ok(()),
+        // Comp-6: constant-time compare (see handlers.rs::constant_time_eq).
+        Some(token)
+            if crate::handlers::constant_time_eq(token.as_bytes(), expected.as_bytes()) =>
+        {
+            Ok(())
+        }
         Some(_) => Err(error_response(
             StatusCode::UNAUTHORIZED,
             "UNAUTHORIZED",
