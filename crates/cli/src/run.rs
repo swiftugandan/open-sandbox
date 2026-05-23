@@ -288,7 +288,13 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
     });
 
     let public_grpc_handle = tokio::spawn(async move {
+        // Comp-2 B4: HTTP/2 keepalive pings detect a frozen-but-TCP-alive
+        // agent within the documented spike-03 budget. Without these the
+        // proxy's inbound loop on a hung agent sits in message().await
+        // until OS TCP timeouts (hours).
         tonic::transport::Server::builder()
+            .http2_keepalive_interval(Some(Duration::from_secs(15)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(20)))
             .add_service(public_service)
             .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), shutdown_signal())
             .await
