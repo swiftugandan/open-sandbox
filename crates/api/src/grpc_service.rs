@@ -17,12 +17,18 @@ use crate::service::{CreateRequest, SandboxInfo, SandboxService};
 
 pub struct GrpcSandboxService {
     client: SandboxManagementServiceClient<Channel>,
+    /// Comp-1 F1 wiring: the controller's management gRPC requires
+    /// `authorization: Bearer <CONTROLLER_ADMIN_TOKEN>` on every call.
+    /// The api gateway must read the same token from env and forward
+    /// it on each request.
+    admin_token: Option<String>,
 }
 
 impl GrpcSandboxService {
     pub fn new(channel: Channel) -> Self {
         Self {
             client: SandboxManagementServiceClient::new(channel),
+            admin_token: None,
         }
     }
 
@@ -36,7 +42,24 @@ impl GrpcSandboxService {
             .map_err(|e| ApiError::ControllerUnavailable {
                 detail: e.to_string(),
             })?;
-        Ok(Self::new(channel))
+        let admin_token = std::env::var("CONTROLLER_ADMIN_TOKEN").ok();
+        Ok(Self {
+            client: SandboxManagementServiceClient::new(channel),
+            admin_token,
+        })
+    }
+
+    /// Wrap a proto message in a `tonic::Request` with the
+    /// `authorization: Bearer <admin_token>` header attached when the
+    /// token is configured.
+    fn authed<M>(&self, msg: M) -> tonic::Request<M> {
+        let mut req = tonic::Request::new(msg);
+        if let Some(token) = &self.admin_token {
+            if let Ok(v) = tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")) {
+                req.metadata_mut().insert("authorization", v);
+            }
+        }
+        req
     }
 }
 
@@ -44,13 +67,13 @@ impl SandboxService for GrpcSandboxService {
     async fn create(&self, request: CreateRequest) -> Result<SandboxInfo, ApiError> {
         let mut client = self.client.clone();
         let resp = client
-            .create_sandbox(ProtoCreate {
+            .create_sandbox(self.authed(ProtoCreate {
                 image: request.image,
                 cpu_millicores: request.cpu_millicores,
                 memory_bytes: request.memory_bytes,
                 env_vars: request.env_vars,
                 exposed_port: request.exposed_port,
-            })
+            }))
             .await
             .map_err(grpc_to_api)?
             .into_inner();
@@ -69,9 +92,9 @@ impl SandboxService for GrpcSandboxService {
     async fn get(&self, sandbox_id: &SandboxId) -> Result<SandboxInfo, ApiError> {
         let mut client = self.client.clone();
         let resp = client
-            .get_sandbox(ProtoGet {
+            .get_sandbox(self.authed(ProtoGet {
                 sandbox_id: sandbox_id.to_string(),
-            })
+            }))
             .await
             .map_err(grpc_to_api)?
             .into_inner();
@@ -88,7 +111,7 @@ impl SandboxService for GrpcSandboxService {
     async fn list(&self) -> Result<Vec<SandboxInfo>, ApiError> {
         let mut client = self.client.clone();
         let resp = client
-            .list_sandboxes(ProtoList {})
+            .list_sandboxes(self.authed(ProtoList {}))
             .await
             .map_err(grpc_to_api)?
             .into_inner();
@@ -108,9 +131,9 @@ impl SandboxService for GrpcSandboxService {
     async fn delete(&self, sandbox_id: &SandboxId) -> Result<(), ApiError> {
         let mut client = self.client.clone();
         client
-            .delete_sandbox(ProtoDelete {
+            .delete_sandbox(self.authed(ProtoDelete {
                 sandbox_id: sandbox_id.to_string(),
-            })
+            }))
             .await
             .map_err(grpc_to_api)?;
         Ok(())

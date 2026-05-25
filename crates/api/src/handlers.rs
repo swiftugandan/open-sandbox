@@ -324,6 +324,14 @@ async fn unary_via_io_stream<S: SandboxService>(
     start: IoStart,
     content: Option<Vec<u8>>,
 ) -> Result<(), ApiError> {
+    // Smoke-test fix: previously this function pushed ALL frames into
+    // client_tx (capacity 8) BEFORE calling open_io_stream, deadlocking
+    // whenever the content needed >7 Stdin chunks (~448 KiB). The
+    // consumer side (the proxy) only starts draining after the
+    // open_io_stream call returns. Solution: send the IoStart inline,
+    // open the stream, then drive the rest of the frames from a
+    // spawned producer task that runs concurrently with the server-
+    // frame loop.
     let (client_tx, client_rx) = mpsc::channel::<IoClientFrame>(8);
     client_tx
         .send(IoClientFrame {
@@ -335,44 +343,46 @@ async fn unary_via_io_stream<S: SandboxService>(
             detail: "internal channel closed".into(),
         })?;
 
-    // Comp-6: chunk the upload at STDIN_CHUNK_BYTES instead of sending the
-    // whole payload as one giant Stdin frame. tonic's default decode cap
-    // is 4 MiB; previously a 5 MiB write_file silently failed with a
-    // generic codec ResourceExhausted. 64 KiB matches the read-side
-    // chunking the agent emits.
-    if let Some(bytes) = content
-        && !bytes.is_empty()
-    {
-        const STDIN_CHUNK_BYTES: usize = 64 * 1024;
-        let mut offset = 0;
-        while offset < bytes.len() {
-            let end = (offset + STDIN_CHUNK_BYTES).min(bytes.len());
-            let chunk = bytes[offset..end].to_vec();
-            client_tx
-                .send(IoClientFrame {
-                    stream_id: String::new(),
-                    payload: Some(io_client_frame::Payload::Stdin(chunk)),
-                })
-                .await
-                .map_err(|_| ApiError::IoStreamFailed {
-                    detail: "internal channel closed".into(),
-                })?;
-            offset = end;
-        }
-    }
-    // Signal EOF.
-    client_tx
-        .send(IoClientFrame {
-            stream_id: String::new(),
-            payload: Some(io_client_frame::Payload::Close(
-                open_sandbox_contracts::proxy::IoClose { stdin_eof: true },
-            )),
-        })
-        .await
-        .ok();
-    drop(client_tx);
-
+    // Open the stream NOW so the consumer is ready before we push the
+    // body chunks. With the proxy draining concurrently, the spawned
+    // producer below can send more than 8 frames without deadlocking.
     let mut server_rx = state.proxy.open_io_stream(client_rx).await?;
+
+    // Comp-6: chunk the upload at STDIN_CHUNK_BYTES so any single tonic
+    // message stays well below the 4 MiB default decode cap. 64 KiB
+    // matches the read-side chunking the agent emits.
+    tokio::spawn(async move {
+        if let Some(bytes) = content
+            && !bytes.is_empty()
+        {
+            const STDIN_CHUNK_BYTES: usize = 64 * 1024;
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let end = (offset + STDIN_CHUNK_BYTES).min(bytes.len());
+                let chunk = bytes[offset..end].to_vec();
+                if client_tx
+                    .send(IoClientFrame {
+                        stream_id: String::new(),
+                        payload: Some(io_client_frame::Payload::Stdin(chunk)),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return; // proxy dropped its receiver; stop pushing
+                }
+                offset = end;
+            }
+        }
+        // Signal EOF. Dropping client_tx after this closes the stream.
+        let _ = client_tx
+            .send(IoClientFrame {
+                stream_id: String::new(),
+                payload: Some(io_client_frame::Payload::Close(
+                    open_sandbox_contracts::proxy::IoClose { stdin_eof: true },
+                )),
+            })
+            .await;
+    });
     while let Some(frame_res) = server_rx.recv().await {
         let frame = frame_res?;
         match frame.payload {
