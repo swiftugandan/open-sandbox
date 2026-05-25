@@ -560,3 +560,33 @@ Other security checks all passed:
   in round 1 catches it).
 - Invalid sandbox UUID → 400; nonexistent UUID → 404.
 - Oversized Authorization header (~16 KiB) → handled cleanly, 401.
+
+### 2026-05-26 — `/loop verify <> fix` round 7
+
+Error paths + concurrent creates + large reads.
+
+- Read nonexistent file → 404 `FILE_NOT_FOUND` (clean).
+- Read directory `/etc` → 500 `IO_STREAM_FAILED` with detail leaking the
+  `cat: read error: Is a directory` implementation choice. Soft issue:
+  reading a directory is a client error and should arguably be 400 with
+  a friendlier code (e.g. `IS_A_DIRECTORY`). Not a bug, future polish.
+- Write to nonexistent parent dir (`/no/such/dir/file.txt`) → 200 success.
+  `write_file` does mkdir-p semantics implicitly; the file landed at the
+  full path. Convenient but undocumented; worth surfacing in `CONTRACTS.md`.
+- Write to `/proc/sysrq-trigger` → 500 `IO_STREAM_FAILED`, error detail
+  leaks the temp-file name pattern `.opensb.<uuid>.tmp`. Soft issue:
+  obscure-but-not-secret; the user-facing message could simply be
+  "write failed: not a writable filesystem".
+- WS read-stream of nonexistent path → WebSocket close frame 4404 with
+  `FILE_NOT_FOUND` reason (clean).
+- 5 MiB unary read → 200, 5,242,880 bytes, md5 round-trip exact, 187 ms.
+- 5 MiB WS read-stream → md5 round-trip exact (frames chunked under the
+  4 MiB cap, no truncation).
+- 5 concurrent `POST /v1/sandboxes` with varied cpu+memory (100/200/300/
+  400/500 mc) → all transitioned to running within ~5 s drain. Total
+  with the pre-existing sandbox: 6 running on the agent, well within
+  capacity. `DELETE` × 5 → 204 across the board.
+
+No real bugs surfaced in round 7. Two soft observations on error-code
+precision (`/etc` read, /proc write) and one undocumented behavior
+(write_file mkdir-p) recorded above.
