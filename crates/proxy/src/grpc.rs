@@ -203,14 +203,15 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
                             warn!("dropping IoServer frame received before Ready");
                             continue;
                         };
-                        if !sessions
-                            .deliver_server_frame(&msg.stream_id, agent_id, frame)
-                            .await
-                        {
-                            // No session for this stream_id, or the carrier
-                            // doesn't own it — drop silently (already logged
-                            // in deliver_server_frame when ownership fails).
-                        }
+                        // Comp-2 B2: deliver_server_frame is now sync + uses
+                        // try_send under the hood. A slow per-session
+                        // consumer no longer blocks this tunnel-inbound loop
+                        // (which would HoL-block every other session on this
+                        // agent's tunnel). Drops on a full per-session
+                        // channel are logged inside deliver_server_frame.
+                        let _ = sessions.deliver_server_frame(
+                            &msg.stream_id, agent_id, frame,
+                        );
                     }
                 }
             }
@@ -265,7 +266,14 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
         }
 
         let inbound = request.into_inner();
-        let (server_tx, server_rx) = mpsc::channel::<Result<IoServerFrame, Status>>(32);
+        // Comp-2 B2: per-session buffer raised to IO_SESSION_BUFFER so a
+        // momentarily slow gateway consumer doesn't immediately trigger the
+        // try_send drop policy in io_sessions::deliver_server_frame. The
+        // tradeoff is more memory per stalled session, bounded at
+        // IO_SESSION_BUFFER * sizeof(IoServerFrame).
+        const IO_SESSION_BUFFER: usize = 256;
+        let (server_tx, server_rx) =
+            mpsc::channel::<Result<IoServerFrame, Status>>(IO_SESSION_BUFFER);
 
         // tonic bidi-streaming requires that we return the Response
         // BEFORE the client can flush messages on the request body.

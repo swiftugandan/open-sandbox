@@ -67,29 +67,23 @@ impl IoSessions {
         self.inner.lock().unwrap().remove(stream_id)
     }
 
-    /// Forward an `IoServerFrame` from the agent's tunnel into the
-    /// gateway-side outbound stream. Returns true if a session was
-    /// found and the frame was queued; false if no such session
-    /// exists (the gateway already disconnected, etc.).
-    ///
-    /// Uses `try_send` to avoid blocking the agent tunnel pump when
-    /// the gateway is slow. The bounded channel sized in
-    /// `OpenIoStream` (32 frames) provides headroom; if it's full,
-    /// the agent's tunnel-side pump backpressures naturally because
-    /// we drop the frame here and the agent retries — wait, that's
-    /// wrong. Better: use `send().await` so backpressure propagates.
-    ///
-    /// Actually the cleanest model is: the tunnel-side dispatch
-    /// task awaits this send. If the gateway is slow, the await
-    /// blocks the tunnel dispatcher, which blocks the agent's
-    /// outbound, which blocks the in-container process. That's the
-    /// backpressure chain we want.
     /// Forward an `IoServerFrame` from the agent's tunnel into the gateway-
-    /// side outbound stream. Comp-2 A2: requires `from_agent` to match the
-    /// session's owning agent — a malicious or confused agent cannot inject
-    /// frames into another agent's session. Returns true on forward, false
-    /// if the stream is unknown OR the carrier doesn't own it.
-    pub async fn deliver_server_frame(
+    /// side outbound stream.
+    ///
+    /// Comp-2 A2: requires `from_agent` to match the session's owning agent
+    /// (frame-ownership check; mismatches are dropped with a warn).
+    ///
+    /// Comp-2 B2 / comp-3 A3: uses `try_send` rather than `send().await`,
+    /// trading session-level backpressure for tunnel-wide HoL isolation.
+    /// One slow gateway consumer no longer blocks the tunnel pump (which
+    /// would freeze every OTHER session on the same agent). On a full
+    /// per-session channel (capacity raised to IO_SESSION_BUFFER frames in
+    /// grpc::dispatch_io_stream), the offending frame is dropped with a
+    /// warn; the session continues if the consumer recovers.
+    ///
+    /// Returns true on forward, false if the stream is unknown, the
+    /// carrier doesn't own it, OR the per-session channel is full.
+    pub fn deliver_server_frame(
         &self,
         stream_id: &str,
         from_agent: &AgentId,
@@ -112,7 +106,17 @@ impl IoSessions {
             }
         };
         match sender {
-            Some(tx) => tx.send(Ok(frame)).await.is_ok(),
+            Some(tx) => match tx.try_send(Ok(frame)) {
+                Ok(()) => true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        stream_id = %stream_id,
+                        "deliver_server_frame: per-session channel full; dropping frame to preserve tunnel HoL isolation"
+                    );
+                    false
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+            },
             None => false,
         }
     }
@@ -171,7 +175,7 @@ mod tests {
             stream_id: "bogus".into(),
             payload: None,
         };
-        assert!(!s.deliver_server_frame("bogus", &AgentId::new(), frame).await);
+        assert!(!s.deliver_server_frame("bogus", &AgentId::new(), frame));
     }
 
     #[tokio::test]
@@ -194,7 +198,7 @@ mod tests {
                 command_not_found: false,
             })),
         };
-        assert!(s.deliver_server_frame("io-0", &agent_id, frame).await);
+        assert!(s.deliver_server_frame("io-0", &agent_id, frame));
         let received = rx.recv().await.unwrap().unwrap();
         assert_eq!(received.stream_id, "io-0");
     }
@@ -219,7 +223,7 @@ mod tests {
             stream_id: "io-0".into(),
             payload: None,
         };
-        assert!(!s.deliver_server_frame("io-0", &attacker, frame).await);
+        assert!(!s.deliver_server_frame("io-0", &attacker, frame));
         assert!(rx.try_recv().is_err());
     }
 
