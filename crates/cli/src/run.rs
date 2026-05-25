@@ -287,17 +287,37 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         }
     });
 
+    // Comp-2 C5 / comp-9: optional in-binary ACME for the public listener.
+    // Operator opts in via TUNNEL_ACME_DOMAIN + ACME_EMAIL; otherwise the
+    // listener serves plaintext h2c (development mode).
+    let acme_settings = crate::tls::AcmeSettings::from_env();
     let public_grpc_handle = tokio::spawn(async move {
         // Comp-2 B4: HTTP/2 keepalive pings detect a frozen-but-TCP-alive
-        // agent within the documented spike-03 budget. Without these the
-        // proxy's inbound loop on a hung agent sits in message().await
-        // until OS TCP timeouts (hours).
-        tonic::transport::Server::builder()
+        // agent within the documented spike-03 budget.
+        let builder = tonic::transport::Server::builder()
             .http2_keepalive_interval(Some(Duration::from_secs(15)))
             .http2_keepalive_timeout(Some(Duration::from_secs(20)))
-            .add_service(public_service)
-            .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), shutdown_signal())
-            .await
+            .add_service(public_service);
+        match acme_settings {
+            Some(settings) => {
+                info!("public listener: ACME-managed TLS");
+                let incoming = crate::tls::acme_incoming(grpc_listener, settings);
+                builder
+                    .serve_with_incoming_shutdown(incoming, shutdown_signal())
+                    .await
+            }
+            None => {
+                warn!(
+                    "public listener: PLAINTEXT (set TUNNEL_ACME_DOMAIN + ACME_EMAIL for production TLS)"
+                );
+                builder
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(grpc_listener),
+                        shutdown_signal(),
+                    )
+                    .await
+            }
+        }
     });
 
     let internal_grpc_handle = if split_listeners {
