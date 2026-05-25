@@ -82,6 +82,24 @@ pub async fn ws_read_file<S: SandboxService>(
             "path query parameter is required",
         );
     }
+    // Loop verify-fix iter 6 (2026-05-26): the unary read/write handlers
+    // gate path through `handlers::validate_sandbox_path` (NUL, control
+    // chars, `..` segments) as defense-in-depth. The WS read-stream
+    // handler was missing the same check, so a relative `../../etc/passwd`
+    // streamed successfully while the unary equivalent returned 400. The
+    // bytes returned are still inside the sandbox container (so it's not
+    // a tenant escape today), but the policy was inconsistent and a
+    // regression in the agent's resolver would have escalated. Match the
+    // unary policy.
+    if let Err(msg) = crate::handlers::validate_sandbox_path(&query.path) {
+        return error_response(StatusCode::BAD_REQUEST, "INVALID_REQUEST", msg);
+    }
+    if let Some(cwd) = &query.cwd
+        && !cwd.is_empty()
+        && let Err(msg) = crate::handlers::validate_sandbox_path(cwd)
+    {
+        return error_response(StatusCode::BAD_REQUEST, "INVALID_REQUEST", msg);
+    }
     if let Err(resp) = check_auth(&headers, &state.api_key) {
         return resp;
     }

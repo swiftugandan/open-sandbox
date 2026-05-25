@@ -520,3 +520,43 @@ No bugs surfaced.
 
 
 
+
+### 2026-05-26 — `/loop verify <> fix` round 6
+
+Security edge-case sweep on the live cluster.
+
+**Bug found and fixed:** `crates/api/src/ws_read_file.rs` did not gate
+the `path` and `cwd` query params through `handlers::validate_sandbox_path`
+(NUL bytes, control characters, `..` segments). The unary
+`GET /files/read` handler gates them; the WS streaming variant was
+missing the same check.
+
+Observed: `ws://.../files/read-stream?path=../../etc/passwd` opened a
+session and streamed the sandbox's `/etc/passwd` content. The bytes
+returned are still inside the sandbox container's filesystem (not a
+tenant escape today), but the policy was inconsistent — `GET /files/read`
+with the same path returns 400 INVALID_REQUEST — and the comment on
+`validate_sandbox_path` explicitly calls out the defense-in-depth
+rationale: "a regression in the agent's resolver doesn't immediately
+escalate to a tenant escape."
+
+Fix: validate both `path` and (when present) `cwd` against
+`validate_sandbox_path` at the boundary before the WS upgrade.
+Validated live: `?path=../../etc/passwd` and `?cwd=/workspace/../etc`
+now return 400; legit paths still stream correctly.
+
+Other security checks all passed:
+- Auth: missing / wrong / empty / wrong-scheme tokens → 401 with
+  consistent error body (no info leak).
+- Auth applies on WS exec, WS read-stream (after the fix), and unary
+  file endpoints.
+- Path traversal in unary read/write: 400 INVALID_REQUEST.
+- Tarball traversal entries (`../../etc/cron.d/evil`, `/etc/cron.d/evil2`,
+  `../escape.txt`) all sanitized to live inside the `x-cwd: /workspace`
+  prefix — three-layer guard does normalize-then-confine rather than
+  reject, which is friendlier and still secure.
+- Body limit: 89 MB JSON payload to `write_file` → 400 INVALID_REQUEST
+  "length limit exceeded" (the `DefaultBodyLimit::max(64 MiB)` shipped
+  in round 1 catches it).
+- Invalid sandbox UUID → 400; nonexistent UUID → 404.
+- Oversized Authorization header (~16 KiB) → handled cleanly, 401.
