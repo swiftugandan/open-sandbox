@@ -2,11 +2,79 @@ use open_sandbox_agent::container::ContainerConfig;
 use open_sandbox_contracts::error::AgentError;
 
 use oci_spec::runtime::{
-    LinuxBuilder, LinuxCpuBuilder, LinuxMemoryBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
-    LinuxResourcesBuilder, ProcessBuilder, RootBuilder, SpecBuilder,
+    Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxMemoryBuilder,
+    LinuxNamespaceBuilder, LinuxNamespaceType, LinuxPidsBuilder, LinuxResourcesBuilder,
+    ProcessBuilder, RootBuilder, SpecBuilder,
 };
 
 const CPU_PERIOD_USEC: u64 = 100_000;
+
+/// Comp-5: per-container pids limit. 256 matches docker's default
+/// recommendation; bounds fork-bomb impact.
+const PIDS_LIMIT: i64 = 256;
+
+/// Comp-5: docker-default capability set. This is the set we *retain*
+/// on the bounding, effective, permitted, inheritable, and ambient sets.
+/// Everything outside this set is dropped relative to host root.
+///
+/// Source: docker's `cap_drop_default` minus the dangerous caps. Matches
+/// the documented baseline of containerd/cri-o/docker for general-purpose
+/// images. Anything that needs more must opt in explicitly via a future
+/// per-sandbox config (deferred).
+fn docker_default_caps() -> Vec<Capability> {
+    vec![
+        Capability::AuditWrite,
+        Capability::Chown,
+        Capability::DacOverride,
+        Capability::Fowner,
+        Capability::Fsetid,
+        Capability::Kill,
+        Capability::Mknod,
+        Capability::NetBindService,
+        Capability::NetRaw,
+        Capability::Setfcap,
+        Capability::Setgid,
+        Capability::Setpcap,
+        Capability::Setuid,
+        Capability::SysChroot,
+    ]
+}
+
+/// Comp-5: paths inside the container that must be masked (read returns
+/// zeros / not visible) so an in-container process can't read host info
+/// via /proc tricks. Matches docker's default masked_paths.
+fn default_masked_paths() -> Vec<String> {
+    [
+        "/proc/asound",
+        "/proc/acpi",
+        "/proc/kcore",
+        "/proc/keys",
+        "/proc/latency_stats",
+        "/proc/timer_list",
+        "/proc/timer_stats",
+        "/proc/sched_debug",
+        "/proc/scsi",
+        "/sys/firmware",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Comp-5: paths that the container can see but must not modify. Matches
+/// docker's default readonly_paths.
+fn default_readonly_paths() -> Vec<String> {
+    [
+        "/proc/bus",
+        "/proc/fs",
+        "/proc/irq",
+        "/proc/sys",
+        "/proc/sysrq-trigger",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
 
 pub fn generate_spec(config: &ContainerConfig) -> Result<oci_spec::runtime::Spec, AgentError> {
     generate_full_spec(config, "rootfs", None)
@@ -30,9 +98,16 @@ pub fn generate_full_spec(
         .build()
         .map_err(spec_err)?;
 
+    // Comp-5: bound fork-bomb impact via a per-container pids cap.
+    let pids = LinuxPidsBuilder::default()
+        .limit(PIDS_LIMIT)
+        .build()
+        .map_err(spec_err)?;
+
     let resources = LinuxResourcesBuilder::default()
         .cpu(cpu)
         .memory(memory)
+        .pids(pids)
         .build()
         .map_err(spec_err)?;
 
@@ -53,8 +128,13 @@ pub fn generate_full_spec(
     })
     .collect::<Result<_, _>>()?;
 
+    // Comp-5: hide host-leaking /proc paths and mark /proc/sys readonly.
     let mut linux_builder = LinuxBuilder::default();
-    linux_builder = linux_builder.resources(resources).namespaces(namespaces);
+    linux_builder = linux_builder
+        .resources(resources)
+        .namespaces(namespaces)
+        .masked_paths(default_masked_paths())
+        .readonly_paths(default_readonly_paths());
     if let Some(path) = cgroup_path {
         linux_builder = linux_builder.cgroups_path(path);
     }
@@ -66,11 +146,27 @@ pub fn generate_full_spec(
     ];
     env.extend(config.env_vars.iter().map(|(k, v)| format!("{k}={v}")));
 
+    // Comp-5: drop host-root caps; retain only the docker-default set.
+    // The same set is applied to bounding/effective/permitted/inheritable/
+    // ambient so a process inside the container starts with these caps
+    // and can never escalate beyond them.
+    let caps: std::collections::HashSet<Capability> = docker_default_caps().into_iter().collect();
+    let capabilities = LinuxCapabilitiesBuilder::default()
+        .bounding(caps.clone())
+        .effective(caps.clone())
+        .permitted(caps.clone())
+        .inheritable(caps.clone())
+        .ambient(caps)
+        .build()
+        .map_err(spec_err)?;
+
     let process = ProcessBuilder::default()
         .terminal(false)
         .args(vec!["sleep".to_string(), "infinity".to_string()])
         .env(env)
         .cwd("/".to_string())
+        .capabilities(capabilities)
+        .no_new_privileges(true)
         .build()
         .map_err(spec_err)?;
 
