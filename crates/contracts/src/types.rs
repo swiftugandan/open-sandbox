@@ -37,8 +37,53 @@ impl SandboxId {
         Self(Uuid::new_v4())
     }
 
+    /// v1.0.2: use the shared `SUBDOMAIN_LEN` constant rather than the
+    /// hard-coded `12`. Closes the comp-0 finding that the generator
+    /// here and the proxy's router could drift on length.
     pub fn subdomain(&self) -> String {
-        self.0.simple().to_string()[..12].to_string()
+        self.0.simple().to_string()[..crate::constants::SUBDOMAIN_LEN].to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSandboxId;
+
+impl fmt::Display for InvalidSandboxId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid SandboxId (must be a UUID)")
+    }
+}
+
+impl std::error::Error for InvalidSandboxId {}
+
+impl std::str::FromStr for SandboxId {
+    type Err = InvalidSandboxId;
+    /// v1.0.2 (comp-0): wire-side validator. Closes the finding that
+    /// `string sandbox_id` was free-form on the proto side and every
+    /// downstream had to remember to revalidate.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self).map_err(|_| InvalidSandboxId)
+    }
+}
+
+impl TryFrom<&str> for SandboxId {
+    type Error = InvalidSandboxId;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl std::str::FromStr for AgentId {
+    type Err = InvalidSandboxId; // shared error shape
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self).map_err(|_| InvalidSandboxId)
+    }
+}
+
+impl TryFrom<&str> for AgentId {
+    type Error = InvalidSandboxId;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
     }
 }
 

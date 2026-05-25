@@ -51,3 +51,19 @@ pub const PROXY_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 pub const DEFAULT_WRITE_CWD: &str = "/home";
 
 pub const DEFAULT_SANDBOX_ENTRYPOINT: &[&str] = &["sleep", "infinity"];
+
+// v1.0.2 (closes comp-0 subdomain hardcoded-12 finding): single source of
+// truth for the sandbox-subdomain length. SandboxId::subdomain() and the
+// proxy's router validator both use this.
+pub const SUBDOMAIN_LEN: usize = 12;
+
+// v1.0.2: gRPC metadata key carrying a structured ControllerError /
+// ProxyError variant name on Status responses. Senders set it on Status
+// trailers; receivers prefer it over the legacy status.code()-based
+// per-method mapping. Closes the comp-0 NotFound-collapse finding.
+pub const ERROR_CODE_HEADER: &str = "x-os-error-code";
+
+// v1.0.2: maximum entries returned from ListSandboxes. Comp-1 F1 capped
+// this server-side; v1.0.2 elevates the cap into the contracts so SDKs
+// know to paginate.
+pub const LIST_SANDBOXES_MAX: usize = 1000;

@@ -83,8 +83,12 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// v1.0.2 (closes comp-0 wildcard finding): exhaustive match without
+    /// a `_ => "UNKNOWN"` fallback. `ApiError` is `#[non_exhaustive]` for
+    /// external callers, but inside the defining crate the match is
+    /// exhaustive — adding a new variant becomes a compile error here,
+    /// which is the intended forcing function.
     pub fn error_code(&self) -> &'static str {
-        #[allow(unreachable_patterns)]
         match self {
             ApiError::Unauthorized { .. } => "UNAUTHORIZED",
             ApiError::SandboxNotFound { .. } => "SANDBOX_NOT_FOUND",
@@ -96,7 +100,6 @@ impl ApiError {
             ApiError::SandboxGone { .. } => "SANDBOX_GONE",
             ApiError::FileNotFound { .. } => "FILE_NOT_FOUND",
             ApiError::Internal { .. } => "INTERNAL_ERROR",
-            _ => "UNKNOWN",
         }
     }
 }
