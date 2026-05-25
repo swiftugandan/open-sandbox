@@ -393,3 +393,42 @@ The eight deferred items are listed in `NEEDS_HUMAN_ATTENTION.md` (search `comp-
 ## Spike-invariant violations
 
 _(empty — populated as component reviews land)_
+
+---
+
+## Loop verify-fix iterations (post-review)
+
+### 2026-05-25 — `/loop verify <> fix` round 2 against local cluster
+
+Cluster: release-binary controller + proxy + api + docker-backed agent on macOS;
+postgres in docker. Single long-lived sandbox carried forward, three additional
+sandboxes created during the loop.
+
+Endpoints exercised end-to-end (status: PASS unless noted):
+
+- `POST /v1/sandboxes/{id}/files/write_files` (gzip tarball, nested directories) —
+  `a.txt`, `b.txt`, `sub/c.txt` all extracted under `/workspace` with correct content.
+- `WS /v1/sandboxes/{id}/files/read-stream` — 1 MiB file md5 round-trip exact.
+- `WS /v1/sandboxes/{id}/exec` with stdin (`opensandbox-exec --stdin always`):
+  `tr a-z A-Z` and `sh -c 'cat | wc -c'` both stream correctly.
+- 3× concurrent `POST /v1/sandboxes` — all returned distinct `sandbox_id` +
+  `subdomain`, all reached `running` within the ~5s drain.
+- 4× concurrent `WS exec` across 4 sandboxes — each returned its own container
+  hostname; no cross-talk, no stream-id collision.
+- Proxy SIGTERM + restart with same args — agent reconnect path (per `proxy_client.rs`
+  ExponentialBackoff) re-armed at 1/2/4/8s; first post-restart `io_session.start`
+  observed at proxy `io-0` (counter reset); pre-restart sandbox remained reachable
+  for subsequent exec calls.
+- `DELETE /v1/sandboxes/{id}` × 3 — all returned 204; subsequent list confirmed
+  removal.
+
+**Minor observation (no bug):** agent emits no INFO log on successful proxy
+reconnect — only failure-path WARNs (`proxy connection lost` + `proxy reconnect
+backoff`) are visible. Ops would have to infer success from the absence of
+further failure logs or from the next `io_session.start`. Worth a one-line INFO
+log in `crates/agent/src/proxy_client.rs` reconnect-success branch.
+
+No bugs surfaced in this iteration. The two real bugs found in the prior round
+(`fix(api): wire CONTROLLER_ADMIN_TOKEN to controller gRPC + unblock large
+write_file uploads`) are committed.
+

@@ -97,6 +97,7 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
             .send(ready)
             .await
             .map_err(|_| AgentError::TunnelDisconnected)?;
+        tracing::info!(agent_id = %self.agent_id, "proxy tunnel established");
 
         let io_sessions: IoSessions = Arc::new(Mutex::new(HashMap::new()));
         let forwarder = self.forwarder.clone();
