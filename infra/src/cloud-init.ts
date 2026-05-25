@@ -1,13 +1,32 @@
 import * as pulumi from "@pulumi/pulumi";
 
 export function controllerUserData(args: {
-  databaseUrl: string;
+  databaseUrl: pulumi.Output<string> | string;
   grpcPort: number;
   proxyHttpPort: number;
   proxyGrpcPort: number;
+  proxyInternalGrpcPort: number;
   volumeDevice: string;
-}): string {
-  return `#!/bin/bash
+  // Comp-9 fix: env passthrough for the auth tokens the comp-1/2 review
+  // round added. Without these, the binaries refuse to start at all —
+  // controller's management gRPC requires CONTROLLER_ADMIN_TOKEN, proxy
+  // requires INTERNAL_TOKEN + TUNNEL_JOIN_TOKEN.
+  controllerAdminToken: pulumi.Output<string>;
+  internalToken: pulumi.Output<string>;
+  tunnelJoinToken: pulumi.Output<string>;
+  apiKey: pulumi.Output<string>;
+  // Optional ACME settings for the proxy's public listener (comp-2 C5).
+  // Unset = plaintext h2c (dev only).
+  tunnelAcmeDomain?: string;
+  acmeEmail?: string;
+}): pulumi.Output<string> {
+  const acmeBlock = args.tunnelAcmeDomain && args.acmeEmail
+    ? `Environment=TUNNEL_ACME_DOMAIN=${args.tunnelAcmeDomain}
+Environment=ACME_EMAIL=${args.acmeEmail}
+Environment=ACME_CACHE_DIR=/mnt/data/acme-cache`
+    : "";
+
+  return pulumi.interpolate`#!/bin/bash
 set -euo pipefail
 
 # ── Mount block volume for Postgres data ──────────────────────
@@ -56,6 +75,8 @@ Requires=postgresql.service
 [Service]
 ExecStart=/usr/local/bin/open-sandbox controller --grpc-port ${args.grpcPort}
 Environment=OPEN_SANDBOX_DATABASE_URL=${args.databaseUrl}
+Environment=CONTROLLER_ADMIN_TOKEN=${args.controllerAdminToken}
+Environment=OPEN_SANDBOX_JOIN_TOKEN=${args.tunnelJoinToken}
 Restart=always
 RestartSec=5
 
@@ -64,6 +85,9 @@ WantedBy=multi-user.target
 UNIT
 
 # ── Systemd: open-sandbox proxy ──────────────────────────────
+# Comp-9: TUNNEL_JOIN_TOKEN (agents present this on OpenTunnel),
+# INTERNAL_TOKEN (api gateway → proxy OpenIoStream auth), and the
+# optional ACME settings to terminate TLS on the public listener.
 cat > /etc/systemd/system/open-sandbox-proxy.service <<UNIT
 [Unit]
 Description=open-sandbox proxy
@@ -71,8 +95,33 @@ After=postgresql.service
 Requires=postgresql.service
 
 [Service]
-ExecStart=/usr/local/bin/open-sandbox proxy --http-port ${args.proxyHttpPort} --grpc-port ${args.proxyGrpcPort}
+ExecStart=/usr/local/bin/open-sandbox proxy --http-port ${args.proxyHttpPort} --grpc-port ${args.proxyGrpcPort} --internal-grpc-port ${args.proxyInternalGrpcPort}
 Environment=OPEN_SANDBOX_DATABASE_URL=${args.databaseUrl}
+Environment=INTERNAL_TOKEN=${args.internalToken}
+Environment=TUNNEL_JOIN_TOKEN=${args.tunnelJoinToken}
+${acmeBlock}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# ── Systemd: open-sandbox api gateway ────────────────────────
+# Co-located with controller + proxy on the same VM. INTERNAL_TOKEN
+# must match the proxy's setting so OpenIoStream calls authenticate.
+cat > /etc/systemd/system/open-sandbox-api.service <<UNIT
+[Unit]
+Description=open-sandbox api gateway
+After=open-sandbox-controller.service open-sandbox-proxy.service
+Requires=open-sandbox-controller.service open-sandbox-proxy.service
+
+[Service]
+ExecStart=/usr/local/bin/open-sandbox api
+Environment=OPEN_SANDBOX_CONTROLLER_URL=http://127.0.0.1:${args.grpcPort}
+Environment=OPEN_SANDBOX_PROXY_URL=http://127.0.0.1:${args.proxyInternalGrpcPort}
+Environment=OPEN_SANDBOX_API_KEY=${args.apiKey}
+Environment=INTERNAL_TOKEN=${args.internalToken}
 Restart=always
 RestartSec=5
 
@@ -83,6 +132,7 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now open-sandbox-controller
 systemctl enable --now open-sandbox-proxy
+systemctl enable --now open-sandbox-api
 
 # ── pg_dump backup cron (6-hour RPO) ─────────────────────────
 cat > /etc/cron.d/pg-backup <<CRON
@@ -97,7 +147,11 @@ export function workerUserData(args: {
   controllerUrl: string;
   proxyUrl: string;
   joinToken: pulumi.Output<string> | string;
+  tunnelJoinToken: pulumi.Output<string>;
 }): pulumi.Output<string> {
+  // Comp-9: workers need TUNNEL_JOIN_TOKEN so they can present it when
+  // dialing the proxy's OpenTunnel listener (comp-2 A1). Without it the
+  // agent binary refuses to start.
   return pulumi.interpolate`#!/bin/bash
 set -euo pipefail
 
@@ -121,6 +175,7 @@ Requires=docker.service
 [Service]
 ExecStart=/usr/local/bin/open-sandbox agent --controller-url ${args.controllerUrl} --proxy-url ${args.proxyUrl}
 Environment=OPEN_SANDBOX_JOIN_TOKEN=${args.joinToken}
+Environment=TUNNEL_JOIN_TOKEN=${args.tunnelJoinToken}
 Environment=OPEN_SANDBOX_CONTROLLER_URL=${args.controllerUrl}
 Environment=OPEN_SANDBOX_PROXY_URL=${args.proxyUrl}
 Restart=always

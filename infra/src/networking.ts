@@ -59,18 +59,35 @@ export function createControllerFirewall(args: {
 }) {
   return new hcloud.Firewall("controller-firewall", {
     rules: [
+      // Public HTTPS for sandbox traffic (`*.sandbox.<domain>`).
+      // Cloudflare proxied → origin: connections come from Cloudflare
+      // edges, but Hetzner firewalls work at L4 so we still open :443
+      // wide. Tighten with Cloudflare's IP ranges if you want belt-
+      // and-braces.
       {
         direction: "in",
         protocol: "tcp",
         port: "443",
         sourceIps: ["0.0.0.0/0", "::/0"],
       },
+      // OpenTunnel public listener for BYO agents dialing in. Public
+      // by design (BYO-from-anywhere); auth gated by TUNNEL_JOIN_TOKEN
+      // (comp-2 A1) and ACME-managed TLS when enabled (comp-2 C5).
+      {
+        direction: "in",
+        protocol: "tcp",
+        port: "50052",
+        sourceIps: ["0.0.0.0/0", "::/0"],
+      },
+      // SSH — restricted to operator CIDRs (comp-9 fail-closed).
       {
         direction: "in",
         protocol: "tcp",
         port: "22",
         sourceIps: args.operatorCidrs,
       },
+      // 50051 (controller gRPC) + 50053 (proxy internal gRPC) stay on
+      // the private Hetzner network — not exposed publicly.
     ],
   });
 }
