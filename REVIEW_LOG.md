@@ -468,4 +468,34 @@ earlier `Redacted` newtype introduction. Added `From<String>`,
 `crates/cli/tests/run_tests.rs` to call `.into()` on the secret fields.
 `cargo test -p open-sandbox --test cli_parsing` now passes (10 tests).
 
+### 2026-05-25 — `/loop verify <> fix` round 4
+
+Signal propagation: confirmed working end-to-end. Initial test results
+looked broken but the failure was a busybox-sh quirk in non-interactive
+mode (foreground `sleep` defers signal traps; `sleep N & wait $!`
+runs them correctly). With the right test pattern, local SIGINT →
+opensandbox-exec → ws-client Signal frame → api → proxy → agent →
+docker `kill -2` → in-container sh trap fires → exit 42 — exit code
+propagated all the way back.
+
+HoL: quantified the round-3 trade-off live. With session A doing a
+16 MiB stdin upload to a slow `while read; sleep 0.1` consumer,
+concurrent fast session B `echo` exec took **811 seconds** (~13.5 min)
+instead of <1 s. Worse, the WS-disconnect synthetic Close for session
+A was itself queued behind A's stdin frames, so the EXEC_KILL_GRACE
+cleanup hook only fired ~15 min after the WS closed — in-container
+zombie [sleep] processes accumulated during that window.
+
+Root cause: agent's tunnel inbound pump uses `send().await` on the
+per-session bounded channel; for slow sessions this backpressures the
+shared tunnel and HoL's all other sessions.
+
+Filed as a focused follow-up in `NEEDS_HUMAN_ATTENTION.md` (medium-effort,
+~150 LOC — per-session control fast-path channel for Close/Signal
+distinct from the bounded Stdin queue). Not blocking single-session
+deployments; affects mixed multi-session workloads.
+
+No code changes shipped this round. Documentation + observability work
+only.
+
 

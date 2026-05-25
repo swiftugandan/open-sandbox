@@ -79,6 +79,14 @@ dev env. Everything below is genuinely open.
 - **What's shipped:** multi-arch detection (`uname -m` picks amd64 vs arm64).
 - **Still deferred:** sha256 verification. Requires the release pipeline to publish a `*.sha256` file alongside each binary; cloud-init then runs `sha256sum -c`. Operational decision (where's the checksum source of truth).
 
+## [comp-3 · decision] HoL across sessions on stdin-heavy uploads + delayed disconnect cleanup
+
+- **Status:** consequence of the round 3 fix (`fix(agent): stdin >2 MiB hangs - revert to send().await for IoClient frames`, commit `61dc2be`). Round 4 quantified the trade-off.
+- **Observed behavior:** with one session A doing a large stdin upload to a slow in-container consumer (e.g., `while read; sleep 0.1`), session B's frames are queued behind A's at the agent's tunnel inbound loop. Measured impact: 16 MiB stdin → slow consumer → session B `echo` exec took 811 seconds (~13.5 min) instead of <1 s. **Additionally, the WS-disconnect synthetic Close frame for session A is itself queued behind A's stdin frames**, so the EXEC_KILL_GRACE cleanup hook only fires after the entire upload drains — observed: io-20's cleanup signal_sent fired ~15 min after the WS closed. This leaves the in-container process running and grows zombie [sleep] children.
+- **Root cause:** `crates/agent/src/proxy_client.rs:308` uses `t.send(io_frame).await` for IoClient routing. For Stdin frames this is correct (data integrity) but it backpressures the tunnel inbound pump, blocking all OTHER sessions on the same agent's tunnel. The blocker is `drive_io_session`'s stdin pump (`tx.send(Bytes::from(bytes)).await` in `crates/agent/src/io_stream.rs:472`) which blocks on the docker exec stdin pipe when the in-container consumer is slow.
+- **Recommended next step (medium effort, ~150 LOC):** add a per-session "control" fast-path channel (try_send-able, never blocks) for Close/Signal frames separate from the bounded Stdin queue. Have `drive_io_session` tokio::select! across both so a queued Close can interrupt a wedged stdin pump. Cleanup hook then fires promptly on disconnect even when stdin is HoL'd. Inbound loop demux routes by frame variant: Stdin → bounded await, Close/Signal → fast-path try_send. Architecture is similar to what comp-2 B2 did on the proxy server-frame side, but with type-discriminated routing.
+- **Production impact:** medium. Two concurrent stdin-heavy sessions on the same agent will see HoL. Single-session deployments are unaffected. Disconnect-cleanup delay is the more serious follow-on (orphan in-container processes accumulate until the inbound loop finally drains).
+
 ## [comp-1 · SPEC] Multi-tenancy
 
 - **Status:** comp-1 F1 closed the immediate exposure with single-tenant admin auth. Per-tenant ownership / API-key-per-tenant / billing-attribution all wait on the SPEC call. The `controllerAdminToken` is the single key today.
