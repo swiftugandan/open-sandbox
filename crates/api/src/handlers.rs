@@ -335,18 +335,30 @@ async fn unary_via_io_stream<S: SandboxService>(
             detail: "internal channel closed".into(),
         })?;
 
+    // Comp-6: chunk the upload at STDIN_CHUNK_BYTES instead of sending the
+    // whole payload as one giant Stdin frame. tonic's default decode cap
+    // is 4 MiB; previously a 5 MiB write_file silently failed with a
+    // generic codec ResourceExhausted. 64 KiB matches the read-side
+    // chunking the agent emits.
     if let Some(bytes) = content
         && !bytes.is_empty()
     {
-        client_tx
-            .send(IoClientFrame {
-                stream_id: String::new(),
-                payload: Some(io_client_frame::Payload::Stdin(bytes)),
-            })
-            .await
-            .map_err(|_| ApiError::IoStreamFailed {
-                detail: "internal channel closed".into(),
-            })?;
+        const STDIN_CHUNK_BYTES: usize = 64 * 1024;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let end = (offset + STDIN_CHUNK_BYTES).min(bytes.len());
+            let chunk = bytes[offset..end].to_vec();
+            client_tx
+                .send(IoClientFrame {
+                    stream_id: String::new(),
+                    payload: Some(io_client_frame::Payload::Stdin(chunk)),
+                })
+                .await
+                .map_err(|_| ApiError::IoStreamFailed {
+                    detail: "internal channel closed".into(),
+                })?;
+            offset = end;
+        }
     }
     // Signal EOF.
     client_tx
