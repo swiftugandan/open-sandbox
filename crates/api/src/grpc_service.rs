@@ -118,6 +118,39 @@ impl SandboxService for GrpcSandboxService {
 }
 
 fn grpc_to_api(status: tonic::Status) -> ApiError {
+    // v1.0.2 cascade: prefer the x-os-error-code trailer over the
+    // tonic::Code-based fallback. The trailer carries the structured
+    // ControllerError variant name (set in controller_error_to_status),
+    // so a Code::NotFound that means "agent_id not registered" no longer
+    // collapses to ApiError::SandboxNotFound. Falls back to the legacy
+    // mapping for any Status that doesn't carry the trailer (other gRPC
+    // peers, tonic-internal errors, pre-v1.0.2 emitters).
+    if let Some(code) = status
+        .metadata()
+        .get(open_sandbox_contracts::constants::ERROR_CODE_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        return match code {
+            "INVALID_TOKEN" => ApiError::Unauthorized {
+                detail: status.message().to_string(),
+            },
+            "SANDBOX_NOT_FOUND" => ApiError::SandboxNotFound {
+                sandbox_id: status.message().to_string(),
+            },
+            "AGENT_NOT_FOUND" => ApiError::ControllerUnavailable {
+                detail: status.message().to_string(),
+            },
+            "NO_AVAILABLE_AGENTS" => ApiError::ControllerUnavailable {
+                detail: format!("no available agents: {}", status.message()),
+            },
+            "DATABASE_ERROR" | "INTERNAL" | "UNKNOWN" => ApiError::Internal {
+                detail: status.message().to_string(),
+            },
+            _ => ApiError::Internal {
+                detail: format!("{code}: {}", status.message()),
+            },
+        };
+    }
     match status.code() {
         tonic::Code::NotFound => ApiError::SandboxNotFound {
             sandbox_id: status.message().to_string(),

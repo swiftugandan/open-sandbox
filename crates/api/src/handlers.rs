@@ -443,19 +443,20 @@ async fn stream_via_io_stream<S: SandboxService>(
 }
 
 fn map_io_error(err: &open_sandbox_contracts::proxy::IoError) -> ApiError {
-    match err.code.as_str() {
-        "FILE_NOT_FOUND" => ApiError::FileNotFound {
+    // v1.0.2 cascade: parse via IoErrorCode so the SANDBOX_NOT_FOUND →
+    // SandboxGone alias normalization lives in contracts instead of
+    // duplicated as a string match here. New codes Other(_) fall through
+    // to the generic IoStreamFailed bucket.
+    use open_sandbox_contracts::wire::IoErrorCode;
+    match IoErrorCode::from(err.code.as_str()) {
+        IoErrorCode::FileNotFound => ApiError::FileNotFound {
             resolved_path: err.detail.clone(),
         },
-        // Comp-6 (closes comp-3 C3): agent emits SANDBOX_NOT_FOUND when its
-        // in-memory sandbox_manager has no entry; alias to the same
-        // SandboxGone variant so SDKs see a clean 404 instead of an opaque
-        // IoStreamFailed 500.
-        "SANDBOX_GONE" | "SANDBOX_NOT_FOUND" => ApiError::SandboxGone {
+        IoErrorCode::SandboxGone => ApiError::SandboxGone {
             sandbox_id: err.detail.clone(),
         },
-        _ => ApiError::IoStreamFailed {
-            detail: format!("{}: {}", err.code, err.detail),
+        other => ApiError::IoStreamFailed {
+            detail: format!("{other}: {}", err.detail),
         },
     }
 }
