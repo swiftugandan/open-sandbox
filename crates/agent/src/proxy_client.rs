@@ -195,7 +195,12 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
             }
         };
 
-        let (in_tx, in_rx) = mpsc::channel::<IoClientFrame>(32);
+        // Comp-3 A3: per-session client-frame buffer raised so one slow
+        // drive_io_session task doesn't head-of-line block the tunnel
+        // inbound loop. The tunnel-inbound path below uses try_send and
+        // drops on overflow.
+        const IO_SESSION_CLIENT_BUFFER: usize = 256;
+        let (in_tx, in_rx) = mpsc::channel::<IoClientFrame>(IO_SESSION_CLIENT_BUFFER);
         let (server_tx, mut server_rx) = mpsc::channel::<IoServerFrame>(32);
 
         // Comp-3 C5: defensive — reject IoStart for an already-active
@@ -264,10 +269,24 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
         });
     } else {
         // Subsequent frame: route to existing session.
+        // Comp-3 A3: try_send so a slow drive_io_session doesn't block
+        // the tunnel inbound pump (which would HoL every other session
+        // on this agent). Overflow drops the frame with a warn; the
+        // 256-slot buffer above absorbs short stalls.
         let tx = io_sessions.lock().unwrap().get(&stream_id).cloned();
         match tx {
             Some(t) => {
-                let _ = t.send(io_frame).await;
+                if let Err(e) = t.try_send(io_frame) {
+                    match e {
+                        mpsc::error::TrySendError::Full(_) => {
+                            tracing::warn!(
+                                stream_id = %stream_id,
+                                "agent: per-session inbound channel full; dropping client frame"
+                            );
+                        }
+                        mpsc::error::TrySendError::Closed(_) => {}
+                    }
+                }
             }
             None => {
                 // No session — silently drop. Could log at debug.
