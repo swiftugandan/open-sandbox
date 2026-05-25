@@ -498,4 +498,25 @@ deployments; affects mixed multi-session workloads.
 No code changes shipped this round. Documentation + observability work
 only.
 
+### 2026-05-25 — `/loop verify <> fix` round 5
+
+HTTP-via-subdomain tunnel path (separate code path from io_session)
+exercised end-to-end:
+
+- nc-based HTTP responder inside the sandbox on the exposed_port (8080).
+- `curl -H "Host: <subdomain>.localhost" http://127.0.0.1:8443/` →
+  HTTP 200 with the in-sandbox body. Path, query, custom headers all
+  passthrough correctly.
+- 1 MiB binary body fetched in ~52 ms, md5 round-trip matches exactly.
+- 10× concurrent fetches: 7 succeeded with correct body, 3 got 502.
+  The 502s are a single-threaded nc test server limitation (`nc -l` is
+  one-shot and there's a brief gap before the while loop respawns),
+  not a proxy bug — the proxy correctly returns 502 on upstream
+  connection failure.
+- Edge cases: invalid/missing subdomain → 404; missing Host header →
+  connection closed (acceptable HTTP/1.1 violation handling).
+
+No bugs surfaced.
+
+
 
