@@ -90,18 +90,53 @@ impl ContainerRuntime for DockerRuntime {
         };
 
         info!(image = %config.image, "pulling image");
-        self.client
-            .create_image(
-                Some(bollard::image::CreateImageOptions {
-                    from_image: config.image.clone(),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(runtime_err)?;
+        // Comp-4: bounded retry with exponential backoff. Transient
+        // registry hiccups (rate-limit, 5xx, brief network drops) used
+        // to abort create_and_start with no signal that the failure was
+        // retryable; the controller's scheduler then reported FAILED and
+        // operators thought the image was unreachable.
+        const MAX_PULL_ATTEMPTS: u32 = 4;
+        const PULL_BASE_DELAY_MS: u64 = 500;
+        let mut last_err: Option<AgentError> = None;
+        for attempt in 1..=MAX_PULL_ATTEMPTS {
+            let result = self
+                .client
+                .create_image(
+                    Some(bollard::image::CreateImageOptions {
+                        from_image: config.image.clone(),
+                        ..Default::default()
+                    }),
+                    None,
+                    None,
+                )
+                .try_collect::<Vec<_>>()
+                .await;
+            match result {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) if attempt < MAX_PULL_ATTEMPTS => {
+                    let delay_ms = PULL_BASE_DELAY_MS * (1u64 << (attempt - 1));
+                    warn!(
+                        image = %config.image,
+                        attempt,
+                        max = MAX_PULL_ATTEMPTS,
+                        delay_ms,
+                        error = %e,
+                        "image pull failed; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    last_err = Some(runtime_err(e));
+                }
+                Err(e) => {
+                    last_err = Some(runtime_err(e));
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
         info!(image = %config.image, "image pull complete");
 
         let docker_config = build_docker_config(&config, &sandbox_id_str);
