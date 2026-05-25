@@ -101,11 +101,45 @@ async fn extract_layer(data: &[u8], rootfs: &PathBuf) -> Result<(), AgentError> 
                 })?
                 .to_path_buf();
 
+            // Comp-5: reject obvious path-traversal shapes BEFORE join.
+            // `entry.unpack(&dest)` with a pre-joined dest does not check
+            // that the result stays within rootfs (unlike Archive::unpack).
+            // A malicious OCI layer with `../../../etc/cron.d/evil` would
+            // write host files under the agent's privilege.
+            if path.is_absolute()
+                || path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(AgentError::Runtime {
+                    detail: format!(
+                        "tar entry rejected (absolute or '..' component): {}",
+                        path.display()
+                    ),
+                });
+            }
+
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if let Some(whiteout_target) = name.strip_prefix(".wh.") {
                     let target = rootfs
                         .join(path.parent().unwrap_or(std::path::Path::new("")))
                         .join(whiteout_target);
+                    // Defense-in-depth: belt-and-braces canonicalize check
+                    // so a symlink inside the partially-extracted rootfs
+                    // can't redirect the whiteout outside.
+                    if let Ok(canonical) = target.canonicalize() {
+                        if !canonical.starts_with(&rootfs) {
+                            return Err(AgentError::Runtime {
+                                detail: format!(
+                                    "whiteout target escapes rootfs: {}",
+                                    target.display()
+                                ),
+                            });
+                        }
+                    }
                     // OCI whiteout: target may not exist if a later layer already removed it
                     let _ = std::fs::remove_file(&target);
                     let _ = std::fs::remove_dir_all(&target);
@@ -114,6 +148,21 @@ async fn extract_layer(data: &[u8], rootfs: &PathBuf) -> Result<(), AgentError> 
             }
 
             let dest = rootfs.join(&path);
+            // Final symlink-following guard on the destination's parent.
+            // A previous entry could have planted `etc -> /etc` and the
+            // next entry exploits the link.
+            if let Some(parent) = dest.parent() {
+                if let Ok(canonical) = parent.canonicalize() {
+                    if !canonical.starts_with(&rootfs) {
+                        return Err(AgentError::Runtime {
+                            detail: format!(
+                                "tar entry parent escapes rootfs: {}",
+                                dest.display()
+                            ),
+                        });
+                    }
+                }
+            }
             entry.unpack(&dest).map_err(|e| AgentError::Runtime {
                 detail: format!("failed to extract {}: {e}", path.display()),
             })?;
