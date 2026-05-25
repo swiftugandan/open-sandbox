@@ -1,4 +1,22 @@
 config:
+  # Required secrets (set via `pulumi config set --secret <name> <value>`):
+  #
+  #   joinToken            — agents present this to the controller for
+  #                          registration (legacy v0.x compat name).
+  #   tunnelJoinToken      — agents present this on OpenTunnel to the
+  #                          proxy's public listener (comp-2 A1).
+  #   controllerAdminToken — required on management gRPC bearer header
+  #                          (comp-1 F1).
+  #   internalToken        — api gateway ↔ proxy OpenIoStream auth
+  #                          (comp-2 C3 closes Combined-mode gap).
+  #   apiKey               — REST/WS bearer key on the api gateway.
+  #
+  # Optional TLS (set both or neither):
+  #
+  #   tunnelAcmeDomain     — FQDN agents dial for OpenTunnel; the proxy
+  #                          issues a Let's Encrypt cert for it via
+  #                          TLS-ALPN-01 (comp-2 C5).
+  #   acmeEmail            — ACME registration contact.
   open-sandbox:domain: example.com
   open-sandbox:workerCount: "2"
   open-sandbox:controllerServerType: cax11

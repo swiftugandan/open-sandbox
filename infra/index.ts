@@ -3,7 +3,7 @@ import { createSshKey, createControllerServer, createWorkerServers, createVolume
 import { controllerUserData, workerUserData } from "./src/cloud-init";
 import { createNetwork, createFloatingIp, assignFloatingIp, attachToNetwork, createControllerFirewall, createWorkerFirewall } from "./src/networking";
 import { createWildcardDns } from "./src/dns";
-import { CONTROLLER_GRPC_PORT, PROXY_HTTP_PORT, PROXY_GRPC_PORT, DATABASE_URL, CONTROLLER_PRIVATE_IP, VOLUME_DEVICE_PREFIX } from "./src/constants";
+import { CONTROLLER_GRPC_PORT, PROXY_HTTP_PORT, PROXY_GRPC_PORT, PROXY_INTERNAL_GRPC_PORT, DATABASE_URL, CONTROLLER_PRIVATE_IP, VOLUME_DEVICE_PREFIX } from "./src/constants";
 import { idAsNumber } from "./src/util";
 
 const config = new pulumi.Config();
@@ -33,6 +33,24 @@ const cloudflareZoneId = config.get("cloudflareZoneId") ?? "";
 // were provisioned with whenever the operator forgot to set the secret.
 const joinToken = config.requireSecret("joinToken");
 
+// Comp-9: the auth tokens the comp-1/2 review round added. The binaries
+// REFUSE TO START without these, so cloud-init must supply them.
+// Required secrets:
+//   pulumi config set --secret controllerAdminToken <random>
+//   pulumi config set --secret internalToken <random>
+//   pulumi config set --secret tunnelJoinToken <random>
+//   pulumi config set --secret apiKey <random>
+const controllerAdminToken = config.requireSecret("controllerAdminToken");
+const internalToken = config.requireSecret("internalToken");
+const tunnelJoinToken = config.requireSecret("tunnelJoinToken");
+const apiKey = config.requireSecret("apiKey");
+
+// Comp-2 C5 / comp-9 #1: optional ACME settings for the proxy's public
+// listener. When set, the proxy issues a Let's Encrypt cert via
+// TLS-ALPN-01. Set both or neither.
+const tunnelAcmeDomain = config.get("tunnelAcmeDomain"); // e.g. tunnel.<domain>
+const acmeEmail = config.get("acmeEmail");
+
 const sshKey = createSshKey({ publicKey: sshPublicKey });
 
 const { network, subnet } = createNetwork({ cidr: networkCidr, subnetRange, location });
@@ -53,7 +71,14 @@ const controllerServer = createControllerServer({
     grpcPort: CONTROLLER_GRPC_PORT,
     proxyHttpPort: PROXY_HTTP_PORT,
     proxyGrpcPort: PROXY_GRPC_PORT,
+    proxyInternalGrpcPort: PROXY_INTERNAL_GRPC_PORT,
     volumeDevice: `${VOLUME_DEVICE_PREFIX}${volumeName}`,
+    controllerAdminToken,
+    internalToken,
+    tunnelJoinToken,
+    apiKey,
+    tunnelAcmeDomain,
+    acmeEmail,
   }),
   sshKeyIds: [idAsNumber(sshKey.id)],
   firewallIds: [idAsNumber(controllerFirewall.id)],
@@ -83,6 +108,7 @@ const workerServers = createWorkerServers({
     controllerUrl: `http://${CONTROLLER_PRIVATE_IP}:${CONTROLLER_GRPC_PORT}`,
     proxyUrl: `http://${CONTROLLER_PRIVATE_IP}:${PROXY_GRPC_PORT}`,
     joinToken,
+    tunnelJoinToken,
   }),
   sshKeyIds: [idAsNumber(sshKey.id)],
   firewallIds: [idAsNumber(workerFirewall.id)],
