@@ -39,6 +39,24 @@ impl FromStr for Redacted {
     }
 }
 
+impl From<String> for Redacted {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl PartialEq<&str> for Redacted {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<str> for Redacted {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

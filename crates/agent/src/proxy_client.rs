@@ -300,23 +300,32 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
         });
     } else {
         // Subsequent frame: route to existing session.
-        // Comp-3 A3: try_send so a slow drive_io_session doesn't block
-        // the tunnel inbound pump (which would HoL every other session
-        // on this agent). Overflow drops the frame with a warn; the
-        // 256-slot buffer above absorbs short stalls.
+        //
+        // Loop verify-fix iter 3 (2026-05-25): reverted from try_send +
+        // drop-on-overflow to send().await. The original comp-3 A3
+        // rationale was tunnel-level HoL isolation: a slow
+        // drive_io_session shouldn't block the inbound pump and
+        // starve other sessions on the same agent. But for IoClient
+        // frames, drop-on-overflow silently corrupts protocol state:
+        // a >2 MiB stdin upload (256 × 8 KiB exactly) loses bytes
+        // mid-stream AND may lose the half-close marker, so the
+        // in-container process hangs forever waiting for EOF.
+        //
+        // Backpressuring the inbound loop is the lesser evil. The
+        // proxy→agent tunnel itself is bounded (capacity 32 at the
+        // gRPC layer), so once drive_io_session catches up the loop
+        // resumes; HoL is bounded by the slowest session's drain
+        // rate and is observable in tracing. The 256-slot per-session
+        // buffer above still absorbs short stalls without blocking
+        // at all.
         let tx = io_sessions.lock().unwrap().get(&stream_id).cloned();
         match tx {
             Some(t) => {
-                if let Err(e) = t.try_send(io_frame) {
-                    match e {
-                        mpsc::error::TrySendError::Full(_) => {
-                            tracing::warn!(
-                                stream_id = %stream_id,
-                                "agent: per-session inbound channel full; dropping client frame"
-                            );
-                        }
-                        mpsc::error::TrySendError::Closed(_) => {}
-                    }
+                if t.send(io_frame).await.is_err() {
+                    tracing::debug!(
+                        stream_id = %stream_id,
+                        "agent: per-session inbound channel closed; dropping client frame"
+                    );
                 }
             }
             None => {

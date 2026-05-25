@@ -5,7 +5,7 @@ use open_sandbox::run;
 async fn run_controller_returns_result() {
     let args = ControllerArgs {
         grpc_port: 50051,
-        database_url: "postgres://localhost/test".to_string(),
+        database_url: "postgres://localhost/test".to_string().into(),
         sweep_interval: 15,
     };
     let result = run::run_controller(args).await;
@@ -21,7 +21,7 @@ async fn run_proxy_returns_result() {
         http_port: 8080,
         grpc_port: 50052,
         internal_grpc_port: 50053,
-        database_url: "postgres://localhost/test".to_string(),
+        database_url: "postgres://localhost/test".to_string().into(),
     };
     let result = run::run_proxy(args).await;
     assert!(
@@ -33,7 +33,7 @@ async fn run_proxy_returns_result() {
 #[tokio::test]
 async fn run_agent_returns_result() {
     let args = AgentArgs {
-        token: "test-token".to_string(),
+        token: "test-token".to_string().into(),
         controller_url: "http://127.0.0.1:50051".to_string(),
         proxy_url: "http://127.0.0.1:50052".to_string(),
     };

@@ -432,3 +432,40 @@ No bugs surfaced in this iteration. The two real bugs found in the prior round
 (`fix(api): wire CONTROLLER_ADMIN_TOKEN to controller gRPC + unblock large
 write_file uploads`) are committed.
 
+### 2026-05-25 — `/loop verify <> fix` round 3
+
+Picked up where round 2 left off and stress-tested large stdin → exec, which
+round 2 hadn't exercised.
+
+Bisection: 1 MiB stdin OK, 2 MiB+ stdin hangs forever (the in-container
+process never sees EOF). Held at every size from 2 MiB to 8 MiB. Reproduced
+with both `wc -c` and `cat >/dev/null` so this is not a wc-specific quirk.
+
+**Bug:** `crates/agent/src/proxy_client.rs` line 310 (pre-fix) used
+`try_send` on the per-session inbound channel and dropped IoClient frames
+with a warn when the 256-slot buffer filled. The threshold matches exactly:
+256 frames × 8 KiB per stdin chunk = 2,097,152 bytes = 2 MiB.
+
+For STDIN, drop-on-overflow is catastrophic: the gateway has already sent
+the bytes and the half-close marker, but the agent silently dropped some
+mid-stream and the half-close marker itself may have been dropped — so
+the in-container process hangs forever on read().
+
+The original comp-3 A3 rationale was tunnel-level HoL isolation: a slow
+drive_io_session shouldn't block the inbound pump and starve other
+sessions on the same agent. But for IoClient frames, HoL is the lesser
+evil — the proxy→agent tunnel is already bounded at the gRPC layer
+(capacity 32) so the chain backpressures end-to-end automatically.
+
+**Fix shipped:** revert to `send().await` for the subsequent-frame
+routing path. 256-slot per-session buffer is preserved as a fast-path
+absorber. Validated live with 4 MiB, 8 MiB, and 32 MiB stdin → md5sum
+round-trips matching exactly.
+
+Drive-by: fixed pre-existing CLI test compile errors caused by the
+earlier `Redacted` newtype introduction. Added `From<String>`,
+`PartialEq<&str>`, `PartialEq<str>` impls on `Redacted` and updated
+`crates/cli/tests/run_tests.rs` to call `.into()` on the secret fields.
+`cargo test -p open-sandbox --test cli_parsing` now passes (10 tests).
+
+
