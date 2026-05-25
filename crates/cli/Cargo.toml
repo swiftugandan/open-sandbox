@@ -29,8 +29,15 @@ reqwest = { version = "0.12", features = ["rustls-tls"], default-features = fals
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tokio-stream = "0.1"
-tonic = "0.12"
+tokio-util = { version = "0.7", features = ["compat"] }
+tonic = { version = "0.12", features = ["tls"] }
 uuid = { version = "1", features = ["v4"] }
+
+# Comp-2 C5: in-binary ACME (Let's Encrypt) for the proxy's public gRPC
+# listener. Operator opts in via env vars; plaintext fallback for dev.
+rustls-acme = { version = "0.10", features = ["tokio"] }
+tokio-rustls = "0.26"
+futures-util = "0.3"
 
 [dev-dependencies]
 assert_cmd = "2"
