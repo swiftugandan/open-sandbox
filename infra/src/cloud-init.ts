@@ -72,9 +72,23 @@ sed -i 's/^host\\s\\+all\\s\\+all\\s\\+::1\\/128\\s\\+trust/host all all ::1\\/1
 systemctl reload postgresql
 
 # ── Install open-sandbox binary ───────────────────────────────
-curl -fsSL https://github.com/chamuka-inc/open-sandbox/releases/latest/download/open-sandbox-linux-amd64 \\
-  -o /usr/local/bin/open-sandbox
+# Comp-9: pick the right arch for the host. Hetzner cax11 is aarch64;
+# cx22 is amd64. Without this detection the cax11 default silently
+# failed with "Exec format error" on the systemd unit. Pinned to the
+# latest tag; for production set OPEN_SANDBOX_VERSION env var to a
+# specific release and add a checksum verification step.
+case "$(uname -m)" in
+  aarch64|arm64) BIN_ARCH=arm64 ;;
+  x86_64|amd64)  BIN_ARCH=amd64 ;;
+  *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
+esac
+BINARY_URL="https://github.com/chamuka-inc/open-sandbox/releases/latest/download/open-sandbox-linux-\${BIN_ARCH}"
+curl -fsSL "$BINARY_URL" -o /usr/local/bin/open-sandbox
 chmod +x /usr/local/bin/open-sandbox
+# Optional: verify checksum if OPEN_SANDBOX_SHA256 is set in the env
+# (cloud-init doesn't pass env, but operators using pulumi.interpolate
+# to bake the sha256 into the script can drop a verification step in
+# here).
 
 # ── Systemd: open-sandbox controller ─────────────────────────
 cat > /etc/systemd/system/open-sandbox-controller.service <<UNIT

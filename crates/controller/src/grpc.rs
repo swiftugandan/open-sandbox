@@ -212,6 +212,22 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                         // entry that no longer exists) is dropped with a warn,
                         // not stream-fatal — a benign race during failover
                         // shouldn't tear down a healthy agent stream.
+                        //
+                        // Comp-3 C2 (v1.0.2 cascade bonus #11): terminal-state
+                        // exception. management.delete_sandbox release_sandbox
+                        // removes the routing row immediately; the agent's
+                        // terminal SandboxStatus(Stopped) arrives moments
+                        // later. Without this exception the no-routing-entry
+                        // arm would drop it and sandbox_states would never
+                        // advance past 'running' for clean deletions. We
+                        // accept the late terminal state because it can only
+                        // ever transition forward (Stopped/Failed are
+                        // sinks).
+                        use open_sandbox_contracts::controller::SandboxState;
+                        let is_terminal = matches!(
+                            status.state(),
+                            SandboxState::Stopped | SandboxState::Failed
+                        );
                         match store.find_routing_entry(&sandbox_id).await {
                             Ok(Some(entry)) if entry.agent_id == *agent_id => {}
                             Ok(Some(entry)) => {
@@ -222,6 +238,15 @@ impl<S: ControllerStore + 'static> ControllerService for GrpcHandler<S> {
                                     "SandboxStatus from non-owning agent; dropping"
                                 );
                                 continue;
+                            }
+                            Ok(None) if is_terminal => {
+                                tracing::info!(
+                                    sender = %agent_id,
+                                    sandbox = %sandbox_id,
+                                    state = ?status.state(),
+                                    "late terminal SandboxStatus after release_sandbox; persisting via exception"
+                                );
+                                // Fall through to save_sandbox_state.
                             }
                             Ok(None) => {
                                 tracing::warn!(
