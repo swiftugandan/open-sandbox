@@ -84,6 +84,46 @@ impl YoukiRuntime {
             detail: "container metadata lock poisoned".into(),
         })
     }
+
+    /// Comp-5: best-effort rollback of a half-created libcontainer
+    /// container. Removes the state_dir entry + bundle on disk; errors
+    /// are warn-logged but never propagated (caller is already returning
+    /// the original failure).
+    async fn rollback_libcontainer(&self, container_id: &str, container_dir: &std::path::Path) {
+        let state_root = self.state_dir().join(container_id);
+        if state_root.exists() {
+            if let Err(e) = tokio::fs::remove_dir_all(&state_root).await {
+                tracing::warn!(container_id, error = %e, "rollback: remove state_dir failed");
+            }
+        }
+        if container_dir.exists() {
+            if let Err(e) = tokio::fs::remove_dir_all(container_dir).await {
+                tracing::warn!(container_id, error = %e, "rollback: remove bundle failed");
+            }
+        }
+    }
+
+    /// Comp-5: best-effort rollback of a CNI ADD. Tears down the
+    /// network namespace + releases any allocated IP. Errors are
+    /// warn-logged.
+    async fn rollback_cni(
+        &self,
+        conflist: &cni::CniConfList,
+        container_id: &str,
+        netns_path: &str,
+    ) {
+        if let Err(e) = cni::invoke_cni(
+            conflist,
+            "DEL",
+            container_id,
+            netns_path,
+            &self.config.cni_bin_path,
+        )
+        .await
+        {
+            tracing::warn!(container_id, error = %e, "rollback: CNI DEL failed");
+        }
+    }
 }
 
 impl ContainerRuntime for YoukiRuntime {
@@ -151,18 +191,29 @@ impl ContainerRuntime for YoukiRuntime {
 
         let mut conflist = cni::generate_conflist(NETWORK_NAME);
         cni::inject_port_mappings(&mut conflist, host_port, container_port);
-        cni::invoke_cni(
+        // Comp-5: track every partial state we set up so a failure later
+        // in create_and_start can roll back instead of leaking
+        // libcontainer state_dir + CNI ip allocations + container
+        // bundle on disk. Mirrors the comp-4 docker rollback approach.
+        let cni_added = match cni::invoke_cni(
             &conflist,
             "ADD",
             &container_id,
             &netns_path,
             &self.config.cni_bin_path,
         )
-        .await?;
+        .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                self.rollback_libcontainer(&container_id, &container_dir).await;
+                return Err(e);
+            }
+        };
 
         let state_dir = self.state_dir();
         let cid_c = container_id.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), AgentError> {
+        if let Err(e) = tokio::task::spawn_blocking(move || -> Result<(), AgentError> {
             let container_root = state_dir.join(&cid_c);
             let mut container =
                 Container::load(container_root).map_err(|e| AgentError::Runtime {
@@ -175,7 +226,16 @@ impl ContainerRuntime for YoukiRuntime {
         .await
         .map_err(|e| AgentError::Runtime {
             detail: format!("container start task panicked: {e}"),
-        })??;
+        })
+        .and_then(|r| r)
+        {
+            if cni_added {
+                self.rollback_cni(&conflist, &container_id, &netns_path)
+                    .await;
+            }
+            self.rollback_libcontainer(&container_id, &container_dir).await;
+            return Err(e);
+        }
 
         let sandbox_id = config.sandbox_id.clone();
         self.lock_containers()?.insert(
