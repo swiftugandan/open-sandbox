@@ -44,6 +44,13 @@ const controllerAdminToken = config.requireSecret("controllerAdminToken");
 const internalToken = config.requireSecret("internalToken");
 const tunnelJoinToken = config.requireSecret("tunnelJoinToken");
 const apiKey = config.requireSecret("apiKey");
+// Comp-9: postgres password baked into the DATABASE_URL. Operator
+// generates with e.g. `openssl rand -hex 32` and sets via
+//   pulumi config set --secret dbPassword <value>
+// cloud-init runs `ALTER USER postgres PASSWORD '...'` before any
+// binary starts. Without this, postgres is trust-on-127.0.0.1 and
+// any process on the host is superuser.
+const dbPassword = config.requireSecret("dbPassword");
 
 // Comp-2 C5 / comp-9 #1: optional ACME settings for the proxy's public
 // listener. When set, the proxy issues a Let's Encrypt cert via
@@ -67,7 +74,10 @@ const controllerServer = createControllerServer({
   serverType: controllerServerType,
   location,
   userData: controllerUserData({
-    databaseUrl: DATABASE_URL,
+    // Comp-9: dbPassword baked into DATABASE_URL at apply time. Pulumi
+    // pulumi.interpolate keeps the secret marked in state.
+    databaseUrl: pulumi.interpolate`postgres://postgres:${dbPassword}@127.0.0.1:5432/open_sandbox`,
+    dbPassword,
     grpcPort: CONTROLLER_GRPC_PORT,
     proxyHttpPort: PROXY_HTTP_PORT,
     proxyGrpcPort: PROXY_GRPC_PORT,

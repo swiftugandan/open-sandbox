@@ -39,10 +39,18 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
     }
 
     pub async fn run(&self, addr: &str) -> Result<(), AgentError> {
+        // Comp-3 B6: client-side HTTP/2 keepalive on the controller
+        // channel too. The controller heartbeat reply path was the only
+        // liveness signal; without keepalive, a frozen controller left
+        // the agent's inbound `message().await` parked for OS-TCP
+        // minutes.
         let channel = tonic::transport::Channel::from_shared(addr.to_string())
             .map_err(|e| AgentError::Internal {
                 detail: e.to_string(),
             })?
+            .keep_alive_while_idle(true)
+            .keep_alive_timeout(std::time::Duration::from_secs(20))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(15))
             .connect()
             .await
             .map_err(|_| AgentError::ControllerDisconnected)?;

@@ -49,10 +49,17 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
     }
 
     pub async fn run(&self, addr: &str) -> Result<(), AgentError> {
+        // Comp-3 B6: client-side HTTP/2 keepalive so a silently-broken
+        // tunnel (proxy frozen, NAT idle timeout, middle-box drop) is
+        // detected within ~35s rather than OS TCP-keepalive minutes.
+        // Mirrors the server-side keepalive comp-2 B4 added on the proxy.
         let channel = tonic::transport::Channel::from_shared(addr.to_string())
             .map_err(|e| AgentError::Internal {
                 detail: e.to_string(),
             })?
+            .keep_alive_while_idle(true)
+            .keep_alive_timeout(std::time::Duration::from_secs(20))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(15))
             .connect()
             .await
             .map_err(|_| AgentError::TunnelDisconnected)?;
@@ -93,6 +100,14 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
 
         let io_sessions: IoSessions = Arc::new(Mutex::new(HashMap::new()));
         let forwarder = self.forwarder.clone();
+
+        // Comp-3 A4: track every per-session spawned task in a JoinSet so
+        // we can abort them on tunnel disconnect. Without this, each
+        // drive_io_session lingers in cleanup() for EXEC_KILL_GRACE
+        // before noticing its in_tx closed — under reconnect storms
+        // (now common since A1 added reconnect loops) this accumulates
+        // unboundedly.
+        let mut session_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
         while let Ok(Some(req)) = inbound.message().await {
             let stream_id = req.stream_id.clone();
@@ -140,10 +155,22 @@ impl<R: ContainerRuntime + 'static, H: HttpClient + 'static> ProxyConnection<R, 
                 }
                 tunnel_request::Payload::Data(_) | tunnel_request::Payload::Close(_) => {}
                 tunnel_request::Payload::IoClient(io_frame) => {
-                    handle_io_client_frame(&forwarder, &io_sessions, &outbound_tx, io_frame).await;
+                    handle_io_client_frame(
+                        &forwarder,
+                        &io_sessions,
+                        &outbound_tx,
+                        &mut session_tasks,
+                        io_frame,
+                    )
+                    .await;
                 }
             }
         }
+
+        // Comp-3 A4: tunnel disconnected. Abort every per-session task
+        // immediately instead of letting each drive_io_session sleep
+        // EXEC_KILL_GRACE after noticing its in_tx closed.
+        session_tasks.shutdown().await;
 
         Err(AgentError::TunnelDisconnected)
     }
@@ -153,6 +180,7 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
     forwarder: &Arc<TunnelForwarder<R, H>>,
     io_sessions: &IoSessions,
     outbound_tx: &mpsc::Sender<TunnelResponse>,
+    session_tasks: &mut tokio::task::JoinSet<()>,
     io_frame: IoClientFrame,
 ) {
     let stream_id = io_frame.stream_id.clone();
@@ -235,12 +263,14 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
         // Forward the initial Start frame.
         let _ = in_tx.send(io_frame).await;
 
-        // Spawn the driver.
+        // Spawn the driver. Comp-3 A4: registered in session_tasks so
+        // tunnel disconnect aborts it immediately rather than waiting
+        // for the cleanup hook's EXEC_KILL_GRACE.
         let runtime = forwarder.sandbox_manager().runtime().clone();
         let registry = forwarder.registry().clone();
         let client_stream = ReceiverStream::new(in_rx).map(Ok::<_, AgentError>);
         let stream_id_for_drive = stream_id.clone();
-        tokio::spawn(drive_io_session(
+        session_tasks.spawn(drive_io_session(
             runtime,
             registry,
             stream_id_for_drive,
@@ -254,7 +284,7 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
         let outbound = outbound_tx.clone();
         let sessions = io_sessions.clone();
         let stream_id_for_pump = stream_id.clone();
-        tokio::spawn(async move {
+        session_tasks.spawn(async move {
             while let Some(server_frame) = server_rx.recv().await {
                 let resp = TunnelResponse {
                     stream_id: stream_id_for_pump.clone(),

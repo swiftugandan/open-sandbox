@@ -123,11 +123,16 @@ impl IoSessions {
 
     /// Fail a session (e.g., the agent dropped). Sends an error
     /// status to the gateway-side stream and removes the session.
+    ///
+    /// Comp-2 C2: try_send first (fast path; the gateway-side channel
+    /// almost always has slack). On a full channel, spawn a fallback
+    /// task that send().awaits — so the disconnect signal eventually
+    /// reaches the gateway instead of silently disappearing and
+    /// surfacing as "stream ended without terminal frame".
     pub fn fail_stream(&self, stream_id: &str, status: Status) {
         let record = self.inner.lock().unwrap().remove(stream_id);
         if let Some(rec) = record {
-            // Best-effort: gateway may have already gone.
-            let _ = rec.server_tx.try_send(Err(status));
+            send_or_spawn(rec.server_tx, Err(status));
         }
     }
 
@@ -147,9 +152,12 @@ impl IoSessions {
             .collect();
         for sid in stream_ids {
             if let Some(rec) = guard.remove(&sid) {
-                let _ = rec.server_tx.try_send(Err(Status::unavailable(format!(
-                    "agent {agent_id} disconnected"
-                ))));
+                send_or_spawn(
+                    rec.server_tx,
+                    Err(Status::unavailable(format!(
+                        "agent {agent_id} disconnected"
+                    ))),
+                );
             }
         }
     }
@@ -160,6 +168,26 @@ impl IoSessions {
 
     pub fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().is_empty()
+    }
+}
+
+/// Comp-2 C2: send the terminal frame via try_send (fast path); on a
+/// full channel, spawn a fallback task that send().awaits so the
+/// disconnect notification eventually lands instead of being silently
+/// dropped. Caller has already removed the session record from
+/// IoSessions, so no other writer can race with the fallback task.
+fn send_or_spawn(
+    tx: mpsc::Sender<Result<IoServerFrame, Status>>,
+    frame: Result<IoServerFrame, Status>,
+) {
+    match tx.try_send(frame) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) => {
+            tokio::spawn(async move {
+                let _ = tx.send(frame).await;
+            });
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
     }
 }
 
