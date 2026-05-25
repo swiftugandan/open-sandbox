@@ -198,10 +198,34 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
         let (in_tx, in_rx) = mpsc::channel::<IoClientFrame>(32);
         let (server_tx, mut server_rx) = mpsc::channel::<IoServerFrame>(32);
 
-        io_sessions
-            .lock()
-            .unwrap()
-            .insert(stream_id.clone(), in_tx.clone());
+        // Comp-3 C5: defensive — reject IoStart for an already-active
+        // stream_id rather than silently overwriting and orphaning the
+        // original session. Proxy currently mints sequential `io-N` ids
+        // and shouldn't collide, but a malformed or compromised proxy
+        // peer could.
+        //
+        // Scope the MutexGuard tightly so it doesn't live across the
+        // outbound_tx.send().await on the conflict path (std::sync::Mutex
+        // guards aren't Send).
+        let is_conflict = {
+            let mut sessions = io_sessions.lock().unwrap();
+            if sessions.contains_key(&stream_id) {
+                true
+            } else {
+                sessions.insert(stream_id.clone(), in_tx.clone());
+                false
+            }
+        };
+        if is_conflict {
+            let _ = outbound_tx
+                .send(io_error_response(
+                    &stream_id,
+                    "STREAM_ID_REUSED",
+                    "an IoStream with this stream_id is already active",
+                ))
+                .await;
+            return;
+        }
 
         // Forward the initial Start frame.
         let _ = in_tx.send(io_frame).await;

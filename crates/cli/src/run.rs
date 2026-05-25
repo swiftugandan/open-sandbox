@@ -53,7 +53,7 @@ impl TokenValidator for StaticTokenValidator {
 
 pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::error::Error>> {
     info!("controller starting");
-    let pool = sqlx::PgPool::connect(&args.database_url).await?;
+    let pool = sqlx::PgPool::connect(args.database_url.expose()).await?;
     let pg_store = Arc::new(PgStore::new(pool));
     pg_store.migrate().await?;
     info!("database migrations applied");
@@ -101,7 +101,7 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
 
 pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>> {
     info!("proxy starting");
-    let pg_pool = sqlx::PgPool::connect(&args.database_url).await?;
+    let pg_pool = sqlx::PgPool::connect(args.database_url.expose()).await?;
     // Comp-2 A3: proxy owns the routing_entries_subdomain_idx functional
     // index; the controller owns the table itself. Retry the index
     // creation since the proxy can race the controller's migrate().
@@ -373,7 +373,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
     let agent_id = AgentId::new();
     info!(agent_id = %agent_id, "agent starting");
 
-    let join_token = JoinToken::new(args.token);
+    let join_token = JoinToken::new(args.token.into_inner());
 
     #[cfg(feature = "youki")]
     let runtime_name = "youki";
@@ -514,7 +514,7 @@ pub async fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(ApiState {
         lifecycle,
         proxy,
-        api_key: args.api_key,
+        api_key: args.api_key.into_inner(),
     });
 
     let router = build_router(state);
