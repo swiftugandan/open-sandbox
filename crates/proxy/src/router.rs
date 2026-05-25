@@ -21,14 +21,17 @@ impl<S: RoutingStore> Router<S> {
         let host = host.split(':').next().unwrap_or(host);
         let first_dot = host.find('.')?;
         let subdomain = &host[..first_dot];
-        if subdomain.len() != 12 || !subdomain.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Comp-2 A4: normalize to lowercase before validation so an
+        // uppercase Host still routes (routing_entries stores the
+        // canonical lowercase hex form).
+        let lower = subdomain.to_ascii_lowercase();
+        // v1.0.2 cascade: shared validator from contracts so the proxy
+        // router and the SandboxId generator can't drift on length /
+        // charset rules.
+        if !open_sandbox_contracts::wire::subdomain_is_valid(&lower) {
             return None;
         }
-        // Comp-2 A4: subdomain lookups against routing_entries compare against the
-        // lowercase hex form of the UUID. Normalize here so a browser that
-        // uppercases the Host (or a manually-typed URL with caps) still hits
-        // the route.
-        Some(subdomain.to_ascii_lowercase())
+        Some(lower)
     }
 
     pub async fn route_request(

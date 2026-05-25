@@ -49,14 +49,10 @@ const READ_FILE_CHUNK_BYTES: usize = 64 * 1024;
 /// agent process and tears down every sandbox on the host.
 const MAX_WRITE_BYTES: usize = 256 * 1024 * 1024;
 
-/// Valid POSIX signal range (1..=31 standard + 34..=64 real-time).
-/// Comp-3 A6: clients send `signum: u32` over the IoSignal frame; we
-/// gate the value before forwarding to the runtime so neither shell
-/// interpolation quirks nor `kill -0` liveness probes leak through as
-/// "kill the process" semantics.
-fn is_valid_signum(signum: u32) -> bool {
-    (1..=31).contains(&signum) || (34..=64).contains(&signum)
-}
+// v1.0.2 cascade: the inline is_valid_signum check is replaced by
+// contracts::wire::Signum::try_from(u32). The check semantics are
+// identical (POSIX 1..=31 + RT 34..=64); the contracts version is the
+// single source of truth.
 
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_io_session<R, S>(
@@ -285,27 +281,29 @@ async fn pump_exec_session<R, S>(
         tokio::select! {
             info = &mut exited_pinned => break Some(info),
             Some(sig) = signal_rx.recv() => {
-                // Comp-3 A6: validate signum range BEFORE forwarding to the
-                // runtime. `as i32` would wrap large u32s to negative; both
-                // backends shell-interpolate the integer into kill(1), so a
-                // bogus value either gets rejected with confusing errors or
-                // (e.g. signum=0) becomes a no-op liveness probe.
-                if !is_valid_signum(sig.signum) {
-                    warn!(
-                        stream_id = %stream_id,
-                        signum = sig.signum,
-                        "rejecting out-of-range signum; dropping signal"
-                    );
-                    continue;
-                }
+                // v1.0.2 cascade: contracts::wire::Signum::try_from gates
+                // the u32 to POSIX 1..=31 + RT 34..=64. Out-of-range
+                // values (including signum=0 = kill -0 liveness probe)
+                // are dropped with a warn before reaching the runtime.
+                let signum = match open_sandbox_contracts::wire::Signum::try_from(sig.signum) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            stream_id = %stream_id,
+                            error = %e,
+                            "rejecting out-of-range signum; dropping signal"
+                        );
+                        continue;
+                    }
+                };
                 if let Err(e) = runtime
-                    .signal_exec(&container_id, in_container_pid, sig.signum as i32)
+                    .signal_exec(&container_id, in_container_pid, signum.as_i32())
                     .await
                 {
                     warn!(
                         stream_id = %stream_id,
                         in_container_pid,
-                        signum = sig.signum,
+                        signum = signum.as_u8(),
                         error = %e,
                         "signal_exec failed"
                     );
