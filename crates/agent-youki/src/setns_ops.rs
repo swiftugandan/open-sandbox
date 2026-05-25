@@ -191,14 +191,38 @@ pub async fn write_file_in_ns(
     .await
 }
 
+/// Sandbox-internal allowlist for `extract_targz_in_ns`. Comp-5: client
+/// can otherwise write tarball entries to `/etc`, `/usr/bin`, etc. inside
+/// the container, planting setuid binaries or overriding the shell. The
+/// allowed prefixes here are the only `cwd` values write_files_targz
+/// will accept.
+///
+/// These are intentionally writable areas in a standard sandbox layout.
+/// If your image expects writes elsewhere, run a small shim that
+/// rewrites the target before calling.
+pub const WRITE_TARGZ_ALLOWED_PREFIXES: &[&str] =
+    &["/workspace", "/home", "/tmp", "/var/tmp"];
+
 /// Extract a gzipped tarball into a target directory inside the
 /// container's mount namespace. Creates the target directory if
 /// needed.
+///
+/// Comp-5: rejects target_dir outside [`WRITE_TARGZ_ALLOWED_PREFIXES`].
+/// Prevents a client from planting binaries in `/etc` or `/usr/bin`
+/// by passing those as `cwd`.
 pub async fn extract_targz_in_ns(
     target_pid: i32,
     target_dir: String,
     tarball: Bytes,
 ) -> Result<(), AgentError> {
+    if !is_target_dir_allowed(&target_dir) {
+        return Err(AgentError::Runtime {
+            detail: format!(
+                "target_dir {target_dir:?} is not under an allowed prefix; \
+                 allowed: {WRITE_TARGZ_ALLOWED_PREFIXES:?}"
+            ),
+        });
+    }
     run_in_container_mount_ns(target_pid, move || {
         std::fs::create_dir_all(&target_dir).map_err(|e| AgentError::Runtime {
             detail: format!("mkdir -p {target_dir}: {e}"),
@@ -213,6 +237,16 @@ pub async fn extract_targz_in_ns(
         Ok(())
     })
     .await
+}
+
+fn is_target_dir_allowed(path: &str) -> bool {
+    // Reject any `..` so a path under an allowed prefix can't escape.
+    if path.split('/').any(|seg| seg == "..") {
+        return false;
+    }
+    WRITE_TARGZ_ALLOWED_PREFIXES
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
 
 #[cfg(test)]

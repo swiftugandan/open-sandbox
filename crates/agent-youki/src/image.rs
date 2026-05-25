@@ -43,30 +43,68 @@ impl ImageManager {
             return Ok(rootfs_dir);
         }
 
-        tokio::fs::create_dir_all(&rootfs_dir)
-            .await
-            .map_err(|e| AgentError::Runtime {
-                detail: format!("failed to create rootfs directory: {e}"),
-            })?;
-
-        for layer in &manifest.layers {
-            let mut stream = self
-                .client
-                .pull_blob_stream(&reference, layer)
+        // Comp-5: atomic image install. Extract into a sibling
+        // `<rootfs>.tmp.<uuid>` directory; on success, atomic rename
+        // into place and write the `.complete` marker. On failure,
+        // best-effort rm the tmp dir. Previously a partial extract
+        // left dirty rootfs that the next pull built atop, silently
+        // corrupting subsequent containers.
+        let tmp_dir = image_dir.join(format!("rootfs.tmp.{}", uuid::Uuid::new_v4().simple()));
+        // If the parent image_dir doesn't exist yet (first pull of this
+        // digest), create it.
+        if let Some(parent) = tmp_dir.parent() {
+            tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| AgentError::Runtime {
-                    detail: format!("failed to start pulling layer {}: {e}", layer.digest),
+                    detail: format!("failed to create image directory: {e}"),
                 })?;
+        }
+        tokio::fs::create_dir_all(&tmp_dir)
+            .await
+            .map_err(|e| AgentError::Runtime {
+                detail: format!("failed to create rootfs tmp directory: {e}"),
+            })?;
 
-            let mut layer_data = Vec::new();
-            while let Some(result) = stream.next().await {
-                let chunk = result.map_err(|e| AgentError::Runtime {
-                    detail: format!("failed to read layer {} data: {e}", layer.digest),
-                })?;
-                layer_data.extend_from_slice(&chunk);
+        let extract_result = async {
+            for layer in &manifest.layers {
+                let mut stream = self
+                    .client
+                    .pull_blob_stream(&reference, layer)
+                    .await
+                    .map_err(|e| AgentError::Runtime {
+                        detail: format!("failed to start pulling layer {}: {e}", layer.digest),
+                    })?;
+
+                let mut layer_data = Vec::new();
+                while let Some(result) = stream.next().await {
+                    let chunk = result.map_err(|e| AgentError::Runtime {
+                        detail: format!("failed to read layer {} data: {e}", layer.digest),
+                    })?;
+                    layer_data.extend_from_slice(&chunk);
+                }
+
+                extract_layer(&layer_data, &tmp_dir).await?;
             }
+            Ok::<(), AgentError>(())
+        }
+        .await;
 
-            extract_layer(&layer_data, &rootfs_dir).await?;
+        if let Err(e) = extract_result {
+            // Best-effort cleanup of the half-extracted tmp dir.
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            return Err(e);
+        }
+
+        // Atomic rename into place. If `rootfs_dir` already exists
+        // (concurrent pull won), drop our tmp.
+        if rootfs_dir.exists() {
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        } else {
+            tokio::fs::rename(&tmp_dir, &rootfs_dir)
+                .await
+                .map_err(|e| AgentError::Runtime {
+                    detail: format!("failed to atomically install rootfs: {e}"),
+                })?;
         }
 
         tokio::fs::write(&marker, b"")
