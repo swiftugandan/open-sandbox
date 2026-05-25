@@ -64,6 +64,10 @@ pub enum WsClientError {
     Protocol(String),
     #[error("session closed by peer")]
     Closed,
+    /// Comp-7: returned by next_frame when no server frame arrived
+    /// within the configured read timeout.
+    #[error("read timeout (no server frame within {timeout:?})")]
+    ReadTimeout { timeout: std::time::Duration },
 }
 
 #[derive(Debug, Clone)]
@@ -113,8 +117,21 @@ pub enum ServerFrame {
     },
 }
 
+/// Comp-7: maximum WebSocket frame size the client accepts before
+/// closing the session. Default 4 MiB matches typical reverse-proxy
+/// limits; bump via [`ExecSession::set_max_frame_bytes`] if the
+/// platform needs larger.
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Comp-7: default read timeout for [`ExecSession::next_frame`]. None
+/// disables the timeout (legacy behavior). The server pings every 30s
+/// per spike-03; setting this to ~60s catches a silently-broken
+/// connection (NAT idle, middle-box drop) without false-positives.
+pub const DEFAULT_READ_TIMEOUT: Option<std::time::Duration> = None;
+
 pub struct ExecSession {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    read_timeout: Option<std::time::Duration>,
 }
 
 impl ExecSession {
@@ -138,9 +155,17 @@ impl ExecSession {
                 },
             )?,
         );
-        let (mut ws, _) = connect_async(request)
-            .await
-            .map_err(|e| WsClientError::Connect(e.to_string()))?;
+        // Comp-7: cap WS frame size so a runaway server payload can't
+        // grow the client's heap unboundedly.
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+            max_frame_size: Some(DEFAULT_MAX_FRAME_BYTES),
+            max_message_size: Some(DEFAULT_MAX_FRAME_BYTES),
+            ..Default::default()
+        };
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async_with_config(request, Some(config), false)
+                .await
+                .map_err(|e| WsClientError::Connect(e.to_string()))?;
 
         // Send IoStart immediately.
         let mut env: HashMap<String, String> = HashMap::new();
@@ -164,7 +189,17 @@ impl ExecSession {
             .await
             .map_err(|e| WsClientError::Io(e.to_string()))?;
 
-        Ok(Self { ws })
+        Ok(Self {
+            ws,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+        })
+    }
+
+    /// Comp-7: enable a per-frame read timeout. After this much time
+    /// without a server frame, [`next_frame`] returns
+    /// `WsClientError::ReadTimeout`. None disables (legacy behavior).
+    pub fn set_read_timeout(&mut self, t: Option<std::time::Duration>) {
+        self.read_timeout = t;
     }
 
     /// Send stdin bytes to the process.
@@ -205,12 +240,27 @@ impl ExecSession {
 
     /// Read the next server-sent frame. Returns `Ok(None)` on
     /// clean close.
+    ///
+    /// Comp-7: if [`set_read_timeout`] has been called with a Some
+    /// value, returns `Err(WsClientError::ReadTimeout)` when no server
+    /// frame arrives within that timeout. The session is left intact
+    /// so the caller can retry or close gracefully.
     pub async fn next_frame(&mut self) -> Result<Option<ServerFrame>, WsClientError> {
+        let timeout = self.read_timeout;
         loop {
-            let msg = match self.ws.next().await {
-                None => return Ok(None),
-                Some(Err(e)) => return Err(WsClientError::Io(e.to_string())),
-                Some(Ok(m)) => m,
+            let next = self.ws.next();
+            let msg = match timeout {
+                Some(t) => match tokio::time::timeout(t, next).await {
+                    Ok(None) => return Ok(None),
+                    Ok(Some(Err(e))) => return Err(WsClientError::Io(e.to_string())),
+                    Ok(Some(Ok(m))) => m,
+                    Err(_) => return Err(WsClientError::ReadTimeout { timeout: t }),
+                },
+                None => match next.await {
+                    None => return Ok(None),
+                    Some(Err(e)) => return Err(WsClientError::Io(e.to_string())),
+                    Some(Ok(m)) => m,
+                },
             };
             match msg {
                 WsMessage::Binary(bytes) => return Ok(Some(decode_server(&bytes)?)),

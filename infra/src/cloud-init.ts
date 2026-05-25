@@ -2,6 +2,7 @@ import * as pulumi from "@pulumi/pulumi";
 
 export function controllerUserData(args: {
   databaseUrl: pulumi.Output<string> | string;
+  dbPassword: pulumi.Output<string>;
   grpcPort: number;
   proxyHttpPort: number;
   proxyGrpcPort: number;
@@ -59,6 +60,16 @@ PGCONF
 
 systemctl start postgresql
 su - postgres -c "psql -c \\"CREATE DATABASE open_sandbox;\\" || true"
+# Comp-9: set a non-trivial postgres password so any future RCE in the
+# controller doesn't become an instant DB superuser pwn. The binaries
+# connect using this password baked into DATABASE_URL.
+su - postgres -c "psql -c \\"ALTER USER postgres PASSWORD '${args.dbPassword}';\\""
+# Switch pg_hba.conf from trust to md5 for local TCP connections so the
+# password is actually enforced.
+PG_HBA=$(su - postgres -c "psql -tA -c 'SHOW hba_file;'")
+sed -i 's/^host\\s\\+all\\s\\+all\\s\\+127.0.0.1\\/32\\s\\+trust/host all all 127.0.0.1\\/32 md5/' "$PG_HBA"
+sed -i 's/^host\\s\\+all\\s\\+all\\s\\+::1\\/128\\s\\+trust/host all all ::1\\/128 md5/' "$PG_HBA"
+systemctl reload postgresql
 
 # ── Install open-sandbox binary ───────────────────────────────
 curl -fsSL https://github.com/chamuka-inc/open-sandbox/releases/latest/download/open-sandbox-linux-amd64 \\

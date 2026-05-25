@@ -10,6 +10,8 @@ config:
   #   internalToken        — api gateway ↔ proxy OpenIoStream auth
   #                          (comp-2 C3 closes Combined-mode gap).
   #   apiKey               — REST/WS bearer key on the api gateway.
+  #   dbPassword           — postgres password baked into DATABASE_URL.
+  #                          Without this, postgres is trust-on-localhost.
   #
   # Optional TLS (set both or neither):
   #
