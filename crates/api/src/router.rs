@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 
 use crate::handlers;
@@ -9,23 +10,35 @@ use crate::state::ApiState;
 use crate::ws_exec;
 use crate::ws_read_file;
 
+/// Body-size cap on file-upload routes. Comp-6: previously axum's default
+/// 2 MiB cap blocked legitimate uploads (gzip tarballs of project trees
+/// commonly exceed it), but raising the global cap also opened
+/// memory-pressure DoS on JSON-body lifecycle routes. Per-route override
+/// is the correct fix.
+const FILE_UPLOAD_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
 pub fn build_router<S: SandboxService>(state: Arc<ApiState<S>>) -> Router {
     Router::new()
-        // Lifecycle
+        // Lifecycle (JSON bodies, kept at axum's default cap)
         .route(
             "/v1/sandboxes",
             post(handlers::create_sandbox::<S>).get(handlers::list_sandboxes::<S>),
         )
         .route("/v1/sandboxes/{id}", get(handlers::get_sandbox::<S>))
         .route("/v1/sandboxes/{id}", delete(handlers::delete_sandbox::<S>))
-        // File ops (REST, unary, backed by proxy OpenIoStream)
+        // File ops (REST, unary, backed by proxy OpenIoStream).
+        // Comp-6: per-route body-size cap raised to 64 MiB so realistic
+        // uploads succeed; the JSON routes above keep the conservative
+        // 2 MiB default.
         .route(
             "/v1/sandboxes/{id}/files/write_files",
-            post(handlers::write_files::<S>),
+            post(handlers::write_files::<S>)
+                .layer(DefaultBodyLimit::max(FILE_UPLOAD_BODY_LIMIT_BYTES)),
         )
         .route(
             "/v1/sandboxes/{id}/files/write_file",
-            post(handlers::write_file::<S>),
+            post(handlers::write_file::<S>)
+                .layer(DefaultBodyLimit::max(FILE_UPLOAD_BODY_LIMIT_BYTES)),
         )
         .route(
             "/v1/sandboxes/{id}/files/read",

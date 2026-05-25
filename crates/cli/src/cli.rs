@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+use crate::secret::Redacted;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "open-sandbox",
@@ -33,9 +35,9 @@ pub struct ControllerArgs {
     )]
     pub grpc_port: u16,
 
-    /// PostgreSQL connection URL
+    /// PostgreSQL connection URL (contains the password — never logged)
     #[arg(long, env = "OPEN_SANDBOX_DATABASE_URL")]
-    pub database_url: String,
+    pub database_url: Redacted,
 
     /// Dead agent sweep interval in seconds
     #[arg(long, default_value_t = 15, env = "OPEN_SANDBOX_SWEEP_INTERVAL")]
@@ -68,16 +70,16 @@ pub struct ProxyArgs {
     )]
     pub internal_grpc_port: u16,
 
-    /// PostgreSQL connection URL
+    /// PostgreSQL connection URL (contains the password — never logged)
     #[arg(long, env = "OPEN_SANDBOX_DATABASE_URL")]
-    pub database_url: String,
+    pub database_url: Redacted,
 }
 
 #[derive(Parser, Debug, Clone)]
 pub struct AgentArgs {
-    /// Join token for authenticating with the controller
+    /// Join token for authenticating with the controller (never logged)
     #[arg(long, env = "OPEN_SANDBOX_JOIN_TOKEN")]
-    pub token: String,
+    pub token: Redacted,
 
     /// Controller gRPC address
     #[arg(
@@ -121,8 +123,8 @@ pub struct ApiArgs {
     )]
     pub proxy_url: String,
 
-    /// Bearer API key callers must present to the gateway.
+    /// Bearer API key callers must present to the gateway (never logged).
     /// In production, set via env. Test default included for dev only.
     #[arg(long, env = "OPEN_SANDBOX_API_KEY")]
-    pub api_key: String,
+    pub api_key: Redacted,
 }

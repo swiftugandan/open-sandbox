@@ -474,14 +474,19 @@ impl ContainerRuntime for DockerRuntime {
             format!("-{signum}"),
             in_container_pid.to_string(),
         ];
+        // Comp-4: the kill exec used to attach stdout/stderr and then
+        // bind the resulting StartExecResults to `_`, leaking an
+        // undrained bollard stream per kill. We don't need any output
+        // — just fire and forget. Setting detach: true tells docker not
+        // to attach in the first place, so there's nothing to drain.
         let exec = self
             .client
             .create_exec(
                 &id.0,
                 CreateExecOptions {
                     cmd: Some(cmd),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
+                    attach_stdout: Some(false),
+                    attach_stderr: Some(false),
                     ..Default::default()
                 },
             )
@@ -493,7 +498,7 @@ impl ContainerRuntime for DockerRuntime {
             .start_exec(
                 &exec.id,
                 Some(StartExecOptions {
-                    detach: false,
+                    detach: true,
                     ..Default::default()
                 }),
             )

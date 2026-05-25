@@ -14,7 +14,7 @@
 //! WS_IDLE_PING_INTERVAL (30s); peer-gone after WS_IDLE_PING_TIMEOUT
 //! (60s) of no Pong → cleanup (per spike 03).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
@@ -143,11 +143,13 @@ async fn pump_ws_session(
     gateway_session_id: uuid::Uuid,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let last_pong = Arc::new(Mutex::new(Instant::now()));
+    // Comp-6: tokio::sync::watch instead of std::sync::Mutex<Instant>. The
+    // value is a single scalar, and a watch has no poison-on-panic state.
+    let (last_pong_tx, last_pong_rx) = tokio::sync::watch::channel(Instant::now());
 
     // Task A: WS → client_tx (decode WS binary frames, push to proxy).
     let client_tx_task = client_tx.clone();
-    let last_pong_recv = last_pong.clone();
+    let last_pong_tx = last_pong_tx.clone();
     let recv_task = tokio::spawn(async move {
         while let Some(msg) = receiver.next().await {
             let Ok(msg) = msg else { break };
@@ -170,7 +172,7 @@ async fn pump_ws_session(
                 }
                 Message::Close(_) => return,
                 Message::Pong(_) => {
-                    *last_pong_recv.lock().unwrap() = Instant::now();
+                    let _ = last_pong_tx.send(Instant::now());
                 }
                 Message::Ping(_) => {
                     // axum auto-responds to Pings on its own.
@@ -250,7 +252,7 @@ async fn pump_ws_session(
                 if sender.send(Message::Ping(Bytes::new())).await.is_err() {
                     break;
                 }
-                let elapsed = last_pong.lock().unwrap().elapsed();
+                let elapsed = last_pong_rx.borrow().elapsed();
                 if elapsed > WS_IDLE_PING_TIMEOUT {
                     warn!(
                         gateway_session_id = %gateway_session_id,
