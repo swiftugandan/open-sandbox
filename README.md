@@ -136,4 +136,4 @@ git tag --list 'module/*' | grep 'live-verified'   # what's live-verified
 
 ## License
 
-Not specified yet — treat as proprietary until a `LICENSE` file is added.
+Licensed under the [Apache License, Version 2.0](LICENSE). Copyright © 2026 Swift Ugandan.
