@@ -91,6 +91,19 @@ curl -X POST -H "Authorization: Bearer dev-api-key" -H 'content-type: applicatio
      http://127.0.0.1:8081/v1/sandboxes
 ```
 
+### Optional: dev console (browser UI)
+
+A single-file dev console lives at [`ui/index.html`](ui/index.html) — sandbox list / create / delete, streaming exec terminal (xterm.js over the WS endpoint), and file read/write. To serve it from a different origin than the API, set `OPEN_SANDBOX_API_CORS_ORIGINS` on the api binary:
+
+```sh
+OPEN_SANDBOX_API_CORS_ORIGINS=http://127.0.0.1:8090 \
+    ./target/release/open-sandbox api ...
+
+(cd ui && python3 -m http.server 8090)
+```
+
+`OPEN_SANDBOX_API_CORS_ORIGINS` accepts a comma-separated list, or sole `*` for wildcard. Unset → no CORS layer (production default). The console authenticates WS upgrades via `Sec-WebSocket-Protocol: open-sandbox.v1, bearer.<base64url(key)>` — see `CONTRACTS.md § WebSocket auth`.
+
 ### Build/test the youki runtime (Linux only — runs inside a dev container on macOS)
 
 ```sh

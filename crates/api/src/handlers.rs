@@ -96,6 +96,94 @@ pub(crate) fn validate_sandbox_path(path: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+// Subprotocol auth constants live in the contracts crate — they're part
+// of the v1.x public wire surface that SDK authors need to discover.
+pub use open_sandbox_contracts::constants::{
+    WS_AUTH_BEARER_PREFIX, WS_AUTH_MAX_OFFERED_PROTOCOLS, WS_AUTH_PROTOCOL_SENTINEL,
+};
+
+/// WebSocket boundary auth. Browser `WebSocket` constructors cannot
+/// attach an `Authorization` header, so this helper also accepts the
+/// standards-friendly fallback of
+/// `Sec-WebSocket-Protocol: open-sandbox.v1, bearer.<base64url(key)>`.
+///
+/// Returns `Ok(None)` if auth came via the `Authorization` header
+/// (no subprotocol echo needed) and `Ok(Some(WS_AUTH_PROTOCOL_SENTINEL))`
+/// if the caller authenticated via subprotocol — the caller MUST echo
+/// that protocol back in the upgrade response or the browser rejects the
+/// handshake. The key itself is never returned (and therefore never
+/// echoed), so it stays out of response headers / access logs / DevTools.
+///
+/// Both auth paths are tried; presenting a wrong Authorization header
+/// alongside a valid subprotocol still authenticates (proxies that
+/// inject stale Authorization headers don't lock out the page).
+#[allow(clippy::result_large_err)]
+pub fn check_ws_auth(headers: &HeaderMap, expected: &str) -> Result<Option<String>, Response> {
+    // Path 1: Authorization: Bearer <key> (programmatic clients).
+    let auth_matches = headers
+        .get(AUTH_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .is_some_and(|tok| constant_time_eq(tok.as_bytes(), expected.as_bytes()));
+    if auth_matches {
+        return Ok(None);
+    }
+
+    // Path 2: Sec-WebSocket-Protocol (browser clients). Iterate every
+    // header value (RFC 7230 permits a sender to split the list across
+    // multiple headers) AND every comma-separated entry within a value.
+    // The per-request iteration is capped (see WS_AUTH_MAX_OFFERED_PROTOCOLS
+    // in the contracts crate) so an unauthenticated attacker can't amplify
+    // a single upgrade into thousands of constant_time_eq calls.
+    use base64::Engine;
+    let expected_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected.as_bytes());
+    let mut sentinel_offered = false;
+    let mut bearer_ok = false;
+    let offered_iter = headers
+        .get_all("sec-websocket-protocol")
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|raw| raw.split(',').map(|s| s.trim()))
+        .take(WS_AUTH_MAX_OFFERED_PROTOCOLS);
+    for offered in offered_iter {
+        if offered.eq_ignore_ascii_case(WS_AUTH_PROTOCOL_SENTINEL) {
+            sentinel_offered = true;
+        } else if let Some(b64) = strip_prefix_ascii_ci(offered, WS_AUTH_BEARER_PREFIX)
+            && constant_time_eq(b64.as_bytes(), expected_b64.as_bytes())
+        {
+            bearer_ok = true;
+        }
+    }
+    if bearer_ok {
+        // Only echo if the client also offered the sentinel — RFC 6455
+        // requires the server's chosen protocol to be one of the offered
+        // values. If the client only offered the bearer entry, accept
+        // the connection without echoing (browsers tolerate this).
+        return Ok(sentinel_offered.then(|| WS_AUTH_PROTOCOL_SENTINEL.to_string()));
+    }
+
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "missing or invalid API key",
+            "error_code": "UNAUTHORIZED",
+        })),
+    )
+        .into_response())
+}
+
+/// Case-insensitive ASCII prefix strip. Mirrors HTTP scheme tradition
+/// (`Authorization: Bearer` is case-insensitive per RFC 7235) so a
+/// client that offers `Bearer.<…>` is treated the same as `bearer.<…>`.
+fn strip_prefix_ascii_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
 /// Constant-time byte compare. Lifted from crates/controller/src/auth.rs
 /// to keep crates/api self-contained without a workspace shared module.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

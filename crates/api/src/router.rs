@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::http::{HeaderName, HeaderValue, Method};
 use axum::routing::{delete, get, post};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::handlers;
 use crate::service::SandboxService;
@@ -17,8 +19,80 @@ use crate::ws_read_file;
 /// is the correct fix.
 const FILE_UPLOAD_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
+/// Optional CORS layer for development consoles served from a different
+/// origin (e.g. `python3 -m http.server 8090`). Enabled by setting
+/// `OPEN_SANDBOX_API_CORS_ORIGINS` to a comma-separated list of allowed
+/// origins, or `*` to allow any origin. Unset → no CORS headers added,
+/// which is the correct production default (single-origin deployments
+/// don't need preflight).
+fn dev_cors_layer() -> Option<CorsLayer> {
+    let raw = std::env::var("OPEN_SANDBOX_API_CORS_ORIGINS").ok()?;
+    // Strip whitespace and surrounding ASCII quotes from each entry so
+    // values copy-pasted from YAML / Helm / shell-quoted env files
+    // (e.g. `'"*"'`, `"https://foo"`) match the same as their unquoted
+    // forms. Drop blanks.
+    let entries: Vec<&str> = raw
+        .split(',')
+        .map(|s| {
+            let s = s.trim();
+            s.strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(s)
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("x-cwd"),
+        ])
+        .expose_headers([HeaderName::from_static("content-type")]);
+    // Wildcard is only honored when `*` is the sole entry — silent
+    // escalation when an operator writes `'*, https://foo'` (a docs-
+    // style mixed value) would broaden the allowlist beyond intent.
+    let has_wildcard = entries.iter().any(|e| *e == "*");
+    let explicit: Vec<&&str> = entries.iter().filter(|e| **e != "*").collect();
+    if has_wildcard && explicit.is_empty() {
+        tracing::info!("api: CORS enabled, allowing any origin");
+        return Some(layer.allow_origin(AllowOrigin::any()));
+    }
+    if has_wildcard {
+        tracing::warn!(
+            explicit = ?explicit,
+            "api: OPEN_SANDBOX_API_CORS_ORIGINS contains `*` mixed with explicit origins; \
+             ignoring `*` and using the explicit allowlist. Set the value to just `*` for wildcard."
+        );
+    }
+    let parsed: Vec<HeaderValue> = explicit
+        .iter()
+        .filter_map(|s| match HeaderValue::from_str(s) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::warn!(origin = %s, "api: CORS origin rejected (not a valid HTTP header value)");
+                None
+            }
+        })
+        .collect();
+    if parsed.is_empty() {
+        // Every entry was invalid; rather than install a layer that
+        // silently rejects every cross-origin request, fail loudly.
+        tracing::error!(
+            "api: OPEN_SANDBOX_API_CORS_ORIGINS contained no valid origins; CORS layer disabled"
+        );
+        return None;
+    }
+    tracing::info!(origins = ?parsed, "api: CORS enabled");
+    Some(layer.allow_origin(AllowOrigin::list(parsed)))
+}
+
 pub fn build_router<S: SandboxService>(state: Arc<ApiState<S>>) -> Router {
-    Router::new()
+    let router = Router::new()
         // Lifecycle (JSON bodies, kept at axum's default cap)
         .route(
             "/v1/sandboxes",
@@ -57,5 +131,9 @@ pub fn build_router<S: SandboxService>(state: Arc<ApiState<S>>) -> Router {
         )
         // Streaming exec (WebSocket)
         .route("/v1/sandboxes/{id}/exec", get(ws_exec::ws_exec::<S>))
-        .with_state(state)
+        .with_state(state);
+    match dev_cors_layer() {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
 }

@@ -1,6 +1,65 @@
 # CHANGELOG
 
-## v1.0.2 (in progress) — pull_policy, startup-time optimization
+## v1.0.2 (in progress) — WebSocket subprotocol auth, opt-in CORS, fail-closed empty key
+
+Additive auth path for browser-based WebSocket clients (the existing
+`Authorization: Bearer` path is unchanged for programmatic clients).
+Opt-in CORS layer for cross-origin dev consoles. Startup-time guard
+that refuses to boot the API binary with an empty API key.
+
+### Additions
+- **WebSocket subprotocol auth** (`crates/api/src/handlers.rs`,
+  constants in `crates/contracts/src/constants.rs`). Browsers can
+  authenticate WS upgrades by offering both subprotocols:
+  ```
+  Sec-WebSocket-Protocol: open-sandbox.v1, bearer.<base64url-no-pad(api_key)>
+  ```
+  The server validates the `bearer.<…>` entry and echoes ONLY the
+  sentinel (`open-sandbox.v1`) back — the API key never lands in the
+  101 response header. The `bearer.` prefix is matched
+  case-insensitively. Per-request iteration is capped at
+  `WS_AUTH_MAX_OFFERED_PROTOCOLS = 16` to prevent pre-auth
+  algorithmic amplification. New contract constants:
+  `WS_AUTH_PROTOCOL_SENTINEL`, `WS_AUTH_BEARER_PREFIX`,
+  `WS_AUTH_MAX_OFFERED_PROTOCOLS`. See `CONTRACTS.md § WebSocket auth`.
+
+- **Opt-in CORS layer** for the REST routes (`OPEN_SANDBOX_API_CORS_ORIGINS`
+  env var). Unset → no CORS headers (production default). Set to
+  a comma-separated list to allowlist explicit origins; sole `*`
+  activates wildcard. Mixed `*` + explicit origins logs a WARN and
+  keeps the explicit allowlist (silent wildcard escalation is
+  prevented). Surrounding ASCII quotes are stripped per entry.
+  See `CONTRACTS.md § CORS`.
+
+- **Single-file dev console** (`ui/index.html`). xterm.js terminal
+  for streaming exec + REST file read/write. Talks to the API
+  through the new subprotocol path so a browser can drive sandboxes
+  without a server-side companion.
+
+### Behavior changes
+- **API binary now refuses to start with an empty `OPEN_SANDBOX_API_KEY`**
+  (`crates/cli/src/run.rs`). The previous behavior — silent
+  open-auth because `constant_time_eq("", "") == true` — has been
+  closed. Operators with empty-key configs (typo'd env vars,
+  unset-in-CI templating bugs) will now see an explicit startup
+  error: `OPEN_SANDBOX_API_KEY must be set to a non-empty value;
+  refusing to start with empty key`.
+
+- **WS auth helper unified**. `ws_exec.rs` and `ws_read_file.rs`
+  previously had local `check_auth` functions that accepted only
+  `Authorization: Bearer`. Both now call the shared
+  `handlers::check_ws_auth`, which accepts either path and is
+  forgiving of a wrong Authorization header alongside a valid
+  subprotocol (proxies that inject stale Authorization headers
+  no longer lock out browser-based clients).
+
+### Dependencies
+- Added `tower-http = { version = "0.6", features = ["cors"] }` to
+  `crates/api/Cargo.toml` for the opt-in CORS layer.
+
+---
+
+## v1.0.2 earlier work — pull_policy, startup-time optimization
 
 Adds a wire-compatible `pull_policy` field on `CreateSandboxRequest`
 (api.proto) and `SandboxConfig` (controller.proto). Old clients send

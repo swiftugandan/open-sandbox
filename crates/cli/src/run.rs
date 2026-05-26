@@ -511,10 +511,20 @@ pub async fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("failed to connect to proxy: {e}"))?,
     );
 
+    let api_key = args.api_key.into_inner();
+    if api_key.is_empty() {
+        // Fail closed: an empty key would let any caller authenticate
+        // (constant_time_eq("","") = true). The api requires a key —
+        // OPEN_SANDBOX_API_KEY env var or --api-key flag.
+        return Err(
+            "OPEN_SANDBOX_API_KEY must be set to a non-empty value; refusing to start with empty key"
+                .into(),
+        );
+    }
     let state = Arc::new(ApiState {
         lifecycle,
         proxy,
-        api_key: args.api_key.into_inner(),
+        api_key,
     });
 
     let router = build_router(state);

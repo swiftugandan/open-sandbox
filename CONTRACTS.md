@@ -177,6 +177,63 @@ The proxy's gRPC service, renamed in v1.0 from `TunnelService` to reflect its br
   - `WS_IDLE_PING_INTERVAL`: 30 seconds (gateway → client WebSocket ping cadence on idle exec sessions)
   - `WS_IDLE_PING_TIMEOUT`: 60 seconds (peer-gone threshold; triggers ExecRegistry cleanup)
   - `EXEC_KILL_GRACE`: 5 seconds (between SIGTERM and SIGKILL when the registry hook fires)
+  - `WS_AUTH_PROTOCOL_SENTINEL`: `"open-sandbox.v1"` — the subprotocol the server echoes on successful WS subprotocol auth (see §WebSocket auth)
+  - `WS_AUTH_BEARER_PREFIX`: `"bearer."` — case-insensitive prefix marking a subprotocol entry that carries a base64url-encoded API key
+  - `WS_AUTH_MAX_OFFERED_PROTOCOLS`: 16 — per-request cap on offered-protocol entries the auth helper inspects
+
+### WebSocket auth (REST gateway, v1.0.x)
+
+Every WebSocket upgrade on the gateway (`/v1/sandboxes/{id}/exec`,
+`/v1/sandboxes/{id}/files/read-stream`) is bearer-authenticated. There
+are two equivalent paths:
+
+1. **`Authorization: Bearer <api_key>`** — preferred for programmatic
+   clients (CLIs, SDKs, server-to-server).
+2. **`Sec-WebSocket-Protocol: open-sandbox.v1, bearer.<base64url-no-pad(api_key)>`**
+   — required for browsers, which cannot set `Authorization` on a
+   `WebSocket` constructor. The client offers both entries; the server
+   validates the bearer entry and echoes ONLY the sentinel
+   (`open-sandbox.v1`) back in the 101 response, so the API key never
+   appears in a response header / access log / DevTools network panel.
+
+Both paths are tried per request; a wrong `Authorization` header does
+not lock out a request that also presents a valid subprotocol (this
+tolerates proxies that inject stale Authorization). On failure both
+paths surface the same 401 body:
+
+```json
+{ "error": "missing or invalid API key", "error_code": "UNAUTHORIZED" }
+```
+
+The base64url-no-padding encoding is mandatory for the subprotocol
+path: WebSocket subprotocol values must satisfy the RFC 7230 token
+grammar (no `=`, `+`, `/`, `,`, whitespace), so API keys containing
+those characters can only be carried over the subprotocol path after
+encoding. The encoding is applied client-side; the server decodes
+nothing — it compares the offered string against
+`base64url-no-pad(state.api_key)` in constant time.
+
+The `bearer.` prefix is matched case-insensitively (HTTP scheme
+tradition); `Bearer.<…>`, `BEARER.<…>`, etc. all work.
+
+### CORS (REST gateway, opt-in)
+
+Set `OPEN_SANDBOX_API_CORS_ORIGINS` to enable CORS for development
+consoles served from a different origin than the API. Unset → no CORS
+layer is installed (correct production default for single-origin
+deployments).
+
+- Comma-separated list of allowed origins, e.g.
+  `http://localhost:8090,https://console.dev`.
+- A sole value of `*` activates wildcard CORS. Mixed `*` + explicit
+  origins logs a WARN and treats the value as the explicit allowlist
+  (the `*` is ignored) — silent wildcard escalation is prevented.
+- Surrounding ASCII quotes are stripped per entry, so YAML/Helm-style
+  `'"https://x"'` normalizes to `https://x`.
+- Empty / all-invalid input produces an ERROR log and no layer.
+
+WebSocket upgrades are not subject to CORS by browser policy, so this
+layer only affects the REST routes.
 
 ## Component-to-contract matrix
 

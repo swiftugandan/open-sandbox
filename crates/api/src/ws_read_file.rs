@@ -15,7 +15,11 @@
 //!   * `4500 READ_FAILED` — other runtime failure (e.g. permission
 //!     denied, mount unavailable).
 //!   * `4503 PROXY_UNAVAILABLE` — proxy/agent disconnected mid-read.
-//!   * `4401 UNAUTHORIZED` — missing/invalid Authorization header.
+//!
+//! Auth failures are surfaced *before* the upgrade as an HTTP 401 with
+//! the standard `{error, error_code: UNAUTHORIZED}` JSON body — they
+//! never produce a WS close frame because the WebSocket is never
+//! established.
 //!
 //! Hosted on a distinct path from the unary `GET /files/read`
 //! handler because axum (v0.8) can't reliably extract
@@ -44,8 +48,6 @@ use open_sandbox_contracts::types::SandboxId;
 use crate::proxy_client::SharedProxyClient;
 use crate::service::{ReadFileQuery, SandboxService};
 use crate::state::ApiState;
-
-const AUTH_HEADER: &str = "authorization";
 
 /// Build the IoStart for a ReadFile session.
 fn build_start(sandbox_id: &SandboxId, path: String, cwd: String) -> IoStart {
@@ -100,39 +102,24 @@ pub async fn ws_read_file<S: SandboxService>(
     {
         return error_response(StatusCode::BAD_REQUEST, "INVALID_REQUEST", msg);
     }
-    if let Err(resp) = check_auth(&headers, &state.api_key) {
-        return resp;
-    }
+    let echo_protocol = match check_auth(&headers, &state.api_key) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let proxy = state.proxy.clone();
     let path = query.path;
     let cwd = query.cwd.unwrap_or_default();
-    ws.on_upgrade(move |socket| run_session(socket, proxy, sandbox_id, path, cwd))
+    let upgrade = if let Some(p) = echo_protocol {
+        ws.protocols([p])
+    } else {
+        ws
+    };
+    upgrade.on_upgrade(move |socket| run_session(socket, proxy, sandbox_id, path, cwd))
 }
 
 #[allow(clippy::result_large_err)]
-fn check_auth(headers: &HeaderMap, expected: &str) -> Result<(), Response> {
-    let got = headers
-        .get(AUTH_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "));
-    match got {
-        // Comp-6: constant-time compare (see handlers.rs::constant_time_eq).
-        Some(token)
-            if crate::handlers::constant_time_eq(token.as_bytes(), expected.as_bytes()) =>
-        {
-            Ok(())
-        }
-        Some(_) => Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            "UNAUTHORIZED",
-            "invalid API key",
-        )),
-        None => Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            "UNAUTHORIZED",
-            "missing Authorization: Bearer header",
-        )),
-    }
+fn check_auth(headers: &HeaderMap, expected: &str) -> Result<Option<String>, Response> {
+    crate::handlers::check_ws_auth(headers, expected)
 }
 
 fn error_response(status: StatusCode, code: &str, msg: &str) -> Response {

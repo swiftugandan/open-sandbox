@@ -90,3 +90,33 @@ pub const ERROR_CODE_HEADER: &str = "x-os-error-code";
 // this server-side; v1.0.2 elevates the cap into the contracts so SDKs
 // know to paginate.
 pub const LIST_SANDBOXES_MAX: usize = 1000;
+
+// =====  WebSocket subprotocol auth (browser clients) =====
+//
+// Browser `WebSocket` constructors cannot attach an `Authorization`
+// header, so the API gateway accepts an equivalent credential on the
+// `Sec-WebSocket-Protocol` offered-protocols list:
+//
+//   Sec-WebSocket-Protocol: open-sandbox.v1, bearer.<base64url-no-pad(api_key)>
+//
+// The server validates the bearer entry, then echoes the sentinel
+// (NOT the bearer value) back in the 101 response. The base64url-no-pad
+// encoding keeps the value inside the RFC 7230 token grammar that
+// `new WebSocket()` enforces on subprotocol entries.
+
+/// Subprotocol the server echoes back when WS subprotocol auth succeeds.
+/// Picking a fixed sentinel (instead of echoing the offered bearer entry)
+/// keeps the shared API key out of response headers, access logs, and
+/// browser DevTools network panels.
+pub const WS_AUTH_PROTOCOL_SENTINEL: &str = "open-sandbox.v1";
+
+/// Subprotocol prefix that carries a base64url-no-padding-encoded API
+/// key. Matched case-insensitively on the server side (HTTP scheme
+/// tradition; `Authorization: Bearer` is case-insensitive per RFC 7235).
+pub const WS_AUTH_BEARER_PREFIX: &str = "bearer.";
+
+/// Per-request cap on the number of offered subprotocol entries the
+/// auth helper inspects. Prevents pre-auth algorithmic amplification:
+/// an attacker stuffing `bearer.X1, bearer.X2, …, bearer.XN` cannot
+/// force more than this many `constant_time_eq` calls per upgrade.
+pub const WS_AUTH_MAX_OFFERED_PROTOCOLS: usize = 16;

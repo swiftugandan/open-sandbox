@@ -1,7 +1,8 @@
 //! Lifecycle handler unit tests. v0.7 exec tests deleted along
 //! with the message-shaped exec surface. WebSocket-streaming exec
-//! coverage lives in `crates/api/tests/ws_streaming.rs` (12.4's
-//! integration suite) and 12.6's e2e scenarios.
+//! end-to-end coverage lives in 12.6's e2e scenarios; this file
+//! covers the auth helper (`check_ws_auth`) used on the WS upgrade
+//! path.
 
 use std::sync::Arc;
 
@@ -322,4 +323,182 @@ async fn create_sandbox_rejects_unknown_pull_policy() {
         "expected 400/422 for unknown pull_policy variant, got {}",
         resp.status()
     );
+}
+
+// ===== WebSocket auth helper =====
+
+mod ws_auth {
+    use axum::http::HeaderMap;
+    use base64::Engine;
+
+    use crate::handlers::{WS_AUTH_PROTOCOL_SENTINEL, check_ws_auth};
+
+    const KEY: &str = "test-key-with,comma+slash/and=padding";
+
+    fn b64url(s: &str) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes())
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn authorization_bearer_accepted() {
+        let h = headers(&[("authorization", &format!("Bearer {}", KEY))]);
+        assert!(matches!(check_ws_auth(&h, KEY), Ok(None)));
+    }
+
+    #[test]
+    fn missing_returns_unauthorized() {
+        let h = headers(&[]);
+        assert!(check_ws_auth(&h, KEY).is_err());
+    }
+
+    #[test]
+    fn wrong_authorization_returns_unauthorized() {
+        let h = headers(&[("authorization", "Bearer wrong")]);
+        assert!(check_ws_auth(&h, KEY).is_err());
+    }
+
+    #[test]
+    fn subprotocol_with_sentinel_echoes_sentinel_not_key() {
+        let h = headers(&[(
+            "sec-websocket-protocol",
+            &format!("open-sandbox.v1, bearer.{}", b64url(KEY)),
+        )]);
+        match check_ws_auth(&h, KEY) {
+            Ok(Some(echo)) => {
+                assert_eq!(echo, WS_AUTH_PROTOCOL_SENTINEL);
+                // Critical: the key (or its base64 form) must NEVER appear
+                // in the echoed protocol — that string lands in the response
+                // handshake header.
+                assert!(!echo.contains(KEY));
+                assert!(!echo.contains(&b64url(KEY)));
+            }
+            other => panic!("expected Ok(Some(sentinel)), got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn subprotocol_without_sentinel_still_authenticates_but_does_not_echo() {
+        // Per RFC 6455 the server MAY accept the upgrade without selecting a
+        // subprotocol when the client offered ones it doesn't recognize.
+        let h = headers(&[(
+            "sec-websocket-protocol",
+            &format!("bearer.{}", b64url(KEY)),
+        )]);
+        assert!(matches!(check_ws_auth(&h, KEY), Ok(None)));
+    }
+
+    #[test]
+    fn subprotocol_split_across_multiple_headers() {
+        // RFC 7230 permits splitting a list header across multiple values;
+        // both must be inspected.
+        let h = headers(&[
+            ("sec-websocket-protocol", "open-sandbox.v1"),
+            ("sec-websocket-protocol", &format!("bearer.{}", b64url(KEY))),
+        ]);
+        match check_ws_auth(&h, KEY) {
+            Ok(Some(echo)) => assert_eq!(echo, WS_AUTH_PROTOCOL_SENTINEL),
+            other => panic!("expected Ok(Some(sentinel)), got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn key_with_comma_and_base64_chars_round_trips() {
+        // The whole point of base64url encoding: keys containing `,`, `+`,
+        // `/`, `=` must still authenticate via subprotocol.
+        assert!(KEY.contains(','));
+        assert!(KEY.contains('+'));
+        let h = headers(&[(
+            "sec-websocket-protocol",
+            &format!("open-sandbox.v1, bearer.{}", b64url(KEY)),
+        )]);
+        assert!(check_ws_auth(&h, KEY).is_ok());
+    }
+
+    #[test]
+    fn wrong_authorization_with_valid_subprotocol_authenticates() {
+        // Proxies that inject a stale Authorization header must not lock
+        // out a page that presents valid subprotocol credentials.
+        let h = headers(&[
+            ("authorization", "Bearer stale-rotated-key"),
+            (
+                "sec-websocket-protocol",
+                &format!("open-sandbox.v1, bearer.{}", b64url(KEY)),
+            ),
+        ]);
+        assert!(check_ws_auth(&h, KEY).is_ok());
+    }
+
+    #[test]
+    fn wrong_subprotocol_with_wrong_authorization_rejected() {
+        let h = headers(&[
+            ("authorization", "Bearer wrong"),
+            (
+                "sec-websocket-protocol",
+                &format!("open-sandbox.v1, bearer.{}", b64url("not-the-key")),
+            ),
+        ]);
+        assert!(check_ws_auth(&h, KEY).is_err());
+    }
+
+    #[test]
+    fn case_insensitive_bearer_prefix_accepted() {
+        // HTTP scheme tradition (RFC 7235 `Authorization: Bearer`) is
+        // case-insensitive; mirror it for the subprotocol prefix so
+        // `Bearer.<b64>` doesn't get rejected as a wrong credential.
+        let h = headers(&[(
+            "sec-websocket-protocol",
+            &format!("open-sandbox.v1, Bearer.{}", b64url(KEY)),
+        )]);
+        assert!(matches!(check_ws_auth(&h, KEY), Ok(Some(_))));
+    }
+
+    #[test]
+    fn excess_offered_protocols_capped() {
+        // An attacker stuffing the header with bogus `bearer.X` entries
+        // shouldn't multiply the work done per upgrade. The helper's
+        // 16-entry cap means a valid bearer offer hidden after the cap
+        // is not consulted — by design, this trades a tiny correctness
+        // edge for a hard cap on pre-auth amplification.
+        let mut entries: Vec<String> =
+            (0..32).map(|i| format!("bearer.bogus{}", i)).collect();
+        // Place the real credential AT THE CAP boundary: index 17 is
+        // beyond the 16-entry cap so the helper does NOT see it.
+        entries.push(format!("bearer.{}", b64url(KEY)));
+        let h = headers(&[("sec-websocket-protocol", &entries.join(", "))]);
+        // Past-cap bearer entries are not consulted: 401.
+        assert!(check_ws_auth(&h, KEY).is_err());
+    }
+
+    #[test]
+    fn valid_offer_within_cap_still_authenticates() {
+        let mut entries = vec!["open-sandbox.v1".to_string(), format!("bearer.{}", b64url(KEY))];
+        // Add a handful of decoys but stay under the 16-entry cap.
+        for i in 0..10 {
+            entries.push(format!("bearer.bogus{}", i));
+        }
+        let h = headers(&[("sec-websocket-protocol", &entries.join(", "))]);
+        assert!(matches!(check_ws_auth(&h, KEY), Ok(Some(_))));
+    }
+
+    #[test]
+    fn unauthorized_error_body_uses_stable_shape() {
+        let h = headers(&[]);
+        let resp = check_ws_auth(&h, KEY).expect_err("expected Err");
+        // Code path: just assert it's a 401. The exact JSON body is
+        // exercised through the router-integration paths; here we only
+        // pin the status so a future refactor that drops the helper's
+        // error path is caught.
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
 }
