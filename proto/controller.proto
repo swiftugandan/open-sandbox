@@ -2,6 +2,7 @@ syntax = "proto3";
 package open_sandbox.controller;
 
 import "google/protobuf/timestamp.proto";
+import "api.proto";
 
 // ControllerService — the long-lived bidi stream between each agent
 // and the controller. Carries lifecycle-only traffic in v1.0:
@@ -102,6 +103,10 @@ message SandboxConfig {
   uint64 memory_limit_bytes = 2;
   map<string, string> env_vars = 3;
   uint32 exposed_port = 4;
+  // v1.0.2: pull-policy threaded from CreateSandboxRequest through
+  // the controller to the agent runtime. Enum lives in api.proto;
+  // UNSPECIFIED here means IF_NOT_PRESENT (current optimized behavior).
+  open_sandbox.api.PullPolicy pull_policy = 5;
 }
 
 message StopSandbox {

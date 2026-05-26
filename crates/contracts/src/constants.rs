@@ -17,6 +17,20 @@ pub const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 pub const SANDBOX_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// v1.0.2 (iter11): upper bound on a single `ContainerRuntime::
+/// create_and_start` call. Set above the worst-case retry budget
+/// the agent's docker runtime can hit under sustained registry
+/// pressure (3 outer port-retry × 4 pull-attempt × ~7.5s of
+/// backoff = ~90s) — but the deadline gives operators a clear
+/// fail-loud upper bound rather than relying on every call site
+/// to enforce its own. On expiry the agent returns
+/// `AgentError::Runtime { detail: "create_and_start deadline
+/// exceeded ..." }`; a partial container (if any) is cleaned up
+/// by the next agent-side reconcile sweep. Caller-supplied
+/// deadlines (e.g. a tonic-propagated gRPC deadline) are a
+/// future iteration's work; for now the const is a static cap.
+pub const SANDBOX_CREATE_DEADLINE: Duration = Duration::from_secs(60);
+
 pub const DEFAULT_SANDBOX_CPU_MILLICORES: u32 = 1000;
 
 pub const DEFAULT_SANDBOX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;

@@ -18,6 +18,25 @@ message CreateSandboxRequest {
   uint64 memory_bytes = 3;
   map<string, string> env_vars = 4;
   uint32 exposed_port = 5;
+  // v1.0.2: how the agent should treat the image cache. Default
+  // (PULL_POLICY_UNSPECIFIED) is interpreted as IF_NOT_PRESENT, which
+  // matches the docker run default and the current agent-docker
+  // optimized warm-path behavior. Set ALWAYS for floating tags
+  // (:latest) that must be refreshed on every start; NEVER for
+  // air-gapped / strict-pin environments where the image MUST already
+  // be local.
+  PullPolicy pull_policy = 6;
+}
+
+// v1.0.2: pull-policy semantics live in api.proto rather than
+// controller.proto because they are caller-facing — the gateway
+// validates and defaults them at the JSON boundary. The controller
+// passes the enum through unchanged via SandboxConfig.pull_policy.
+enum PullPolicy {
+  PULL_POLICY_UNSPECIFIED = 0;
+  PULL_POLICY_IF_NOT_PRESENT = 1;
+  PULL_POLICY_ALWAYS = 2;
+  PULL_POLICY_NEVER = 3;
 }
 
 message CreateSandboxResponse {

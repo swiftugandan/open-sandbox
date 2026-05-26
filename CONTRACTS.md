@@ -4,12 +4,17 @@
 
 ## Status
 
-Current released version: **`contracts/v1.0.1`** on `main`.
-Last freeze tag: **`contracts/v1.0.0-frozen`** (the wire-shape freeze; unchanged in v1.0.1).
+Current released version: **`contracts/v1.0.2`** (uncommitted on `main`; the `contracts/v1.0.2` git tag exists but the implementation lands with this branch).
+Last freeze tag: **`contracts/v1.0.0-frozen`** (the wire-shape freeze; unchanged in v1.0.1 and wire-compatibly extended in v1.0.2).
 
 *v1.0.0 frozen 2026-05-23 (paired with `spec/v1.0.0`). v1.0.1 is on-wire compatible: no proto changes, no new error variants, no constant changes. Changes after the freeze require a `contracts/amendment-<desc>` branch and a version bump for any wire-shape changes.*
 
 v1.0.0 is the first stable contracts release. It was a **breaking** reshape from v0.7: exec moves from a message exchange routed through the control plane (controller's ExecBroker, agent stream ExecCommand/ExecResult, gateway's unary ExecSandbox RPC) to a stream-shaped session on the data plane (proxy's SandboxIoService.OpenIoStream, agent's tunnel multiplex, gateway WebSocket). Architectural-decision record: `EXEC_STREAMING_DESIGN.md`. Historical plan: `PLAN_EXEC_STREAMING.md` (tag `plan/v0.6.3`).
+
+v1.0.2 begins on the tree as the first amendment to v1.0.1, starting with the `pull_policy` field (PLAN_CONTRACTS_v1.0.2.md item #13):
+
+- **`api.PullPolicy` enum** with variants `UNSPECIFIED`, `IF_NOT_PRESENT`, `ALWAYS`, `NEVER`. Wire-compatible addition: new proto3 field on `CreateSandboxRequest` and `SandboxConfig`. Old clients send the zero `UNSPECIFIED`, which the agent's `From<i32> for types::PullPolicy` collapses to `IfNotPresent` — the same behavior new clients get by omitting the field. The JSON API accepts kebab-case strings (`"if-not-present"` / `"always"` / `"never"`) via `#[serde(rename_all = "kebab-case")]`. Forward-compat: unknown wire-i32 values also collapse to `IfNotPresent`.
+- **Default policy = `IfNotPresent`** matches `docker run` semantics: skip the registry round-trip when the image is locally cached. Callers that need to refresh a floating tag like `:latest` on every start must set `pull_policy = "always"`. Air-gapped / strict-pin deployments set `pull_policy = "never"`.
 
 v1.0.1 adds three internal-only improvements on top of the v1.0.0 wire shape (see `CHANGELOG.md` for the operator-facing summary):
 
