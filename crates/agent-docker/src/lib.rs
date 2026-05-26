@@ -32,6 +32,18 @@ const NANOCPUS_PER_MILLICPU: i64 = 1_000_000;
 /// OOMs and tears down every sandbox on the host.
 pub const MAX_READ_BYTES: usize = 256 * 1024 * 1024;
 
+/// Tri-state result of probing whether an image is locally cached.
+/// `Unknown` captures the inspect_image-returned-non-404 case (daemon
+/// flake, schema drift, etc.) where we can't say either way — the
+/// pull/create logic treats Unknown conservatively (will pull on
+/// IfNotPresent; will fail on Never).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    Present,
+    Absent,
+    Unknown,
+}
+
 pub struct DockerRuntime {
     client: bollard::Docker,
 }
@@ -42,17 +54,79 @@ impl DockerRuntime {
         Ok(Self { client })
     }
 
+    /// Pull `image` with bounded exponential backoff. Comp-4: transient
+    /// registry hiccups (rate-limit, 5xx, brief network drops) used to
+    /// abort create_and_start with no signal that the failure was
+    /// retryable; the controller's scheduler then reported FAILED and
+    /// operators thought the image was unreachable.
+    ///
+    /// Called from create_and_start both on cold-cache (inspect_image
+    /// returned 404) and as a fallback when create_container itself
+    /// reports the image missing after a successful inspect (TOCTOU
+    /// prune race, partial layer GC).
+    async fn pull_image_with_retry(&self, image: &str) -> Result<(), AgentError> {
+        const MAX_PULL_ATTEMPTS: u32 = 4;
+        const PULL_BASE_DELAY_MS: u64 = 500;
+        info!(image, "pulling image");
+        let mut last_err: Option<AgentError> = None;
+        for attempt in 1..=MAX_PULL_ATTEMPTS {
+            let result = self
+                .client
+                .create_image(
+                    Some(bollard::image::CreateImageOptions {
+                        from_image: image.to_string(),
+                        ..Default::default()
+                    }),
+                    None,
+                    None,
+                )
+                .try_collect::<Vec<_>>()
+                .await;
+            match result {
+                Ok(_) => {
+                    info!(image, "image pull complete");
+                    return Ok(());
+                }
+                Err(e) if attempt < MAX_PULL_ATTEMPTS => {
+                    let delay_ms = PULL_BASE_DELAY_MS * (1u64 << (attempt - 1));
+                    warn!(
+                        image,
+                        attempt,
+                        max = MAX_PULL_ATTEMPTS,
+                        delay_ms,
+                        error = %e,
+                        "image pull failed; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    last_err = Some(runtime_err(e));
+                }
+                Err(e) => {
+                    last_err = Some(runtime_err(e));
+                }
+            }
+        }
+        Err(last_err.expect("loop exits via Ok or sets last_err on the final attempt"))
+    }
+
     /// Best-effort force-remove used by create_and_start rollback paths.
     /// Comp-4: errors here are logged but never propagated — the caller
     /// surfaces the original failure to the controller.
-    async fn force_remove(&self, container_id: &str) {
+    ///
+    /// `target` accepts either a container id (from `created.id` on
+    /// rollback paths) OR a container name (from `name.as_str()` on
+    /// the 409 name-conflict recovery arm). Docker's HTTP API at
+    /// `/containers/{id}` treats both equivalently — bollard does no
+    /// distinction. We log the value under `target` because either form
+    /// may appear; the older field name `container_id` would mislead
+    /// operators grepping logs by id-shape.
+    async fn force_remove(&self, target: &str) {
         let opts = RemoveContainerOptions {
             force: true,
             v: true,
             ..Default::default()
         };
-        if let Err(e) = self.client.remove_container(container_id, Some(opts)).await {
-            warn!(container_id, error = %e, "rollback remove_container failed");
+        if let Err(e) = self.client.remove_container(target, Some(opts)).await {
+            warn!(target, error = %e, "rollback remove_container failed");
         }
     }
 
@@ -83,111 +157,236 @@ impl ContainerRuntime for DockerRuntime {
         let sandbox_id_str = config.sandbox_id.to_string();
         let name = format!("sandbox-{sandbox_id_str}");
 
-        let port_hint = if config.exposed_port > 0 {
-            Some(format!("{}/tcp", config.exposed_port))
-        } else {
-            None
-        };
+        // v1.0.2: honor caller-supplied pull_policy. Defaults to
+        // IfNotPresent — matches `docker run` semantics, which is also
+        // what the dev fleet measured as the warm-path optimum
+        // (~1.1s p50 saved vs the v1.0.1 always-pull behavior).
+        //
+        // The flow is:
+        //   1. Probe local presence via inspect_image (tri-state:
+        //      Present | Absent | Unknown). Skipped for Always since
+        //      we're going to pull anyway.
+        //   2. Pull (or refuse) per policy.
+        //   3. Attempt create_container. On 404 (TOCTOU prune race or
+        //      partial layer GC under disk pressure), pull and retry
+        //      once unless policy is Never. The retry covers the
+        //      Unknown-presence case too.
+        use open_sandbox_contracts::types::PullPolicy;
+        let policy = config.pull_policy;
 
-        info!(image = %config.image, "pulling image");
-        // Comp-4: bounded retry with exponential backoff. Transient
-        // registry hiccups (rate-limit, 5xx, brief network drops) used
-        // to abort create_and_start with no signal that the failure was
-        // retryable; the controller's scheduler then reported FAILED and
-        // operators thought the image was unreachable.
-        const MAX_PULL_ATTEMPTS: u32 = 4;
-        const PULL_BASE_DELAY_MS: u64 = 500;
-        let mut last_err: Option<AgentError> = None;
-        for attempt in 1..=MAX_PULL_ATTEMPTS {
-            let result = self
-                .client
-                .create_image(
-                    Some(bollard::image::CreateImageOptions {
-                        from_image: config.image.clone(),
-                        ..Default::default()
-                    }),
-                    None,
-                    None,
-                )
-                .try_collect::<Vec<_>>()
-                .await;
-            match result {
-                Ok(_) => {
-                    last_err = None;
-                    break;
-                }
-                Err(e) if attempt < MAX_PULL_ATTEMPTS => {
-                    let delay_ms = PULL_BASE_DELAY_MS * (1u64 << (attempt - 1));
-                    warn!(
-                        image = %config.image,
-                        attempt,
-                        max = MAX_PULL_ATTEMPTS,
-                        delay_ms,
-                        error = %e,
-                        "image pull failed; retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    last_err = Some(runtime_err(e));
-                }
-                Err(e) => {
-                    last_err = Some(runtime_err(e));
+        let presence = match policy {
+            PullPolicy::Always => Presence::Unknown, // unused; we pull unconditionally
+            PullPolicy::IfNotPresent | PullPolicy::Never => {
+                match self.client.inspect_image(&config.image).await {
+                    Ok(_) => Presence::Present,
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => Presence::Absent,
+                    Err(e) => {
+                        warn!(image = %config.image, error = %e, "inspect_image failed");
+                        Presence::Unknown
+                    }
                 }
             }
-        }
-        if let Some(e) = last_err {
-            return Err(e);
-        }
-        info!(image = %config.image, "image pull complete");
+        };
 
-        let docker_config = build_docker_config(&config, &sandbox_id_str);
+        match policy {
+            PullPolicy::Always => {
+                self.pull_image_with_retry(&config.image).await?;
+            }
+            PullPolicy::IfNotPresent => match presence {
+                Presence::Present => {
+                    info!(image = %config.image, "image present locally; skipping pull");
+                }
+                Presence::Absent | Presence::Unknown => {
+                    self.pull_image_with_retry(&config.image).await?;
+                }
+            },
+            PullPolicy::Never => match presence {
+                Presence::Present => {
+                    info!(image = %config.image, "image present locally; pull_policy=never");
+                }
+                Presence::Absent => {
+                    return Err(AgentError::Runtime {
+                        detail: format!(
+                            "image {} not present locally and pull_policy=never",
+                            config.image
+                        ),
+                    });
+                }
+                Presence::Unknown => {
+                    return Err(AgentError::Runtime {
+                        detail: format!(
+                            "could not verify image {} presence and pull_policy=never",
+                            config.image
+                        ),
+                    });
+                }
+            },
+        }
+
+        // v1.0.2 (iter4+iter5): bounded retry loop around create+start
+        // for port-collision recovery. Pre-allocate the host port,
+        // skip inspect_container, and on `start_container` EADDRINUSE
+        // force-remove the orphan + allocate a fresh port + retry.
+        // v1.0.2 (iter6+iter7+iter8): also recovers 404 image-missing
+        // (TOCTOU prune race) and 409 name-conflict (stale orphan from
+        // crashed prior agent) by advancing the outer iteration on
+        // non-final-attempt failure.
+        const MAX_PORT_RETRY_ATTEMPTS: u32 = 3;
         let options = CreateContainerOptions {
             name: name.as_str(),
             platform: None,
         };
 
-        let created = self
-            .client
-            .create_container(Some(options), docker_config)
-            .await
-            .map_err(runtime_err)?;
+        for attempt in 1..=MAX_PORT_RETRY_ATTEMPTS {
+            let final_attempt = attempt == MAX_PORT_RETRY_ATTEMPTS;
+            let host_port_opt = if config.exposed_port > 0 {
+                Some(allocate_free_host_port()?)
+            } else {
+                None
+            };
+            let docker_config = build_docker_config(&config, &sandbox_id_str, host_port_opt);
 
-        // Comp-4: any failure between create_container and the final Ok must
-        // remove the orphaned container, or repeated retries leave dead
-        // entries piling up under the `sandbox-<uuid>` name and a future
-        // recreate hits a name collision.
-        if let Err(e) = self
-            .client
-            .start_container::<String>(&created.id, None)
-            .await
-            .map_err(runtime_err)
-        {
-            self.force_remove(&created.id).await;
-            return Err(e);
+            let created = match self
+                .client
+                .create_container(Some(options.clone()), docker_config.clone())
+                .await
+            {
+                Ok(c) => c,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) if !matches!(policy, PullPolicy::Never) => {
+                    warn!(image = %config.image, "create_container reported image missing; refreshing image and retrying once");
+                    // iter8: pull failure on non-final attempt also
+                    // advances the outer loop rather than propagating.
+                    match self.pull_image_with_retry(&config.image).await {
+                        Ok(()) => {}
+                        Err(e) if !final_attempt => {
+                            warn!(
+                                error = %e,
+                                attempt,
+                                max = MAX_PORT_RETRY_ATTEMPTS,
+                                "pull-recovery exhausted retries; advancing outer port-retry"
+                            );
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    match self
+                        .client
+                        .create_container(Some(options.clone()), docker_config.clone())
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(e) if !final_attempt => {
+                            warn!(
+                                error = %e,
+                                attempt,
+                                max = MAX_PORT_RETRY_ATTEMPTS,
+                                "create_container failed after pull-recovery; advancing outer port-retry"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(final_attempt_err(
+                                "create_container after pull-recovery",
+                                MAX_PORT_RETRY_ATTEMPTS,
+                                e,
+                            ));
+                        }
+                    }
+                }
+                Err(ref e) if is_name_conflict_409(e) => {
+                    warn!(container_name = %name, "create_container reports name in use; force-removing stale container and retrying once");
+                    self.force_remove(name.as_str()).await;
+                    match self
+                        .client
+                        .create_container(Some(options.clone()), docker_config)
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(e) if !final_attempt => {
+                            warn!(
+                                error = %e,
+                                attempt,
+                                max = MAX_PORT_RETRY_ATTEMPTS,
+                                "create_container still failed after 409 force-remove; advancing outer port-retry"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(final_attempt_err(
+                                "create_container after 409 force-remove",
+                                MAX_PORT_RETRY_ATTEMPTS,
+                                e,
+                            ));
+                        }
+                    }
+                }
+                Err(e) => return Err(runtime_err(e)),
+            };
+
+            match self
+                .client
+                .start_container::<String>(&created.id, None)
+                .await
+            {
+                Ok(_) => {
+                    let host_port = host_port_opt.unwrap_or(0);
+                    info!(container_id = %created.id, sandbox_id = %sandbox_id_str, host_port, "container started");
+                    return Ok(ContainerInfo {
+                        id: ContainerId(created.id),
+                        sandbox_id: config.sandbox_id,
+                        host_port,
+                        running: true,
+                    });
+                }
+                Err(e)
+                    if is_port_collision(&e) && host_port_opt.is_some() && !final_attempt =>
+                {
+                    warn!(
+                        host_port = ?host_port_opt,
+                        attempt,
+                        max = MAX_PORT_RETRY_ATTEMPTS,
+                        error = %e,
+                        "port-bind collision; force-removing orphan and retrying with fresh port"
+                    );
+                    self.force_remove(&created.id).await;
+                    // Small deterministic jitter (10–40ms range from
+                    // the sandbox-id first byte) decorrelates retries
+                    // against a sibling cycling the same ephemeral pool.
+                    let jitter_ms = 10
+                        + (sandbox_id_str.as_bytes().first().copied().unwrap_or(0) as u64 % 31);
+                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                    continue;
+                }
+                Err(e) if is_port_collision(&e) && final_attempt => {
+                    warn!(
+                        host_port = ?host_port_opt,
+                        attempt,
+                        max = MAX_PORT_RETRY_ATTEMPTS,
+                        error = %e,
+                        "port-bind collision; giving up after final attempt"
+                    );
+                    self.force_remove(&created.id).await;
+                    return Err(final_attempt_err(
+                        "port-bind collision",
+                        MAX_PORT_RETRY_ATTEMPTS,
+                        e,
+                    ));
+                }
+                Err(e) => {
+                    self.force_remove(&created.id).await;
+                    return Err(runtime_err(e));
+                }
+            }
         }
-
-        let inspect = match self.client.inspect_container(&created.id, None).await {
-            Ok(i) => i,
-            Err(e) => {
-                self.force_remove(&created.id).await;
-                return Err(runtime_err(e));
-            }
-        };
-
-        let host_port = match extract_host_port(&inspect, port_hint.as_deref()) {
-            Ok(p) => p,
-            Err(e) => {
-                self.force_remove(&created.id).await;
-                return Err(e);
-            }
-        };
-        info!(container_id = %created.id, sandbox_id = %sandbox_id_str, host_port, "container started");
-
-        Ok(ContainerInfo {
-            id: ContainerId(created.id),
-            sandbox_id: config.sandbox_id,
-            host_port,
-            running: true,
-        })
+        // The for loop above always returns from one of its arms; this
+        // is unreachable while MAX_PORT_RETRY_ATTEMPTS > 0 (it's a
+        // const = 3).
+        unreachable!("create_and_start retry loop always returns from inside")
     }
 
     async fn stop_and_remove(&self, id: &ContainerId, timeout: Duration) -> Result<(), AgentError> {
@@ -818,13 +1017,62 @@ fn parent_dir(path: &str) -> String {
     }
 }
 
-fn build_docker_config(config: &ContainerConfig, sandbox_id_str: &str) -> Config<String> {
+/// Ask the kernel for a free ephemeral TCP port by binding to :0,
+/// reading the assigned port, and closing the socket. v1.0.2 (iter4):
+/// this replaces the previous `publish_all_ports = true` flow that
+/// required a follow-up `inspect_container` round-trip to discover
+/// which port Docker assigned (~120ms on macOS Docker Desktop, ~5ms
+/// on Linux native). Pre-allocating here lets us pass `port_bindings`
+/// explicitly and skip the inspect entirely.
+///
+/// TOCTOU is inherent: another process can grab the port between
+/// `drop(listener)` and the docker daemon's bind. The caller's
+/// port-collision retry loop (iter5) handles that.
+fn allocate_free_host_port() -> Result<u16, AgentError> {
+    let listener =
+        std::net::TcpListener::bind("0.0.0.0:0").map_err(|e| AgentError::Runtime {
+            detail: format!("could not allocate ephemeral host port: {e}"),
+        })?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| AgentError::Runtime {
+            detail: format!("could not read ephemeral host port: {e}"),
+        })?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+fn build_docker_config(
+    config: &ContainerConfig,
+    sandbox_id_str: &str,
+    host_port: Option<u16>,
+) -> Config<String> {
     let nano_cpus = (config.cpu_limit_millicores as i64) * NANOCPUS_PER_MILLICPU;
+
+    // Explicit host-port binding for the exposed_port — skips the
+    // post-start `inspect_container` round-trip. If exposed_port==0
+    // we omit both `exposed_ports` and `port_bindings`; sandbox is
+    // exec-only and has no host-side mapping.
+    let (exposed_ports, port_bindings) = match (config.exposed_port, host_port) {
+        (0, _) | (_, None) => (None, None),
+        (container_port, Some(hp)) => {
+            let port_key = format!("{container_port}/tcp");
+            let binding = bollard::models::PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some(hp.to_string()),
+            };
+            (
+                Some(HashMap::from([(port_key.clone(), HashMap::new())])),
+                Some(HashMap::from([(port_key, Some(vec![binding]))])),
+            )
+        }
+    };
 
     let host_config = HostConfig {
         memory: Some(config.memory_limit_bytes as i64),
         nano_cpus: Some(nano_cpus),
-        publish_all_ports: Some(true),
+        port_bindings,
         ..Default::default()
     };
 
@@ -843,13 +1091,6 @@ fn build_docker_config(config: &ContainerConfig, sandbox_id_str: &str) -> Config
         (LABEL_SANDBOX_ID.to_string(), sandbox_id_str.to_string()),
     ]);
 
-    let exposed_ports = if config.exposed_port > 0 {
-        let port_key = format!("{}/tcp", config.exposed_port);
-        Some(HashMap::from([(port_key, HashMap::new())]))
-    } else {
-        None
-    };
-
     Config::<String> {
         image: Some(config.image.clone()),
         cmd: Some(
@@ -866,39 +1107,202 @@ fn build_docker_config(config: &ContainerConfig, sandbox_id_str: &str) -> Config
     }
 }
 
-fn extract_host_port(
-    inspect: &bollard::models::ContainerInspectResponse,
-    port_hint: Option<&str>,
-) -> Result<u16, AgentError> {
-    let ports = inspect
-        .network_settings
-        .as_ref()
-        .and_then(|ns| ns.ports.as_ref())
-        .ok_or_else(|| AgentError::Runtime {
-            detail: "no port mappings found".into(),
-        })?;
-
-    let bindings = if let Some(key) = port_hint {
-        ports.get(key).and_then(|b| b.as_ref())
-    } else {
-        ports.values().find_map(|b| b.as_ref())
-    }
-    .ok_or_else(|| AgentError::Runtime {
-        detail: "no port bindings available".into(),
-    })?;
-
-    bindings
-        .first()
-        .and_then(|b| b.host_port.as_ref())
-        .and_then(|p| p.parse::<u16>().ok())
-        .ok_or_else(|| AgentError::Runtime {
-            detail: "could not parse host port".into(),
-        })
-}
-
 fn runtime_err(e: bollard::errors::Error) -> AgentError {
     AgentError::Runtime {
         detail: e.to_string(),
+    }
+}
+
+/// True when a bollard error from `create_container` indicates a
+/// name-conflict 409 — i.e., a container named `sandbox-<uuid>`
+/// already exists on the host (typically a crashed prior agent or a
+/// transient force_remove failure during an earlier port-retry
+/// iteration). Docker's current message format is
+/// `Conflict. The container name "/sandbox-<uuid>" is already in use
+/// by container "..."`; we substring-match the stable "is already in
+/// use" phrase. Extracted into a helper so future docker message
+/// rewordings are caught by the dedicated tests rather than silently
+/// disabling the 409 recovery arm.
+fn is_name_conflict_409(e: &bollard::errors::Error) -> bool {
+    if let bollard::errors::Error::DockerResponseServerError {
+        status_code: 409,
+        message,
+    } = e
+    {
+        message.to_ascii_lowercase().contains("is already in use")
+    } else {
+        false
+    }
+}
+
+/// True when a bollard error from `start_container` indicates the host
+/// port we pre-allocated has been grabbed by another process between
+/// our probe-and-release and docker's bind. Docker surfaces this as
+/// `DockerResponseServerError { status_code: 500 }` with a
+/// driver-specific message — we match the substrings that appear
+/// across all current docker versions:
+///   * libnetwork (default): "bind: address already in use"
+///   * docker-proxy / userland fallback: "Error starting userland proxy: ... bind"
+///   * portallocator: "port is already allocated"
+fn is_port_collision(e: &bollard::errors::Error) -> bool {
+    if let bollard::errors::Error::DockerResponseServerError {
+        status_code: 500,
+        message,
+    } = e
+    {
+        let m = message.to_ascii_lowercase();
+        m.contains("bind: address already in use")
+            || m.contains("port is already allocated")
+            || (m.contains("userland proxy") && m.contains("bind"))
+    } else {
+        false
+    }
+}
+
+/// v1.0.2 (iter9): produce the uniform "exhausted after N attempts"
+/// error that all three create_and_start final-attempt arms emit
+/// (port-collision, 404 pull-recovery, 409 name-conflict). Without a
+/// shared format, operators correlating log-scanner regexes against
+/// different arms would miss one.
+///
+/// Format: `<kind> after <max> attempts: <bollard message>`.
+fn final_attempt_err<E: std::fmt::Display>(kind: &str, max: u32, e: E) -> AgentError {
+    AgentError::Runtime {
+        detail: format!("{kind} after {max} attempts: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod port_collision_tests {
+    use super::*;
+
+    fn err(message: &str) -> bollard::errors::Error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn matches_libnetwork_bind_message() {
+        assert!(is_port_collision(&err(
+            "driver failed programming external connectivity on endpoint sandbox-abc: \
+             Error starting userland proxy: listen tcp4 0.0.0.0:50123: bind: address already in use"
+        )));
+    }
+
+    #[test]
+    fn matches_portallocator_message() {
+        assert!(is_port_collision(&err(
+            "Bind for 0.0.0.0:50123 failed: port is already allocated"
+        )));
+    }
+
+    #[test]
+    fn ignores_unrelated_500() {
+        assert!(!is_port_collision(&err("internal server error")));
+        assert!(!is_port_collision(&err("cgroup mount failed")));
+    }
+
+    #[test]
+    fn ignores_404_image_missing() {
+        let e = bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "no such image: foo:bar".into(),
+        };
+        assert!(!is_port_collision(&e));
+    }
+}
+
+#[cfg(test)]
+mod name_conflict_tests {
+    use super::*;
+
+    fn err(status_code: u16, message: &str) -> bollard::errors::Error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn matches_current_docker_message() {
+        assert!(is_name_conflict_409(&err(
+            409,
+            r#"Conflict. The container name "/sandbox-abc123" is already in use by container "deadbeef"."#
+        )));
+    }
+
+    #[test]
+    fn matches_uppercase_variant() {
+        assert!(is_name_conflict_409(&err(
+            409,
+            r#"CONFLICT. THE CONTAINER NAME "/SANDBOX-ABC123" IS ALREADY IN USE BY CONTAINER "DEADBEEF"."#
+        )));
+    }
+
+    #[test]
+    fn ignores_non_409_status() {
+        assert!(!is_name_conflict_409(&err(
+            500,
+            r#"The container name "/sandbox-abc" is already in use"#
+        )));
+    }
+
+    #[test]
+    fn ignores_409_with_unrelated_message() {
+        assert!(!is_name_conflict_409(&err(
+            409,
+            "Conflict. Volume \"shared\" is mounted by 2 containers"
+        )));
+    }
+
+    #[test]
+    fn ignores_non_docker_response_errors() {
+        let e = bollard::errors::Error::JsonDataError {
+            message: "is already in use".to_string(),
+            column: 0,
+        };
+        assert!(!is_name_conflict_409(&e));
+    }
+}
+
+#[cfg(test)]
+mod final_attempt_err_tests {
+    use super::*;
+
+    #[test]
+    fn uniform_format_across_kinds() {
+        for kind in [
+            "port-bind collision",
+            "create_container after pull-recovery",
+            "create_container after 409 force-remove",
+        ] {
+            let AgentError::Runtime { detail } =
+                final_attempt_err(kind, 3, "underlying-bollard-error")
+            else {
+                panic!("expected Runtime variant");
+            };
+            assert_eq!(
+                detail,
+                format!("{kind} after 3 attempts: underlying-bollard-error"),
+                "format drift would break operator log alerts"
+            );
+        }
+    }
+
+    #[test]
+    fn embeds_bollard_display() {
+        let bollard = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "bind: address already in use".into(),
+        };
+        let AgentError::Runtime { detail } = final_attempt_err("port-bind collision", 3, bollard)
+        else {
+            panic!("expected Runtime variant");
+        };
+        assert!(detail.contains("after 3 attempts:"), "got: {detail}");
+        assert!(detail.contains("bind: address already in use"), "got: {detail}");
     }
 }
 
