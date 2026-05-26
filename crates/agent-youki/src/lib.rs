@@ -129,25 +129,32 @@ impl YoukiRuntime {
 impl ContainerRuntime for YoukiRuntime {
     async fn create_and_start(&self, config: ContainerConfig) -> Result<ContainerInfo, AgentError> {
         // v1.0.2: honor pull_policy. The image_manager's `.complete`
-        // marker already gives us approximate IfNotPresent semantics
-        // (it skips layer fetch when the digest dir exists), but:
-        //   - For `Always`, we must force a re-fetch even if the
-        //     marker is present (floating-tag refresh). image_manager
-        //     does not yet support a force flag; tracked as a youki
-        //     follow-up and currently degrades to IfNotPresent.
-        //   - For `Never`, we must skip the registry round-trip
-        //     entirely and fail if no local digest matches. youki's
-        //     pull_and_unpack always probes the manifest, which is a
-        //     registry hit; until a tag→digest local index lands we
-        //     return Runtime with a clear message rather than silently
-        //     calling pull.
+        // marker gives us IfNotPresent semantics (skip layer fetch when
+        // the digest dir exists); iter12 added a `force` flag for the
+        // Always path so floating tags actually refresh.
+        //   - `IfNotPresent` / default: pull_and_unpack_with(force=false)
+        //     — manifest+config still fetched (we need the digest to
+        //     locate the cache), but layer extraction short-circuits
+        //     on the `.complete` marker.
+        //   - `Always`: pull_and_unpack_with(force=true) — removes the
+        //     marker and re-extracts. Iter12 closes the long-standing
+        //     "Always silently degrades to IfNotPresent" gap.
+        //   - `Never`: skip the registry round-trip entirely and fail
+        //     if no local digest matches. youki's pull_and_unpack
+        //     always probes the manifest, which is a registry hit;
+        //     until a tag→digest local index lands we return Runtime
+        //     with a clear message.
         use open_sandbox_contracts::types::PullPolicy;
         if matches!(config.pull_policy, PullPolicy::Never) {
             return Err(AgentError::Runtime {
                 detail: "pull_policy=never is not yet supported by the youki runtime (no local tag→digest index); use the docker runtime or set IfNotPresent/Always".into(),
             });
         }
-        let rootfs = self.image_manager.pull_and_unpack(&config.image).await?;
+        let force = matches!(config.pull_policy, PullPolicy::Always);
+        let rootfs = self
+            .image_manager
+            .pull_and_unpack_with(&config.image, force)
+            .await?;
         dns::write_resolv_conf(&rootfs).await?;
 
         let host_port = cni::allocate_port()?;

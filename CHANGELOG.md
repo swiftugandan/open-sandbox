@@ -58,12 +58,42 @@ warm-startup-time optimization shipped on this branch (see
   `Never`.
 
 ### Behavior change (YoukiRuntime)
-- Accepts the `pull_policy` field. `IfNotPresent` is the existing
-  behavior (oci-client's `.complete` marker fast path). `Always` is
-  threaded through but currently degrades to `IfNotPresent` (no
-  force-refetch flag in `ImageManager`; tracked as a youki
-  follow-up). `Never` fails fast with a `Runtime` error citing the
-  feature gap.
+- Accepts the `pull_policy` field. `IfNotPresent` (default) is the
+  existing behavior (oci-client's `.complete` marker fast path).
+  `Always` now actually force-refreshes the image (iter12 closes
+  the original "silently degrades to IfNotPresent" gap). `Never`
+  fails fast with a `Runtime` error pending a local tag→digest
+  index — see iter12 below.
+
+  Iter12 splits `ImageManager::pull_and_unpack(&str)` into a
+  public wrapper that delegates to a new
+  `pull_and_unpack_with(&str, force: bool)`:
+  - `force = false`: existing IfNotPresent semantics. Pulls
+    manifest + config (needed to compute the digest), then
+    short-circuits on the `.complete` marker. No layer fetch
+    when cached.
+  - `force = true` (PullPolicy::Always): extracts into a fresh
+    tmp_dir first, THEN (on extract success) evicts the cached
+    `.complete` marker + `rootfs/` directory and atomically
+    swaps the freshly-extracted tmp into place. The order is
+    load-bearing: a force-pull that fails mid-extract leaves
+    the previously-healthy cache intact, preserving the comp-5
+    invariant `marker exists ⇒ rootfs exists`. (An earlier
+    iter12 draft did the eviction upfront — surfaced by
+    iter12's own /code-review as "failed force-pull destroys a
+    healthy cache" — and was reordered before landing.)
+
+  Three unit tests anchor the behavior, all run in the
+  agent-youki dev container against a live alpine:latest pull:
+  - `force_refetch_re_extracts_even_when_cached`: verifies the
+    `.complete` marker mtime advances on a force=true second call.
+  - `default_wrapper_uses_cache`: verifies the public wrapper
+    short-circuits (marker mtime unchanged) so the IfNotPresent
+    semantics are preserved by the convenience entry point.
+  - `failed_force_pull_preserves_cache`: populates the cache,
+    then issues a force-pull against a non-existent registry
+    image; asserts the original alpine cache (marker + rootfs)
+    is intact after the force-pull's Err return.
 
 ### Internal
 - `pull_image_with_retry` extracted from `create_and_start` so the
