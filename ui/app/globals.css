@@ -1,0 +1,44 @@
+@import "tailwindcss";
+@import "@xterm/xterm/css/xterm.css";
+
+@theme {
+  --color-bg: #0b0d10;
+  --color-surface: #11141a;
+  --color-surface-2: #181c24;
+  --color-border: #262c36;
+  --color-border-strong: #364150;
+  --color-fg: #e6e9ef;
+  --color-fg-muted: #8993a4;
+  --color-accent: #7aa2ff;
+  --color-accent-soft: #1e2a4a;
+  --color-ok: #66d29a;
+  --color-warn: #e7b75f;
+  --color-err: #f07178;
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+input, button, textarea, select { font: inherit; color: inherit; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-border-strong); }
+
+.font-mono { font-family: var(--font-mono); }
+
+/* xterm needs a positioned parent to fit correctly */
+.xterm-viewport { background: transparent !important; }

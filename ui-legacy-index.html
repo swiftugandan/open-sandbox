@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>open-sandbox · dev console</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1f262e;
+    --border: #30363d;
+    --fg: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+               font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+           border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: 0.3px; }
+  header .muted { color: var(--muted); font-size: 12px; }
+  header input { background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+                 border-radius: 6px; padding: 5px 8px; font-family: var(--mono); font-size: 12px; min-width: 220px; }
+  header .spacer { flex: 1; }
+  header .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  header .status-dot.ok { background: var(--ok); }
+  header .status-dot.err { background: var(--err); }
+  main { display: grid; grid-template-columns: 360px minmax(0, 1fr); height: calc(100vh - 49px); }
+  #left { border-right: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; }
+  #create-box { padding: 12px; border-bottom: 1px solid var(--border); }
+  #create-box input { width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+                      border-radius: 6px; padding: 6px 8px; font-family: var(--mono); font-size: 12px; margin-bottom: 8px; }
+  button { background: var(--accent); color: #0a0c10; border: 0; border-radius: 6px;
+           padding: 6px 12px; font-weight: 600; cursor: pointer; font-size: 12px; }
+  button:hover { filter: brightness(1.08); }
+  button.secondary { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); }
+  button.danger { background: transparent; color: var(--err); border: 1px solid var(--border); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #sandbox-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+  .sandbox-row { display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+                 border-left: 3px solid transparent; cursor: pointer; }
+  .sandbox-row:hover { background: var(--panel-2); }
+  .sandbox-row.selected { background: var(--panel-2); border-left-color: var(--accent); }
+  .sandbox-row .id { font-family: var(--mono); font-size: 11px; color: var(--fg); }
+  .sandbox-row .meta { font-size: 11px; color: var(--muted); }
+  .badge { font-size: 10px; padding: 2px 6px; border-radius: 10px; background: var(--panel-2); color: var(--muted);
+           text-transform: uppercase; font-weight: 600; letter-spacing: 0.4px; }
+  .badge.running { color: var(--ok); border: 1px solid #1e3a26; background: #0d2417; }
+  .badge.creating { color: var(--warn); border: 1px solid #3a2e0c; background: #241c0d; }
+  .badge.failed, .badge.stopped, .badge.gone { color: var(--err); border: 1px solid #3a1818; background: #241010; }
+  #right { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+  #empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 13px; }
+  #tabbar { display: none; gap: 0; border-bottom: 1px solid var(--border); background: var(--panel); }
+  .tab { padding: 8px 16px; font-size: 12px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; }
+  .tab.active { color: var(--fg); border-bottom-color: var(--accent); background: var(--bg); }
+  #panels { flex: 1; min-height: 0; min-width: 0; display: none; flex-direction: column; }
+  .panel { display: none; width: 100%; min-width: 0; min-height: 0; flex-direction: column; flex: 1; }
+  .panel.active { display: flex; }
+  /* Exec panel */
+  #exec-toolbar { display: flex; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--panel); align-items: center; }
+  #exec-toolbar input { flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+                        border-radius: 6px; padding: 6px 10px; font-family: var(--mono); font-size: 12px; }
+  #exec-toolbar .ws-state { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  #term { flex: 1; min-height: 0; padding: 8px 0 0 8px; background: #000; overflow: hidden; }
+  /* Files panel */
+  #files-panel { padding: 16px; gap: 16px; overflow: auto; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 16px; }
+  .card h3 { margin: 0 0 10px 0; font-size: 13px; color: var(--fg); }
+  .card .row { display: flex; gap: 8px; margin-bottom: 8px; }
+  .card input, .card textarea { flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+                                 border-radius: 6px; padding: 6px 10px; font-family: var(--mono); font-size: 12px; }
+  .card textarea { min-height: 120px; resize: vertical; }
+  .out { background: #0a0c10; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+         font-family: var(--mono); font-size: 12px; color: var(--fg); white-space: pre-wrap; max-height: 240px; overflow: auto; }
+  .out.empty { color: var(--muted); font-style: italic; }
+  .err-line { color: var(--err); }
+  .ok-line { color: var(--ok); }
+  /* Info panel */
+  #info-panel { padding: 16px; overflow: auto; }
+  pre { font-family: var(--mono); font-size: 12px; background: var(--panel); border: 1px solid var(--border);
+        border-radius: 6px; padding: 12px; overflow: auto; color: var(--fg); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>open-sandbox</h1>
+  <span class="muted">dev console</span>
+  <span class="muted">·</span>
+  <span class="muted">API</span>
+  <input id="api-base" value="http://127.0.0.1:8081" spellcheck="false">
+  <span class="muted">Bearer</span>
+  <input id="api-key" type="password" value="dev-api-key" spellcheck="false">
+  <span class="spacer"></span>
+  <span id="conn-dot" class="status-dot"></span>
+  <span id="conn-text" class="muted">connecting…</span>
+</header>
+
+<main>
+  <section id="left">
+    <div id="create-box">
+      <input id="img" value="alpine:3.21" placeholder="image (e.g. alpine:3.21)">
+      <div style="display:flex; gap:8px;">
+        <button id="create-btn">Create sandbox</button>
+        <button id="refresh-btn" class="secondary">Refresh</button>
+      </div>
+    </div>
+    <div id="sandbox-list"></div>
+  </section>
+
+  <section id="right">
+    <div id="empty">Select a sandbox on the left, or create one to start.</div>
+
+    <div id="tabbar">
+      <div class="tab active" data-panel="exec-panel">Exec</div>
+      <div class="tab" data-panel="files-panel">Files</div>
+      <div class="tab" data-panel="info-panel">Info</div>
+    </div>
+
+    <div id="panels">
+      <div class="panel active" id="exec-panel">
+        <div id="exec-toolbar">
+          <input id="cmd-input" placeholder='command (e.g. sh -c "uname -a; echo hello")' value='sh -c "uname -a && echo hello"'>
+          <button id="run-btn">Run</button>
+          <button id="kill-btn" class="danger" disabled>SIGTERM</button>
+          <span class="ws-state" id="ws-state">idle</span>
+        </div>
+        <div id="term"></div>
+      </div>
+
+      <div class="panel" id="files-panel">
+        <div class="card">
+          <h3>Read file</h3>
+          <div class="row">
+            <input id="read-path" placeholder="/etc/os-release" value="/etc/os-release">
+            <button id="read-btn">Read</button>
+          </div>
+          <div id="read-out" class="out empty">(no read yet)</div>
+        </div>
+        <div class="card">
+          <h3>Write file</h3>
+          <div class="row">
+            <input id="write-path" placeholder="/tmp/hello.txt" value="/tmp/hello.txt">
+          </div>
+          <div class="row">
+            <textarea id="write-content" placeholder="file contents...">hello from the dev console
+</textarea>
+          </div>
+          <div class="row" style="justify-content:flex-end;">
+            <button id="write-btn">Write</button>
+          </div>
+          <div id="write-out" class="out empty">(no write yet)</div>
+        </div>
+      </div>
+
+      <div class="panel" id="info-panel">
+        <pre id="info-json">(no sandbox selected)</pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script>
+/* ============================================================
+ *  Minimal protobuf-3 encoder/decoder — only the bits we need.
+ *  Wire types: 0 = varint, 2 = length-delimited.
+ * ============================================================ */
+const PB = (() => {
+  function encVarint(n, out) {
+    n = BigInt(n);
+    while (n > 127n) { out.push(Number((n & 0x7Fn) | 0x80n)); n >>= 7n; }
+    out.push(Number(n));
+  }
+  function decVarint(buf, pos) {
+    let n = 0n, shift = 0n;
+    while (true) {
+      const b = buf[pos++];
+      n |= BigInt(b & 0x7F) << shift;
+      if ((b & 0x80) === 0) break;
+      shift += 7n;
+    }
+    return [n, pos];
+  }
+  function tag(field, wire) { return (field << 3) | wire; }
+  function encString(field, s, out) {
+    out.push(tag(field, 2));
+    const bytes = new TextEncoder().encode(s);
+    encVarint(bytes.length, out);
+    for (const b of bytes) out.push(b);
+  }
+  function encBytes(field, bytes, out) {
+    out.push(tag(field, 2));
+    encVarint(bytes.length, out);
+    for (const b of bytes) out.push(b);
+  }
+  function encMessage(field, inner, out) {
+    out.push(tag(field, 2));
+    encVarint(inner.length, out);
+    for (const b of inner) out.push(b);
+  }
+  function encInt32(field, n, out) {
+    out.push(tag(field, 0));
+    // proto3 int32: treat negatives as 10-byte sign-extended varint, but we only need positives.
+    encVarint(n < 0 ? (BigInt.asUintN(64, BigInt(n))) : n, out);
+  }
+
+  // IoStart { sandbox_id=1 string, oneof params { ExecParams exec=2, ReadFileParams read_file=3, WriteFileParams write_file=4, WriteFilesTargzParams write_files_targz=5 } }
+  // ExecParams { command=1 repeated string, cwd=2 string, env=3 map<string,string> }
+  function encodeIoStart_Exec(sandboxId, command, cwd, env) {
+    const exec = [];
+    for (const arg of command) encString(1, arg, exec);
+    if (cwd) encString(2, cwd, exec);
+    if (env) {
+      for (const [k, v] of Object.entries(env)) {
+        const entry = [];
+        encString(1, k, entry);
+        encString(2, v, entry);
+        encMessage(3, entry, exec);
+      }
+    }
+    const ioStart = [];
+    encString(1, sandboxId, ioStart);
+    encMessage(2, exec, ioStart);
+    return new Uint8Array(ioStart);
+  }
+
+  // IoSignal { signum=1 uint32 }  → varint
+  function encodeIoSignal(signum) {
+    const out = [];
+    out.push(tag(1, 0));
+    encVarint(signum, out);
+    return new Uint8Array(out);
+  }
+
+  /* ----- server frame decoders ----- */
+  function parseFields(buf) {
+    // returns { fieldNum: [values...] } — values are {wire, bytes|number}
+    const map = {};
+    let pos = 0;
+    while (pos < buf.length) {
+      const [tagN, p1] = decVarint(buf, pos);
+      pos = p1;
+      const tagNum = Number(tagN);
+      const field = tagNum >> 3;
+      const wire = tagNum & 7;
+      let val;
+      if (wire === 0) {
+        const [v, p2] = decVarint(buf, pos); pos = p2;
+        val = { wire, num: Number(v), big: v };
+      } else if (wire === 2) {
+        const [lenB, p2] = decVarint(buf, pos); pos = p2;
+        const len = Number(lenB);
+        val = { wire, bytes: buf.subarray(pos, pos + len) };
+        pos += len;
+      } else {
+        throw new Error('unsupported wire type ' + wire);
+      }
+      (map[field] ||= []).push(val);
+    }
+    return map;
+  }
+  function decString(b) { return new TextDecoder().decode(b); }
+
+  // IoStarted { exec_id=1 string, in_container_pid=2 int32 }
+  function decodeIoStarted(buf) {
+    const f = parseFields(buf);
+    // proto int32 stored as varint; negatives would come as full uint64 bits, but PIDs are positive.
+    let pid = 0;
+    if (f[2]) {
+      const v = f[2][0];
+      // signed int32 from varint: if high bit set in 64-bit form, sign-extend
+      pid = Number(BigInt.asIntN(32, v.big));
+    }
+    return { exec_id: f[1] ? decString(f[1][0].bytes) : '', in_container_pid: pid };
+  }
+  // IoExited { exit_code=1 int32, command_not_found=2 bool }
+  function decodeIoExited(buf) {
+    const f = parseFields(buf);
+    let exit = 0;
+    if (f[1]) exit = Number(BigInt.asIntN(32, f[1][0].big));
+    const cnf = f[2] ? !!f[2][0].num : false;
+    return { exit_code: exit, command_not_found: cnf };
+  }
+  // IoError { code=1 string, detail=2 string }
+  function decodeIoError(buf) {
+    const f = parseFields(buf);
+    return {
+      code: f[1] ? decString(f[1][0].bytes) : '',
+      detail: f[2] ? decString(f[2][0].bytes) : '',
+    };
+  }
+
+  return { encodeIoStart_Exec, encodeIoSignal, decodeIoStarted, decodeIoExited, decodeIoError };
+})();
+
+/* ============================================================
+ *  Frame envelope: [1 byte kind][payload]
+ * ============================================================ */
+const KIND = {
+  START: 0x00, STDIN: 0x01, SIGNAL: 0x02, STDIN_EOF: 0x03,
+  STDOUT: 0x11, STDERR: 0x12, EXITED: 0x13, ERROR: 0x14, STARTED: 0x15,
+};
+function frame(kind, payload) {
+  const out = new Uint8Array(1 + (payload ? payload.length : 0));
+  out[0] = kind;
+  if (payload) out.set(payload, 1);
+  return out;
+}
+
+/* ============================================================
+ *  REST helpers
+ * ============================================================ */
+function apiBase() { return document.getElementById('api-base').value.replace(/\/$/, ''); }
+function apiKey()  { return document.getElementById('api-key').value; }
+function wsBase()  {
+  const b = apiBase();
+  // Match case-insensitively so `HTTPS://...` is rewritten to `wss://...`.
+  return b.replace(/^https?/i, m => m.toLowerCase() === 'https' ? 'wss' : 'ws');
+}
+// base64url-no-padding — keeps the API key inside the RFC 7230 token
+// grammar that browsers enforce on `Sec-WebSocket-Protocol` values.
+function b64urlKey() {
+  const bytes = new TextEncoder().encode(apiKey());
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+// Must match WS_AUTH_PROTOCOL_SENTINEL in crates/contracts/src/constants.rs.
+const WS_AUTH_SENTINEL = 'open-sandbox.v1';
+async function api(path, opts = {}) {
+  const r = await fetch(apiBase() + path, {
+    ...opts,
+    headers: {
+      'Authorization': 'Bearer ' + apiKey(),
+      ...(opts.body && !opts.headers?.['Content-Type'] ? { 'Content-Type': 'application/json' } : {}),
+      ...(opts.headers || {}),
+    },
+  });
+  return r;
+}
+
+/* ============================================================
+ *  Sandbox list
+ * ============================================================ */
+let sandboxes = [];
+let selectedId = null;
+let pollTimer = null;
+
+async function refreshList() {
+  const dot = document.getElementById('conn-dot');
+  const txt = document.getElementById('conn-text');
+  try {
+    const r = await api('/v1/sandboxes');
+    if (!r.ok) {
+      dot.className = 'status-dot err';
+      txt.textContent = 'auth?  HTTP ' + r.status;
+      return;
+    }
+    const data = await r.json();
+    sandboxes = data.sandboxes || [];
+    dot.className = 'status-dot ok';
+    txt.textContent = `connected · ${sandboxes.length} sandbox(es)`;
+    renderList();
+  } catch (e) {
+    dot.className = 'status-dot err';
+    txt.textContent = 'unreachable';
+  }
+}
+
+function renderList() {
+  const root = document.getElementById('sandbox-list');
+  root.innerHTML = '';
+  if (sandboxes.length === 0) {
+    const empty = document.createElement('div');
+    empty.style.padding = '20px';
+    empty.style.color = 'var(--muted)';
+    empty.style.fontSize = '12px';
+    empty.textContent = 'no sandboxes yet';
+    root.appendChild(empty);
+    return;
+  }
+  for (const sb of sandboxes) {
+    const row = document.createElement('div');
+    row.className = 'sandbox-row' + (sb.sandbox_id === selectedId ? ' selected' : '');
+    row.onclick = () => selectSandbox(sb.sandbox_id);
+    row.innerHTML = `
+      <div style="flex:1; min-width:0;">
+        <div class="id" title="${sb.sandbox_id}">${sb.sandbox_id.slice(0, 8)}…${sb.sandbox_id.slice(-4)}</div>
+        <div class="meta">agent ${sb.agent_id.slice(0, 8)} · ${sb.subdomain}</div>
+      </div>
+      <span class="badge ${sb.status}">${sb.status}</span>
+    `;
+    const del = document.createElement('button');
+    del.className = 'danger';
+    del.textContent = '×';
+    del.title = 'Delete';
+    del.onclick = (ev) => { ev.stopPropagation(); deleteSandbox(sb.sandbox_id); };
+    row.appendChild(del);
+    root.appendChild(row);
+  }
+}
+
+async function createSandbox() {
+  const image = document.getElementById('img').value.trim();
+  if (!image) return;
+  const btn = document.getElementById('create-btn');
+  btn.disabled = true;
+  try {
+    const r = await api('/v1/sandboxes', { method: 'POST', body: JSON.stringify({ image }) });
+    const txt = await r.text();
+    if (!r.ok) { alert('create failed: ' + txt); return; }
+    const data = JSON.parse(txt);
+    await refreshList();
+    selectSandbox(data.sandbox_id);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function deleteSandbox(id) {
+  if (!confirm('Delete sandbox ' + id.slice(0, 8) + '?')) return;
+  await api('/v1/sandboxes/' + id, { method: 'DELETE' });
+  if (selectedId === id) { selectedId = null; renderRight(); }
+  await refreshList();
+}
+
+function selectSandbox(id) {
+  if (selectedId !== id) {
+    closeWS();
+  }
+  selectedId = id;
+  renderList();
+  renderRight();
+}
+
+function renderRight() {
+  document.getElementById('empty').style.display = selectedId ? 'none' : 'flex';
+  document.getElementById('tabbar').style.display = selectedId ? 'flex' : 'none';
+  document.getElementById('panels').style.display = selectedId ? 'flex' : 'none';
+  if (selectedId) {
+    const sb = sandboxes.find(s => s.sandbox_id === selectedId);
+    document.getElementById('info-json').textContent = JSON.stringify(sb, null, 2);
+    // size terminal once visible
+    setTimeout(() => fit && fit.fit(), 30);
+  }
+}
+
+/* ============================================================
+ *  Tabs
+ * ============================================================ */
+document.querySelectorAll('.tab').forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById(t.dataset.panel).classList.add('active');
+    if (t.dataset.panel === 'exec-panel') setTimeout(() => fit && fit.fit(), 30);
+  };
+});
+
+/* ============================================================
+ *  xterm.js terminal
+ * ============================================================ */
+const term = new Terminal({
+  fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+  fontSize: 13,
+  theme: { background: '#000000', foreground: '#c9d1d9', cursor: '#58a6ff' },
+  convertEol: true,
+  cursorBlink: true,
+});
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit);
+term.open(document.getElementById('term'));
+setTimeout(() => fit.fit(), 50);
+window.addEventListener('resize', () => fit.fit());
+
+/* ============================================================
+ *  Exec session (WebSocket)
+ * ============================================================ */
+let ws = null;
+let wsAlive = false;
+
+function setWsState(s, color) {
+  const el = document.getElementById('ws-state');
+  el.textContent = s;
+  el.style.color = color || 'var(--muted)';
+}
+
+function closeWS() {
+  if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+  wsAlive = false;
+  document.getElementById('kill-btn').disabled = true;
+  document.getElementById('run-btn').disabled = false;
+  setWsState('idle');
+}
+
+function parseCommand(str) {
+  // very small shell-like splitter: handles single + double quotes, no escapes.
+  // Tracks `started` so that an explicit empty quoted argument (`sh -c ""`)
+  // still emits an empty string rather than being silently dropped.
+  const out = []; let cur = ''; let started = false; let quote = null;
+  const flush = () => { if (started) { out.push(cur); cur = ''; started = false; } };
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (quote) {
+      if (c === quote) { quote = null; }
+      else { cur += c; }
+    } else if (c === '"' || c === "'") {
+      quote = c; started = true;
+    } else if (/\s/.test(c)) {
+      flush();
+    } else {
+      cur += c; started = true;
+    }
+  }
+  flush();
+  return out;
+}
+
+function runExec() {
+  if (!selectedId) return;
+  if (ws) closeWS();
+  const cmdStr = document.getElementById('cmd-input').value.trim();
+  if (!cmdStr) return;
+  if (!apiKey()) {
+    // Don't construct `bearer.` (empty suffix) as a credential; surface
+    // the misconfiguration immediately rather than letting the WS
+    // handshake fail with a generic 401.
+    term.writeln('\x1b[31mAPI key is empty — enter a Bearer token in the header bar.\x1b[0m');
+    return;
+  }
+  const argv = parseCommand(cmdStr);
+  term.writeln('\x1b[90m$ ' + argv.join(' ') + '\x1b[0m');
+
+  const url = wsBase() + '/v1/sandboxes/' + selectedId + '/exec';
+  // Browsers can't set Authorization on WebSocket. We offer two subprotocols:
+  //   - `open-sandbox.v1` (the sentinel the server echoes back)
+  //   - `bearer.<base64url(key)>` (the credential — never echoed)
+  // base64url-no-padding keeps the value inside the RFC 7230 token grammar
+  // that `new WebSocket()` enforces on subprotocol entries.
+  try {
+    ws = new WebSocket(url, [WS_AUTH_SENTINEL, 'bearer.' + b64urlKey()]);
+  } catch (e) {
+    term.writeln('\x1b[31mws ctor failed: ' + e.message + '\x1b[0m');
+    return;
+  }
+  ws.binaryType = 'arraybuffer';
+  setWsState('connecting', 'var(--warn)');
+
+  ws.onopen = () => {
+    wsAlive = true;
+    setWsState('connected', 'var(--ok)');
+    document.getElementById('kill-btn').disabled = false;
+    document.getElementById('run-btn').disabled = true;
+    // Send IoStart
+    const payload = PB.encodeIoStart_Exec(selectedId, argv, '', null);
+    ws.send(frame(KIND.START, payload));
+  };
+  ws.onmessage = (ev) => {
+    const buf = new Uint8Array(ev.data);
+    if (buf.length < 1) return;
+    const kind = buf[0];
+    const body = buf.subarray(1);
+    switch (kind) {
+      case KIND.STARTED: {
+        const s = PB.decodeIoStarted(body);
+        term.writeln('\x1b[90mstarted exec_id=' + s.exec_id + ' pid=' + s.in_container_pid + '\x1b[0m');
+        break;
+      }
+      case KIND.STDOUT:
+        term.write(body);
+        break;
+      case KIND.STDERR:
+        term.write('\x1b[31m');
+        term.write(body);
+        term.write('\x1b[0m');
+        break;
+      case KIND.EXITED: {
+        const e = PB.decodeIoExited(body);
+        const col = e.exit_code === 0 ? '32' : '31';
+        const cnf = e.command_not_found ? ' (command not found)' : '';
+        term.writeln('\r\n\x1b[' + col + 'mexited ' + e.exit_code + cnf + '\x1b[0m');
+        break;
+      }
+      case KIND.ERROR: {
+        const e = PB.decodeIoError(body);
+        term.writeln('\r\n\x1b[31m[' + e.code + '] ' + e.detail + '\x1b[0m');
+        break;
+      }
+      default:
+        term.writeln('\x1b[33m(unknown frame kind 0x' + kind.toString(16) + ')\x1b[0m');
+    }
+  };
+  ws.onclose = (ev) => {
+    setWsState('closed' + (ev.code ? ' ' + ev.code : ''));
+    if (ev.code === 4401 || ev.code === 1006) {
+      term.writeln('\x1b[31m(ws closed ' + ev.code + ' ' + (ev.reason || '') + ')\x1b[0m');
+    } else if (ev.reason) {
+      term.writeln('\x1b[90m(' + ev.reason + ')\x1b[0m');
+    }
+    closeWS();
+  };
+  ws.onerror = () => {
+    setWsState('error', 'var(--err)');
+  };
+}
+
+// Send stdin from the terminal to the WS.
+term.onData(data => {
+  if (ws && wsAlive) {
+    const enc = new TextEncoder().encode(data);
+    ws.send(frame(KIND.STDIN, enc));
+  }
+});
+
+document.getElementById('run-btn').onclick = runExec;
+document.getElementById('cmd-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); runExec(); }
+});
+document.getElementById('kill-btn').onclick = () => {
+  if (!ws || !wsAlive) return;
+  ws.send(frame(KIND.SIGNAL, PB.encodeIoSignal(15)));
+};
+
+/* ============================================================
+ *  Files panel
+ * ============================================================ */
+document.getElementById('read-btn').onclick = async () => {
+  if (!selectedId) return;
+  const path = document.getElementById('read-path').value.trim();
+  const out = document.getElementById('read-out');
+  out.className = 'out';
+  out.textContent = 'reading…';
+  try {
+    const r = await api('/v1/sandboxes/' + selectedId + '/files/read?path=' + encodeURIComponent(path));
+    const ct = r.headers.get('content-type') || '';
+    if (!r.ok) {
+      const t = await r.text();
+      out.textContent = 'HTTP ' + r.status + '\n' + t;
+      out.className = 'out err-line';
+      return;
+    }
+    const buf = new Uint8Array(await r.arrayBuffer());
+    // Try UTF-8 decode; fall back to hex preview.
+    try {
+      const txt = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+      out.textContent = txt || '(empty file)';
+    } catch (_) {
+      out.textContent = '(' + buf.length + ' bytes binary)';
+    }
+  } catch (e) {
+    out.textContent = e.message;
+    out.className = 'out err-line';
+  }
+};
+document.getElementById('write-btn').onclick = async () => {
+  if (!selectedId) return;
+  const path = document.getElementById('write-path').value.trim();
+  const content = document.getElementById('write-content').value;
+  const out = document.getElementById('write-out');
+  out.className = 'out';
+  out.textContent = 'writing…';
+  try {
+    const r = await api('/v1/sandboxes/' + selectedId + '/files/write_file', {
+      method: 'POST',
+      body: JSON.stringify({ path, content }),
+    });
+    const t = await r.text();
+    if (!r.ok) {
+      out.textContent = 'HTTP ' + r.status + '\n' + t;
+      out.className = 'out err-line';
+    } else {
+      out.textContent = t;
+      out.className = 'out ok-line';
+    }
+  } catch (e) {
+    out.textContent = e.message;
+    out.className = 'out err-line';
+  }
+};
+
+/* ============================================================
+ *  Boot
+ * ============================================================ */
+document.getElementById('create-btn').onclick = createSandbox;
+document.getElementById('refresh-btn').onclick = refreshList;
+document.getElementById('api-base').addEventListener('change', refreshList);
+document.getElementById('api-key').addEventListener('change', refreshList);
+refreshList();
+pollTimer = setInterval(refreshList, 3000);
+</script>
+</body>
+</html>
