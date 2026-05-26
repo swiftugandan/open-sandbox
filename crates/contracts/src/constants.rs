@@ -17,18 +17,27 @@ pub const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 pub const SANDBOX_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// v1.0.2 (iter11): upper bound on a single `ContainerRuntime::
-/// create_and_start` call. Set above the worst-case retry budget
-/// the agent's docker runtime can hit under sustained registry
-/// pressure (3 outer port-retry × 4 pull-attempt × ~7.5s of
-/// backoff = ~90s) — but the deadline gives operators a clear
-/// fail-loud upper bound rather than relying on every call site
-/// to enforce its own. On expiry the agent returns
-/// `AgentError::Runtime { detail: "create_and_start deadline
-/// exceeded ..." }`; a partial container (if any) is cleaned up
-/// by the next agent-side reconcile sweep. Caller-supplied
-/// deadlines (e.g. a tonic-propagated gRPC deadline) are a
-/// future iteration's work; for now the const is a static cap.
+/// v1.0.2 (iter11): operator-facing upper bound on a single
+/// `ContainerRuntime::create_and_start` call, enforced uniformly
+/// across all runtimes by `SandboxManager::start_sandbox`'s
+/// `tokio::time::timeout` wrap. Intentionally set BELOW the docker
+/// runtime's theoretical worst-case retry budget (3 outer
+/// port-retry × 4 pull-attempt × ~7.5s of backoff ≈ 90s): the
+/// agent fails loud rather than letting an outlier camp on a
+/// thread for the full retry ceiling. The trade-off: a legitimate
+/// slow operation past 60s (e.g. a multi-GB cold pull on a slow
+/// link) gets killed; raise this constant if your fleet
+/// regularly pulls images larger than ~150 MB on first start.
+///
+/// On expiry the agent returns
+/// `AgentError::Runtime { detail: "create_and_start deadline of
+/// 60s exceeded ..." }`. If `create_container` succeeded but
+/// `start_container` was mid-flight when the timeout fired, the
+/// partially-created docker container leaks until the agent
+/// process restarts — `SandboxManager::reconcile` exists but is
+/// not yet periodically invoked. Caller-supplied deadlines (e.g.
+/// a tonic-propagated gRPC deadline) and a periodic reconcile
+/// task are both follow-ups.
 pub const SANDBOX_CREATE_DEADLINE: Duration = Duration::from_secs(60);
 
 pub const DEFAULT_SANDBOX_CPU_MILLICORES: u32 = 1000;

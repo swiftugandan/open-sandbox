@@ -52,7 +52,48 @@ impl<R: ContainerRuntime> SandboxManager<R> {
             pull_policy: open_sandbox_contracts::types::PullPolicy::from(config.pull_policy),
         };
 
-        match self.runtime.create_and_start(container_config).await {
+        // v1.0.2 (iter11): bound the runtime's create_and_start by
+        // `SANDBOX_CREATE_DEADLINE`. The wrap lives here in
+        // SandboxManager rather than inside each ContainerRuntime
+        // impl so DockerRuntime and YoukiRuntime are bounded
+        // uniformly (production uses youki per ADR-009; without this
+        // hoist the deadline only applied to the dev/docker path).
+        // The DockerRuntime's worst-case retry budget is documented
+        // in `pull_image_with_retry` + the port-retry loop (~90s of
+        // sleeps + RTTs under sustained registry pressure); the
+        // 60s ceiling intentionally fails loud BELOW that budget so
+        // an outlier doesn't camp on an agent thread for the full
+        // worst case. On expiry the partially-created container (if
+        // create_container succeeded but start_container was
+        // mid-flight) leaks until the agent process restarts — a
+        // periodic agent-side reconcile-and-cleanup is a separate
+        // follow-up (`SandboxManager::reconcile` exists but has no
+        // periodic caller today).
+        let deadline = open_sandbox_contracts::constants::SANDBOX_CREATE_DEADLINE;
+        let sandbox_id_for_err = sandbox_id.clone();
+        let runtime_result = match tokio::time::timeout(
+            deadline,
+            self.runtime.create_and_start(container_config),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(
+                    sandbox_id = %sandbox_id_for_err,
+                    deadline_secs = deadline.as_secs(),
+                    "create_and_start deadline exceeded; partial container (if any) leaks until reconcile sweep is wired"
+                );
+                Err(AgentError::Runtime {
+                    detail: format!(
+                        "create_and_start deadline of {}s exceeded for sandbox {sandbox_id_for_err}",
+                        deadline.as_secs()
+                    ),
+                })
+            }
+        };
+
+        match runtime_result {
             Ok(info) => {
                 info!(sandbox_id = %sandbox_id, host_port = info.host_port, "sandbox started");
                 let entry = SandboxEntry {
@@ -172,6 +213,7 @@ impl<R: ContainerRuntime> SandboxManager<R> {
 mod tests {
     use super::*;
     use crate::testutil::*;
+    use std::time::Duration;
 
     fn stop_cmd(sandbox_id: &SandboxId, timeout_secs: u32) -> StopSandbox {
         StopSandbox {
@@ -233,6 +275,62 @@ mod tests {
         // subsequent stop/get observes the terminal state.
         let entry = manager.sandboxes.lock().unwrap().get(&sandbox_id).cloned();
         assert_eq!(entry.map(|e| e.state), Some(SandboxState::Failed));
+    }
+
+    /// v1.0.2 (iter11): anchors the operator-facing deadline-exceeded
+    /// error message format so a future refactor can't silently drift
+    /// log-scanner regexes / dashboards. The actual deadline value is
+    /// the const `SANDBOX_CREATE_DEADLINE = 60s`; with paused time we
+    /// advance virtual time past it without real wall-clock delay.
+    #[tokio::test(start_paused = true)]
+    async fn start_sandbox_deadline_exceeded_returns_anchored_error() {
+        let deadline = open_sandbox_contracts::constants::SANDBOX_CREATE_DEADLINE;
+        // Runtime sleeps for 2× the deadline so the timeout always fires.
+        let runtime = Arc::new(SlowContainerRuntime {
+            sleep: deadline * 2,
+        });
+        let manager = SandboxManager::new(runtime);
+        let sandbox_id = SandboxId::new();
+
+        let err = manager
+            .start_sandbox(start_cmd(&sandbox_id, "nginx:latest"))
+            .await
+            .expect_err("expected timeout error");
+        let detail = err.to_string();
+        // Format is "create_and_start deadline of {N}s exceeded for sandbox {uuid}".
+        assert!(
+            detail.contains("create_and_start deadline of"),
+            "format drift would break operator alerts; got: {detail}"
+        );
+        assert!(
+            detail.contains(&format!("{}s exceeded", deadline.as_secs())),
+            "deadline-secs must be in the error; got: {detail}"
+        );
+        assert!(
+            detail.contains(&sandbox_id.to_string()),
+            "sandbox_id must be in the error for log correlation; got: {detail}"
+        );
+        // Failed-state accounting still applies.
+        let entry = manager.sandboxes.lock().unwrap().get(&sandbox_id).cloned();
+        assert_eq!(entry.map(|e| e.state), Some(SandboxState::Failed));
+    }
+
+    /// Happy path: runtime returns Ok well before the deadline; no
+    /// timeout interference. Pinned alongside the deadline test so
+    /// future deadline changes can't accidentally break the success
+    /// path.
+    #[tokio::test(start_paused = true)]
+    async fn start_sandbox_runtime_within_deadline_succeeds() {
+        let runtime = Arc::new(SlowContainerRuntime {
+            sleep: Duration::from_millis(50),
+        });
+        let manager = SandboxManager::new(runtime);
+        let sandbox_id = SandboxId::new();
+        let state = manager
+            .start_sandbox(start_cmd(&sandbox_id, "nginx:latest"))
+            .await
+            .expect("should succeed within deadline");
+        assert_eq!(state, SandboxState::Running);
     }
 
     #[tokio::test]

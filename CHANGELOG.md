@@ -186,6 +186,29 @@ warm-startup-time optimization shipped on this branch (see
     warn log field follows, removing the misleading semantics on
     the 409-recovery call site which passes a container *name*
     rather than an id.
+
+  * Iter11: deadline propagation, enforced uniformly at the
+    `SandboxManager::start_sandbox` layer (NOT inside each
+    `ContainerRuntime` impl) so both DockerRuntime AND YoukiRuntime
+    are bounded by the same `SANDBOX_CREATE_DEADLINE` constant.
+    Production runs youki per ADR-009; pinning the deadline at the
+    runtime-impl level would have left production uncapped.
+    `SANDBOX_CREATE_DEADLINE = 60s` is intentionally BELOW the
+    docker runtime's worst-case retry budget (~90s under sustained
+    registry pressure: 3 outer port-retry × 4 pull-attempt × ~7.5s
+    of backoff): fail loud rather than letting an outlier camp on a
+    thread for the full ceiling. On expiry the agent returns
+    `AgentError::Runtime { detail: "create_and_start deadline of
+    60s exceeded for sandbox <uuid>" }`; if `create_container`
+    succeeded but `start_container` was mid-flight when the future
+    was dropped, the partial docker container leaks until the agent
+    process restarts — `SandboxManager::reconcile` exists but is
+    not yet periodically invoked. Two anchor tests pin the
+    operator-facing error format using `tokio::test(start_paused =
+    true)` + a `SlowContainerRuntime` mock, so future refactors
+    can't silently drift log-scanner regexes. Caller-supplied
+    deadlines (e.g. propagating a tonic gRPC request deadline) and
+    a periodic reconcile-cleanup task are both follow-ups.
 - `extract_host_port` and its supporting code paths are deleted — no
   remaining callers.
 

@@ -375,6 +375,89 @@ impl ContainerRuntime for FailingContainerRuntime {
     }
 }
 
+/// v1.0.2 (iter11): runtime mock whose `create_and_start` sleeps for
+/// a configurable duration before returning Ok. Used with
+/// `tokio::test(start_paused = true)` to deterministically trip the
+/// `SandboxManager::start_sandbox` deadline wrap without real time
+/// elapsing. The other trait methods delegate to noop stubs.
+pub struct SlowContainerRuntime {
+    pub sleep: Duration,
+}
+
+impl ContainerRuntime for SlowContainerRuntime {
+    async fn create_and_start(
+        &self,
+        config: ContainerConfig,
+    ) -> Result<ContainerInfo, AgentError> {
+        tokio::time::sleep(self.sleep).await;
+        Ok(ContainerInfo {
+            id: ContainerId(format!("slow-{}", config.sandbox_id)),
+            sandbox_id: config.sandbox_id,
+            host_port: 9000,
+            running: true,
+        })
+    }
+
+    async fn stop_and_remove(
+        &self,
+        _id: &ContainerId,
+        _timeout: Duration,
+    ) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    async fn list_sandbox_containers(&self) -> Result<Vec<ContainerInfo>, AgentError> {
+        Ok(Vec::new())
+    }
+
+    async fn start_exec(
+        &self,
+        _id: &ContainerId,
+        _start: ExecStart,
+    ) -> Result<ExecHandle, AgentError> {
+        Err(AgentError::Runtime {
+            detail: "slow runtime mock: start_exec unimplemented".into(),
+        })
+    }
+
+    async fn signal_exec(
+        &self,
+        _id: &ContainerId,
+        _in_container_pid: i32,
+        _signum: i32,
+    ) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    async fn read_file(
+        &self,
+        _id: &ContainerId,
+        _path: &str,
+        _cwd: Option<&str>,
+    ) -> Result<Bytes, AgentError> {
+        Ok(Bytes::new())
+    }
+
+    async fn write_file(
+        &self,
+        _id: &ContainerId,
+        _path: &str,
+        _cwd: Option<&str>,
+        _content: Bytes,
+    ) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    async fn write_files_targz(
+        &self,
+        _id: &ContainerId,
+        _cwd: Option<&str>,
+        _tarball: Bytes,
+    ) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
 pub struct MockHttpClient {
     response: ForwardResponse,
     called: AtomicUsize,
