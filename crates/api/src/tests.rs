@@ -21,6 +21,7 @@ const TEST_API_KEY: &str = "test-secret-1234";
 
 struct MockService {
     sandbox: SandboxInfo,
+    last_pull_policy: std::sync::Mutex<Option<open_sandbox_contracts::types::PullPolicy>>,
 }
 
 impl MockService {
@@ -35,12 +36,14 @@ impl MockService {
                 status: "running".into(),
                 error: None,
             },
+            last_pull_policy: std::sync::Mutex::new(None),
         }
     }
 }
 
 impl SandboxService for MockService {
-    async fn create(&self, _request: CreateRequest) -> Result<SandboxInfo, ApiError> {
+    async fn create(&self, request: CreateRequest) -> Result<SandboxInfo, ApiError> {
+        *self.last_pull_policy.lock().unwrap() = Some(request.pull_policy);
         Ok(self.sandbox.clone())
     }
 
@@ -264,4 +267,59 @@ async fn write_file_rejects_both_content_and_content_b64() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
     assert_eq!(body["error_code"], "INVALID_REQUEST");
+}
+
+#[tokio::test]
+async fn create_sandbox_default_pull_policy_is_if_not_present() {
+    use open_sandbox_contracts::types::PullPolicy;
+    let (svc, app) = build_app().await;
+    let req = json_request(
+        "POST",
+        "/v1/sandboxes",
+        serde_json::json!({"image": "nginx:alpine"}),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        *svc.last_pull_policy.lock().unwrap(),
+        Some(PullPolicy::IfNotPresent),
+        "omitting pull_policy must default to IfNotPresent so old clients keep the current optimized warm path"
+    );
+}
+
+#[tokio::test]
+async fn create_sandbox_accepts_kebab_case_pull_policy_always() {
+    use open_sandbox_contracts::types::PullPolicy;
+    let (svc, app) = build_app().await;
+    let req = json_request(
+        "POST",
+        "/v1/sandboxes",
+        serde_json::json!({"image": "myorg/app:latest", "pull_policy": "always"}),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        *svc.last_pull_policy.lock().unwrap(),
+        Some(PullPolicy::Always),
+        "pull_policy=always opts back into the v1.0.1 always-pull behavior for floating tags"
+    );
+}
+
+#[tokio::test]
+async fn create_sandbox_rejects_unknown_pull_policy() {
+    let (_svc, app) = build_app().await;
+    let req = json_request(
+        "POST",
+        "/v1/sandboxes",
+        serde_json::json!({"image": "x", "pull_policy": "yolo"}),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    // serde rejects unknown enum variants → axum surfaces as 400/422.
+    // Either is acceptable; the key contract is "not 201 Created".
+    assert!(
+        resp.status() == StatusCode::BAD_REQUEST
+            || resp.status() == StatusCode::UNPROCESSABLE_ENTITY,
+        "expected 400/422 for unknown pull_policy variant, got {}",
+        resp.status()
+    );
 }

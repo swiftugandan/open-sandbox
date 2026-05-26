@@ -210,6 +210,7 @@ mod tests {
             memory_limit_bytes: 256 * 1024 * 1024,
             env_vars: HashMap::from([("FOO".into(), "bar".into())]),
             exposed_port: 8080,
+            pull_policy: open_sandbox_contracts::types::PullPolicy::IfNotPresent,
         }
     }
 

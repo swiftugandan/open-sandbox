@@ -914,6 +914,7 @@ mod tests {
             memory_limit_bytes: 512 * 1024 * 1024,
             env_vars: HashMap::new(),
             exposed_port: 80,
+            pull_policy: open_sandbox_contracts::types::PullPolicy::IfNotPresent,
         }
     }
 
@@ -980,6 +981,7 @@ mod tests {
             memory_limit_bytes: 256 * 1024 * 1024,
             env_vars: HashMap::from([("TEST_VAR".into(), "test_value".into())]),
             exposed_port: 80,
+            pull_policy: open_sandbox_contracts::types::PullPolicy::IfNotPresent,
         };
 
         let info = runtime.create_and_start(config).await.unwrap();

@@ -55,6 +55,17 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
             req.exposed_port
         };
 
+        // v1.0.2 (iter10): fail-closed at the wire boundary. A newer
+        // client carrying a stricter PullPolicy variant we don't know
+        // about must NOT be silently downgraded to IfNotPresent —
+        // that would defeat the air-gap guarantee for callers who set
+        // Never. The agent (downstream of this validation) continues
+        // to use the lossy `From<i32>` for defense-in-depth.
+        let pull_policy = open_sandbox_contracts::types::PullPolicy::from_wire_i32_strict(
+            req.pull_policy,
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
         let assignment = self
             .controller
             .create_sandbox(InternalCreateRequest {
@@ -66,6 +77,7 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
                 },
                 env_vars: req.env_vars,
                 exposed_port,
+                pull_policy,
             })
             .await
             .map_err(|e| controller_error_to_status(&e))?;

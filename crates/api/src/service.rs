@@ -30,6 +30,13 @@ pub struct CreateRequest {
     pub env_vars: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub exposed_port: u32,
+    /// v1.0.2: how the agent runtime should treat the image cache.
+    /// Defaults to `IfNotPresent` (skip the registry round-trip when
+    /// the image is locally cached — matches `docker run` semantics).
+    /// Set `"always"` for floating tags that must refresh on every
+    /// start; `"never"` for air-gapped strict-pin deployments.
+    #[serde(default)]
+    pub pull_policy: open_sandbox_contracts::types::PullPolicy,
 }
 
 fn default_cpu() -> u32 {

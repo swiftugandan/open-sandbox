@@ -223,6 +223,7 @@ async fn live_sandbox_creation() {
             },
             env_vars: std::collections::HashMap::new(),
             exposed_port: 8080,
+            pull_policy: Default::default(),
         })
         .await
         .unwrap();

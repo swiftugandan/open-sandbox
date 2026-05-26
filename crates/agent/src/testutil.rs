@@ -422,6 +422,10 @@ pub fn start_cmd(sandbox_id: &SandboxId, image: &str) -> StartSandbox {
             memory_limit_bytes: 512_000_000,
             env_vars: HashMap::new(),
             exposed_port: 8080,
+            // v1.0.2: proto3 default 0 == UNSPECIFIED, which the
+            // agent collapses to IfNotPresent — same wire shape an
+            // older client (that doesn't know the field) sends.
+            pull_policy: 0,
         }),
     }
 }

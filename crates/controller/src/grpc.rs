@@ -295,6 +295,9 @@ pub struct CreateSandboxRequest {
     pub requirements: SandboxRequirements,
     pub env_vars: std::collections::HashMap<String, String>,
     pub exposed_port: u32,
+    /// v1.0.2: propagated end-to-end from CreateSandboxRequest on the
+    /// API gateway through to the agent's `StartSandbox` payload.
+    pub pull_policy: open_sandbox_contracts::types::PullPolicy,
 }
 
 pub struct Controller<S: ControllerStore> {
@@ -345,6 +348,7 @@ impl<S: ControllerStore + 'static> Controller<S> {
                     memory_limit_bytes: request.requirements.memory_bytes,
                     env_vars: request.env_vars,
                     exposed_port: request.exposed_port,
+                    pull_policy: request.pull_policy.to_wire() as i32,
                 }),
             })),
         };
@@ -615,6 +619,7 @@ mod tests {
                 },
                 env_vars: std::collections::HashMap::new(),
                 exposed_port: 8080,
+                pull_policy: Default::default(),
             })
             .await
             .unwrap();
@@ -856,6 +861,7 @@ mod tests {
                 },
                 env_vars: std::collections::HashMap::new(),
                 exposed_port: 8080,
+                pull_policy: Default::default(),
             })
             .await;
 

@@ -49,6 +49,7 @@ impl<R: ContainerRuntime> SandboxManager<R> {
             memory_limit_bytes: config.memory_limit_bytes,
             env_vars: config.env_vars,
             exposed_port: config.exposed_port,
+            pull_policy: open_sandbox_contracts::types::PullPolicy::from(config.pull_policy),
         };
 
         match self.runtime.create_and_start(container_config).await {

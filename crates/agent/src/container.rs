@@ -21,6 +21,9 @@ pub struct ContainerConfig {
     pub memory_limit_bytes: u64,
     pub env_vars: HashMap<String, String>,
     pub exposed_port: u32,
+    /// v1.0.2: caller-supplied image-cache policy. See
+    /// `open_sandbox_contracts::types::PullPolicy`.
+    pub pull_policy: open_sandbox_contracts::types::PullPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
