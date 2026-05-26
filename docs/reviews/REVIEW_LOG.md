@@ -1,11 +1,21 @@
 # Code Review Log
 
-Cross-session log for the component-by-component review pass described in `CODE_REVIEW_PLAN.md`. Anchored at `contracts/v1.0.1`.
+> **⚠️ Review pass complete — historical findings record.**
+>
+> Pass anchored at `contracts/v1.0.1`; all ten component slots (0–9) closed with fixes
+> landed on `main`. Deferred contract-change candidates cascaded into the v1.0.2
+> amendment (`docs/plans/PLAN_CONTRACTS_v1.0.2.md`) — item #13 shipped 2026-05-26
+> (commits `9341a62..bd414f6`); items #1–#12 are pending a separate session.
+> Cross-component and spike-invariant findings were either closed inline or moved
+> to `docs/reviews/NEEDS_HUMAN_ATTENTION.md` for decisions. This file is the per-finding
+> reference; consult it when investigating a fix's history.
+
+Cross-session log for the component-by-component review pass described in `../plans/CODE_REVIEW_PLAN.md`. Anchored at `contracts/v1.0.1`.
 
 Findings are grouped by category:
-- **Deferred contract-change candidates** — fixes that would alter `proto/` or `crates/contracts`; held until end-of-pass, then triaged into a potential `contracts/v1.0.2` cycle.
+- **Deferred contract-change candidates** — fixes that would alter `proto/` or `crates/contracts`; held until end-of-pass, then triaged into the `contracts/v1.0.2` cycle (`../plans/PLAN_CONTRACTS_v1.0.2.md`).
 - **Cross-component findings** — bugs in a downstream crate surfaced during another crate's review.
-- **Spike-invariant violations** — code that contradicts a confirmed spike conclusion in `EXEC_STREAMING_DESIGN.md`.
+- **Spike-invariant violations** — code that contradicts a confirmed spike conclusion in `../design/EXEC_STREAMING_DESIGN.md`.
 
 Format per entry: `## [comp-N · severity] short title` with `Source`, `File`, `Summary`, `Failure scenario`, `Status`.
 

@@ -4,7 +4,7 @@
 
 ## Status
 
-Current released version: **`contracts/v1.0.2`** on `main` (item #13 landed in commits `9341a62`..`bd414f6`; items #1-#12 from `PLAN_CONTRACTS_v1.0.2.md` are still pending and would ship in a separate v1.0.2-completion session).
+Current released version: **`contracts/v1.0.2`** on `main` (item #13 landed in commits `9341a62`..`bd414f6`; items #1-#12 from [`docs/plans/PLAN_CONTRACTS_v1.0.2.md`](docs/plans/PLAN_CONTRACTS_v1.0.2.md) are still pending and would ship in a separate v1.0.2-completion session).
 Last freeze tag: **`contracts/v1.0.0-frozen`** (the wire-shape freeze; unchanged in v1.0.1 and wire-compatibly extended in v1.0.2).
 The `contracts/v1.0.2` git tag itself currently points at `0e68177` (predating the #13 landing) and should be moved when #1-#12 ship.
 
@@ -12,7 +12,7 @@ The `contracts/v1.0.2` git tag itself currently points at `0e68177` (predating t
 
 v1.0.0 is the first stable contracts release. It was a **breaking** reshape from v0.7: exec moves from a message exchange routed through the control plane (controller's ExecBroker, agent stream ExecCommand/ExecResult, gateway's unary ExecSandbox RPC) to a stream-shaped session on the data plane (proxy's SandboxIoService.OpenIoStream, agent's tunnel multiplex, gateway WebSocket). Architectural-decision record: `EXEC_STREAMING_DESIGN.md`. Historical plan: `PLAN_EXEC_STREAMING.md` (tag `plan/v0.6.3`).
 
-v1.0.2 begins on the tree as the first amendment to v1.0.1, starting with the `pull_policy` field (PLAN_CONTRACTS_v1.0.2.md item #13):
+v1.0.2 begins on the tree as the first amendment to v1.0.1, starting with the `pull_policy` field ([`docs/plans/PLAN_CONTRACTS_v1.0.2.md`](docs/plans/PLAN_CONTRACTS_v1.0.2.md) item #13):
 
 - **`api.PullPolicy` enum** with variants `UNSPECIFIED`, `IF_NOT_PRESENT`, `ALWAYS`, `NEVER`. Wire-compatible addition: new proto3 field on `CreateSandboxRequest` and `SandboxConfig`. Old clients send the zero `UNSPECIFIED`, which `from_wire` collapses to `IfNotPresent` — the same behavior new clients get by omitting the field. The JSON API accepts kebab-case strings (`"if-not-present"` / `"always"` / `"never"`) via `#[serde(rename_all = "kebab-case")]`. **Unknown wire-i32 values are rejected at the controller's management endpoint** with `Status::InvalidArgument` → HTTP 400 (via `PullPolicy::from_wire_i32_strict`), so a future stricter-than-`Never` variant from a newer client doesn't silently downgrade to `IfNotPresent` and defeat the air-gap guarantee. The lossy `From<i32>` is preserved downstream of the controller (e.g. in the agent's `sandbox.rs`) as defense-in-depth, since the controller has already validated.
 - **Default policy = `IfNotPresent`** matches `docker run` semantics: skip the registry round-trip when the image is locally cached. Callers that need to refresh a floating tag like `:latest` on every start must set `pull_policy = "always"`. Air-gapped / strict-pin deployments set `pull_policy = "never"`.

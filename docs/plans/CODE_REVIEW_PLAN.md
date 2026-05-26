@@ -1,10 +1,22 @@
 # Component Code-Review Plan
 
+> **⚠️ Pass complete — process reference + progress record.**
+>
+> All ten component slots (0–9) shipped fixes that landed on `main`. Contract-touching
+> findings cascaded into `docs/plans/PLAN_CONTRACTS_v1.0.2.md` (item #13 shipped
+> 2026-05-26; items #1–#12 pending). Per-component findings live in
+> `docs/reviews/REVIEW_LOG.md`; open decisions surfaced during the pass live in
+> `docs/reviews/NEEDS_HUMAN_ATTENTION.md`.
+>
+> The mechanics + per-component checklist below are still the canonical playbook
+> for future review passes. The "Progress tracking" table is a historical record
+> of the v1.0.1-anchored pass.
+
 A cross-session plan for running `/code-review` over the system one component at a time while holding `proto/*.proto` + `crates/contracts` frozen as the anchor.
 
 ## Guiding constraint
 
-`proto/*.proto` and `crates/contracts` are **frozen** for the duration of this pass at `contracts/v1.0.1`. Any finding that would require a contract change is **logged, not applied** — contract drift invalidates every other component's review. If a contract change becomes unavoidable, halt the pass, re-tag, and re-plan.
+`proto/*.proto` and `crates/contracts` were **frozen** for the duration of this pass at `contracts/v1.0.1`. Any finding that would require a contract change was **logged, not applied** — contract drift would invalidate every other component's review.
 
 ## Mechanics
 

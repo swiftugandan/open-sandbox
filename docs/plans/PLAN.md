@@ -265,10 +265,10 @@ Amended with ops-resilience-observability-api-feedback module. Tagged `plan/v0.5
 Released as `contracts/v1.0.0-frozen` (paired with `spec/v1.0.0`),
 then `contracts/v1.0.1` follow-ups on `main`.
 
-- **Architectural record:** [`EXEC_STREAMING_DESIGN.md`](./EXEC_STREAMING_DESIGN.md)
+- **Architectural record:** [`EXEC_STREAMING_DESIGN.md`](../design/EXEC_STREAMING_DESIGN.md)
 - **Historical plan:** [`PLAN_EXEC_STREAMING.md`](./PLAN_EXEC_STREAMING.md) (`plan/v0.6.3`)
 - **Per-sub-module tags:** `module/exec-streaming-{1..7}-*/{red,green,refactored,e2e-mock,live-verified,done}`
-- **v1.0.1 follow-ups:** see `FOLLOWUPS_v1.0.1.md`
+- **v1.0.1 follow-ups:** see [`../reviews/FOLLOWUPS_v1.0.1.md`](../reviews/FOLLOWUPS_v1.0.1.md)
   - `module/v1.0.1-ws-read-file/done` — streaming WS `/files/read-stream`
   - `module/v1.0.1-two-listener-proxy/done` — split OpenTunnel / OpenIoStream listeners
   - `module/v1.0.1-youki-setns-file-ops/done` — `setns(2)` file ops, no in-container binaries

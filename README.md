@@ -30,13 +30,13 @@ BYO devs ──install──► [Agent on their machine]               │
 
 **Container runtime:** [youki](https://github.com/youki-dev/youki)/libcontainer in-process for production (zero daemon overhead, ~250 MB savings per VM vs the Docker daemon). Docker Engine runtime available as a development fallback on macOS.
 
-**Streaming exec:** sandbox stdin/stdout/stderr ride a stream-shaped session on the proxy's data plane (`SandboxIoService.OpenIoStream`), exposed to clients as WebSocket (`WS /v1/sandboxes/{id}/exec`). The connection IS the lifetime — closing the WebSocket sends `SIGTERM` + 5s grace + `SIGKILL`. See [`EXEC_STREAMING_DESIGN.md`](EXEC_STREAMING_DESIGN.md) for the ADR.
+**Streaming exec:** sandbox stdin/stdout/stderr ride a stream-shaped session on the proxy's data plane (`SandboxIoService.OpenIoStream`), exposed to clients as WebSocket (`WS /v1/sandboxes/{id}/exec`). The connection IS the lifetime — closing the WebSocket sends `SIGTERM` + 5s grace + `SIGKILL`. See [`docs/design/EXEC_STREAMING_DESIGN.md`](docs/design/EXEC_STREAMING_DESIGN.md) for the ADR.
 
 ## Status
 
 - **Frozen wire shape:** `contracts/v1.0.0-frozen` (2026-05-23)
-- **Current released contracts:** `contracts/v1.0.1`
-- **In-progress on `main`:** `contracts/v1.0.2` amendment, item #13 landed (`PullPolicy` + warm-startup optimization arc — see [`CHANGELOG.md`](CHANGELOG.md))
+- **Current contracts version on `main`:** `contracts/v1.0.2` — item #13 (`PullPolicy` + warm-startup optimization arc) shipped 2026-05-26; items #1–#12 pending a separate session (see [`docs/plans/PLAN_CONTRACTS_v1.0.2.md`](docs/plans/PLAN_CONTRACTS_v1.0.2.md))
+- **Tag note:** the `contracts/v1.0.2` git tag points at the initial v1.0.2 commit (`0e68177`, pre-#13); tag movement deferred until #1–#12 ship
 - 86 macOS unit tests + 31 Linux youki tests green on `main`
 
 ## Repository layout
@@ -55,8 +55,10 @@ BYO devs ──install──► [Agent on their machine]               │
 | `crates/cli/` | The `open-sandbox` binary — bundles all subcommands |
 | `infra/` | Pulumi stack (TypeScript) and end-to-end shell scenarios |
 | `spikes/` | Time-boxed investigations with `RESULT.md` write-ups |
-| `SPEC.md`, `SAD.md`, `PLAN.md` | Functional spec, architecture doc, decomposition plan |
-| `CONTRACTS.md` | Prose companion to the contracts crate |
+| `SPEC.md`, `SAD.md`, `CONTRACTS.md` | Functional spec, architecture doc, contracts prose |
+| `docs/plans/` | Decomposition + amendment plans (PLAN, PLAN_EXEC_STREAMING, PLAN_CONTRACTS_v1.0.2, CODE_REVIEW_PLAN) |
+| `docs/design/` | Architectural decision records (EXEC_STREAMING_DESIGN) |
+| `docs/reviews/` | Review log, follow-ups, open questions |
 
 ## Quick start
 
@@ -118,7 +120,7 @@ Single Pulumi stack provisions controller VM + worker VMs + DNS + TLS cert. Cost
 
 ## Engineering discipline
 
-This repo follows a strict spec → architecture → contracts → decomposition → per-module TDD flow. See [`ENGINEERING_DISCIPLINE.md`](ENGINEERING_DISCIPLINE.md) for the rules, and [`PLAN.md`](PLAN.md) for the binary-decomposition DAG. Every module has a `module/<name>/{red,green,refactored,e2e-mock,live-verified}` tag trail:
+This repo follows a strict spec → architecture → contracts → decomposition → per-module TDD flow. See [`ENGINEERING_DISCIPLINE.md`](ENGINEERING_DISCIPLINE.md) for the rules, and [`docs/plans/PLAN.md`](docs/plans/PLAN.md) for the binary-decomposition DAG. Every module has a `module/<name>/{red,green,refactored,e2e-mock,live-verified}` tag trail:
 
 ```sh
 git tag --list 'module/*' | grep 'live-verified'   # what's live-verified
@@ -131,7 +133,7 @@ git tag --list 'module/*' | grep 'live-verified'   # what's live-verified
 3. [`SAD.md`](SAD.md) — 30k-ft → 10k-ft → per-component zoom
 4. [`CONTRACTS.md`](CONTRACTS.md) — wire types + cross-cutting policies
 5. [`CHANGELOG.md`](CHANGELOG.md) — what's changed in each contracts version
-6. [`EXEC_STREAMING_DESIGN.md`](EXEC_STREAMING_DESIGN.md) — the v1.0 ADR for the exec/file-ops data plane
+6. [`docs/design/EXEC_STREAMING_DESIGN.md`](docs/design/EXEC_STREAMING_DESIGN.md) — the v1.0 ADR for the exec/file-ops data plane
 7. [`infra/e2e/scenarios/`](infra/e2e/scenarios/) — runnable end-to-end scenarios
 
 ## License
