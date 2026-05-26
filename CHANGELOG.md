@@ -15,8 +15,13 @@ warm-startup-time optimization shipped on this branch (see
   **`SandboxConfig.pull_policy`** (controller.proto): new enum
   `PullPolicy { UNSPECIFIED, IF_NOT_PRESENT, ALWAYS, NEVER }`. JSON
   API accepts kebab-case: `"if-not-present"` (default), `"always"`,
-  `"never"`. Unknown wire-i32 values collapse to `IfNotPresent` for
-  forward-compat.
+  `"never"`. Unknown wire-i32 values are **rejected at the
+  controller's management endpoint** with `Status::InvalidArgument`
+  → HTTP 400 (see the iter10 entry below for the fail-closed
+  rationale: silently collapsing a future stricter-than-`Never`
+  variant to `IfNotPresent` would defeat the air-gap guarantee).
+  Downstream of that wire boundary the agent uses a lossy `From<i32>`
+  as defense-in-depth, since the controller has already validated.
 - **`open_sandbox_contracts::types::PullPolicy`**: rust-side newtype
   with serde derive, defaulting to `IfNotPresent` when the JSON field
   is omitted. From/To conversions to the prost-generated wire enum.

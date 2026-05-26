@@ -147,7 +147,7 @@ impl ContainerRuntime for YoukiRuntime {
         use open_sandbox_contracts::types::PullPolicy;
         if matches!(config.pull_policy, PullPolicy::Never) {
             return Err(AgentError::Runtime {
-                detail: "pull_policy=never is not yet supported by the youki runtime (no local tag→digest index); use the docker runtime or set IfNotPresent/Always".into(),
+                detail: "pull_policy=never is not yet supported by the youki runtime: youki's image_manager always probes the manifest before deciding to extract, so it cannot satisfy the no-registry-contact contract Never requires. A future iteration adds a local tag→digest index that lets Never resolve without a manifest probe. Until then, set IfNotPresent or Always.".into(),
             });
         }
         let force = matches!(config.pull_policy, PullPolicy::Always);

@@ -7,9 +7,14 @@ contracts crate frozen at `v1.0.1` cannot fix without a bump. This document is
 the amendment plan — what changes, what cascades downstream, and how to ship
 the cycle without breaking the existing-on-`main` system.
 
-User decided "Schedule v1.0.2 now" in the comp-blitz round (2026-05-25). This
-plan is the next session's starting point; implementation is **not yet on the
-tree** — `main` still anchors on `contracts/v1.0.1`.
+User decided "Schedule v1.0.2 now" in the comp-blitz round (2026-05-25).
+**Update 2026-05-26: item #13 (PullPolicy + strict wire decode + warm-path
+startup optimization arc) landed on `main` in 5 commits (`9341a62` →
+`bd414f6`). Items #1-#12 from the table below are still pending — they're
+unrelated to the startup-time work and would be a separate v1.0.2-completion
+session. The `contracts/v1.0.2` git tag (currently at `0e68177`, predating
+the PullPolicy amendment) should be moved or re-issued when the rest of
+v1.0.2 lands. See CHANGELOG.md for the operator-facing summary of #13.**
 
 ## Scope (the 10 findings)
 
