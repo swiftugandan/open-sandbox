@@ -1,12 +1,26 @@
 # Implementation Plan
 
+> **⚠️ Mostly shipped — historical reference + structural map.**
+>
+> This document was the executable plan written at `contracts/v0.3.0-frozen`
+> and drove the original binary decomposition. Every binary listed below
+> has shipped to `main`; the v1.0 streaming-exec reshape (see
+> `EXEC_STREAMING_DESIGN.md` + `PLAN_EXEC_STREAMING.md`) and the v1.0.1 /
+> v1.0.2-#13 amendments have layered on top. The structural map (the DAG
+> + the per-binary acceptance criteria) is still useful as a high-level
+> reference. Do NOT treat the prerequisite checkboxes as live state —
+> see `CONTRACTS.md` for the current contracts version.
+>
+> If you're planning a *new* binary or a *new* amendment, draft a fresh
+> plan document. Operator-facing changelog: `CHANGELOG.md`.
+
 > Decomposition of the system into binaries. Each binary depends only on the frozen contracts crate and on lower-level binaries through their published contracts. This is what makes "one binary at a time, protected by contracts" actually work.
 
-## Prerequisites
+## Prerequisites (historical — original plan; current contracts version is `v1.0.2`)
 
 - [x] `contracts/v0.3.0-frozen` tag exists
 - [x] `SPEC.md`, `SAD.md`, `CONTRACTS.md` are committed and tagged
-- [ ] Final confidence gate (below) is "high"
+- [x] Final confidence gate (below) was "high" — plan executed
 
 ## Dependency DAG
 
