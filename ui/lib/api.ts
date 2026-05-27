@@ -97,6 +97,14 @@ export const api = {
     }),
   remove: (cfg: ApiConfig, id: string) =>
     request<void>(cfg, `/v1/sandboxes/${id}`, { method: "DELETE" }),
+  pause: (cfg: ApiConfig, id: string) =>
+    request<{ status: string }>(cfg, `/v1/sandboxes/${id}/pause`, {
+      method: "POST",
+    }),
+  unpause: (cfg: ApiConfig, id: string) =>
+    request<{ status: string }>(cfg, `/v1/sandboxes/${id}/unpause`, {
+      method: "POST",
+    }),
   readFile: async (cfg: ApiConfig, id: string, path: string) => {
     const r = await fetch(
       trimBase(cfg.base) +

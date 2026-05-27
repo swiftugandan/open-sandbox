@@ -78,6 +78,14 @@ pub enum ApiError {
     #[error("file not found: {resolved_path}")]
     FileNotFound { resolved_path: String },
 
+    /// v1.0.2 (cascade-fix #5): the requested lifecycle transition is
+    /// not valid from the sandbox's current state — e.g. pause on a
+    /// stopped sandbox, unpause on a running sandbox that wasn't
+    /// previously paused. Maps to HTTP 409 Conflict so clients can
+    /// distinguish a precondition failure from an internal error.
+    #[error("invalid state transition: {detail}")]
+    InvalidState { detail: String },
+
     #[error("internal error: {detail}")]
     Internal { detail: String },
 }
@@ -99,6 +107,7 @@ impl ApiError {
             ApiError::IoStreamFailed { .. } => "IO_STREAM_FAILED",
             ApiError::SandboxGone { .. } => "SANDBOX_GONE",
             ApiError::FileNotFound { .. } => "FILE_NOT_FOUND",
+            ApiError::InvalidState { .. } => "INVALID_STATE",
             ApiError::Internal { .. } => "INTERNAL_ERROR",
         }
     }

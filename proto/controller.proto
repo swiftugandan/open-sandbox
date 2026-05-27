@@ -33,6 +33,10 @@ message ControllerCommand {
     StopSandbox stop_sandbox = 4;
     // Field 5 was ExecCommand in v0.x; removed in v1.0.
     FetchLogsCommand fetch_logs = 5;
+    // v1.0.2: pause / resume the in-container processes without
+    // destroying the container, tunnel, or exec registry state.
+    PauseSandbox pause_sandbox = 6;
+    UnpauseSandbox unpause_sandbox = 7;
   }
 }
 
@@ -83,6 +87,15 @@ enum SandboxState {
   SANDBOX_STATE_STOPPING = 3;
   SANDBOX_STATE_STOPPED = 4;
   SANDBOX_STATE_FAILED = 5;
+  // v1.0.2: transitional and steady-state pause states. PAUSING is
+  // optimistic — set by the controller the moment it dispatches a
+  // PauseSandbox command; the agent's SandboxStatus reply flips it
+  // to PAUSED. Old clients (proto3 unknown variants are preserved as
+  // the integer value) round-trip these as the int even if they
+  // don't pattern-match on them.
+  SANDBOX_STATE_PAUSING = 6;
+  SANDBOX_STATE_PAUSED = 7;
+  SANDBOX_STATE_UNPAUSING = 8;
 }
 
 message ResourceReport {
@@ -112,6 +125,18 @@ message SandboxConfig {
 message StopSandbox {
   string sandbox_id = 1;
   uint32 timeout_seconds = 2;
+}
+
+// v1.0.2: gateway → controller → agent. The agent calls the runtime
+// backend's pause primitive and reports SandboxStatus(PAUSED) on
+// success. No timeout — pause is a synchronous cgroup/Docker
+// operation that completes in milliseconds.
+message PauseSandbox {
+  string sandbox_id = 1;
+}
+
+message UnpauseSandbox {
+  string sandbox_id = 1;
 }
 
 message FetchLogsCommand {

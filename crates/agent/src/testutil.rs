@@ -11,8 +11,8 @@ use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
 use crate::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, EXEC_CHANNEL_CAPACITY,
-    ExecExitInfo, ExecHandle, ExecStart, detect_command_not_found,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState,
+    EXEC_CHANNEL_CAPACITY, ExecExitInfo, ExecHandle, ExecStart, detect_command_not_found,
 };
 use crate::tunnel::{ForwardRequest, ForwardResponse, HttpClient};
 
@@ -44,6 +44,8 @@ pub struct WriteRecord {
 pub struct MockContainerRuntime {
     created: AtomicUsize,
     stopped: AtomicUsize,
+    paused: AtomicUsize,
+    unpaused: AtomicUsize,
     port_counter: AtomicUsize,
     existing: Mutex<Vec<ContainerInfo>>,
     files: Mutex<HashMap<String, Bytes>>,
@@ -57,6 +59,8 @@ impl MockContainerRuntime {
         Self {
             created: AtomicUsize::new(0),
             stopped: AtomicUsize::new(0),
+            paused: AtomicUsize::new(0),
+            unpaused: AtomicUsize::new(0),
             port_counter: AtomicUsize::new(9000),
             existing: Mutex::new(Vec::new()),
             files: Mutex::new(HashMap::new()),
@@ -88,6 +92,14 @@ impl MockContainerRuntime {
         self.stopped.load(Ordering::SeqCst)
     }
 
+    pub fn paused_count(&self) -> usize {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    pub fn unpaused_count(&self) -> usize {
+        self.unpaused.load(Ordering::SeqCst)
+    }
+
     pub fn signals_received(&self) -> Vec<SignalRecord> {
         self.signals_received.lock().unwrap().clone()
     }
@@ -111,7 +123,7 @@ impl ContainerRuntime for MockContainerRuntime {
             id: ContainerId(format!("mock-{}", config.sandbox_id)),
             sandbox_id: config.sandbox_id,
             host_port: port,
-            running: true,
+            state: ContainerState::Running,
         })
     }
 
@@ -121,6 +133,16 @@ impl ContainerRuntime for MockContainerRuntime {
         _timeout: Duration,
     ) -> Result<(), AgentError> {
         self.stopped.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn pause(&self, _id: &ContainerId) -> Result<(), AgentError> {
+        self.paused.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn unpause(&self, _id: &ContainerId) -> Result<(), AgentError> {
+        self.unpaused.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -315,6 +337,18 @@ impl ContainerRuntime for FailingContainerRuntime {
         })
     }
 
+    async fn pause(&self, _id: &ContainerId) -> Result<(), AgentError> {
+        Err(AgentError::Runtime {
+            detail: "mock runtime failure".into(),
+        })
+    }
+
+    async fn unpause(&self, _id: &ContainerId) -> Result<(), AgentError> {
+        Err(AgentError::Runtime {
+            detail: "mock runtime failure".into(),
+        })
+    }
+
     async fn list_sandbox_containers(&self) -> Result<Vec<ContainerInfo>, AgentError> {
         Ok(Vec::new())
     }
@@ -394,7 +428,7 @@ impl ContainerRuntime for SlowContainerRuntime {
             id: ContainerId(format!("slow-{}", config.sandbox_id)),
             sandbox_id: config.sandbox_id,
             host_port: 9000,
-            running: true,
+            state: ContainerState::Running,
         })
     }
 
@@ -403,6 +437,14 @@ impl ContainerRuntime for SlowContainerRuntime {
         _id: &ContainerId,
         _timeout: Duration,
     ) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    async fn pause(&self, _id: &ContainerId) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    async fn unpause(&self, _id: &ContainerId) -> Result<(), AgentError> {
         Ok(())
     }
 
@@ -492,7 +534,19 @@ pub fn mock_container_info(sandbox_id: SandboxId, port: u16) -> ContainerInfo {
         id: ContainerId(format!("existing-{}", sandbox_id)),
         sandbox_id,
         host_port: port,
-        running: true,
+        state: ContainerState::Running,
+    }
+}
+
+/// Builds a ContainerInfo entry in the Paused state — used by the
+/// reconcile regression test that asserts paused containers don't
+/// silently collapse to Stopped on every sweep (cascade #1).
+pub fn mock_container_info_paused(sandbox_id: SandboxId, port: u16) -> ContainerInfo {
+    ContainerInfo {
+        id: ContainerId(format!("existing-{}", sandbox_id)),
+        sandbox_id,
+        host_port: port,
+        state: ContainerState::Paused,
     }
 }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::info;
+use tracing::{info, warn};
 
 use open_sandbox_contracts::constants::HEARTBEAT_INTERVAL;
 use open_sandbox_contracts::controller::controller_command;
@@ -154,8 +154,18 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                                 error_message: error_msg,
                             })),
                         };
-                        let _ = status_tx.send(status).await;
-                        info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
+                        // Cascade-fix #9: dropping SandboxStatus on a
+                        // closed channel (mid-reconnect, channel torn
+                        // down) silently strands the controller at the
+                        // previous steady-state. Logging here makes the
+                        // drop observable so an operator can detect the
+                        // condition and trigger reconcile. A complete
+                        // fix would queue + replay on next-connect.
+                        if let Err(e) = status_tx.send(status).await {
+                            warn!(sandbox_id = %sandbox_id_str, state = state_val, error = %e, "failed to send SandboxStatus (channel closed); controller may be stale");
+                        } else {
+                            info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
+                        }
                     });
                 }
                 controller_command::Payload::StopSandbox(stop) => {
@@ -179,8 +189,99 @@ impl<R: ContainerRuntime + 'static> ControllerConnection<R> {
                                 error_message: error_msg,
                             })),
                         };
-                        let _ = status_tx.send(status).await;
-                        info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
+                        // Cascade-fix #9: dropping SandboxStatus on a
+                        // closed channel (mid-reconnect, channel torn
+                        // down) silently strands the controller at the
+                        // previous steady-state. Logging here makes the
+                        // drop observable so an operator can detect the
+                        // condition and trigger reconcile. A complete
+                        // fix would queue + replay on next-connect.
+                        if let Err(e) = status_tx.send(status).await {
+                            warn!(sandbox_id = %sandbox_id_str, state = state_val, error = %e, "failed to send SandboxStatus (channel closed); controller may be stale");
+                        } else {
+                            info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
+                        }
+                    });
+                }
+                controller_command::Payload::PauseSandbox(pause) => {
+                    let sandbox_id_str = pause.sandbox_id.clone();
+                    info!(sandbox_id = %sandbox_id_str, "received pause command");
+                    let sandbox_manager = sandbox_manager.clone();
+                    let status_tx = status_tx.clone();
+                    tokio::spawn(async move {
+                        let state = sandbox_manager.pause_sandbox(pause).await;
+                        // On failure, the container is still in its
+                        // PREVIOUS steady-state (Running) — pause didn't
+                        // take effect. Reporting Failed here would write
+                        // a TERMINAL state to the controller (see the
+                        // late-terminal-state exception in grpc.rs) and
+                        // permanently brick the sandbox row even though
+                        // the container itself is still healthy.
+                        // Cascade-fix #4.
+                        let (state_val, error_msg) = match state {
+                            Ok(s) => (s as i32, String::new()),
+                            Err(e) => (
+                                open_sandbox_contracts::controller::SandboxState::Running as i32,
+                                e.to_string(),
+                            ),
+                        };
+                        let status = AgentMessage {
+                            payload: Some(agent_message::Payload::SandboxStatus(SandboxStatus {
+                                sandbox_id: sandbox_id_str.clone(),
+                                state: state_val,
+                                error_message: error_msg,
+                            })),
+                        };
+                        // Cascade-fix #9: dropping SandboxStatus on a
+                        // closed channel (mid-reconnect, channel torn
+                        // down) silently strands the controller at the
+                        // previous steady-state. Logging here makes the
+                        // drop observable so an operator can detect the
+                        // condition and trigger reconcile. A complete
+                        // fix would queue + replay on next-connect.
+                        if let Err(e) = status_tx.send(status).await {
+                            warn!(sandbox_id = %sandbox_id_str, state = state_val, error = %e, "failed to send SandboxStatus (channel closed); controller may be stale");
+                        } else {
+                            info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
+                        }
+                    });
+                }
+                controller_command::Payload::UnpauseSandbox(unpause) => {
+                    let sandbox_id_str = unpause.sandbox_id.clone();
+                    info!(sandbox_id = %sandbox_id_str, "received unpause command");
+                    let sandbox_manager = sandbox_manager.clone();
+                    let status_tx = status_tx.clone();
+                    tokio::spawn(async move {
+                        let state = sandbox_manager.unpause_sandbox(unpause).await;
+                        // Inverse of pause: failed unpause leaves the
+                        // container in its previous Paused state.
+                        // Cascade-fix #4.
+                        let (state_val, error_msg) = match state {
+                            Ok(s) => (s as i32, String::new()),
+                            Err(e) => (
+                                open_sandbox_contracts::controller::SandboxState::Paused as i32,
+                                e.to_string(),
+                            ),
+                        };
+                        let status = AgentMessage {
+                            payload: Some(agent_message::Payload::SandboxStatus(SandboxStatus {
+                                sandbox_id: sandbox_id_str.clone(),
+                                state: state_val,
+                                error_message: error_msg,
+                            })),
+                        };
+                        // Cascade-fix #9: dropping SandboxStatus on a
+                        // closed channel (mid-reconnect, channel torn
+                        // down) silently strands the controller at the
+                        // previous steady-state. Logging here makes the
+                        // drop observable so an operator can detect the
+                        // condition and trigger reconcile. A complete
+                        // fix would queue + replay on next-connect.
+                        if let Err(e) = status_tx.send(status).await {
+                            warn!(sandbox_id = %sandbox_id_str, state = state_val, error = %e, "failed to send SandboxStatus (channel closed); controller may be stale");
+                        } else {
+                            info!(sandbox_id = %sandbox_id_str, state = state_val, "reported sandbox status");
+                        }
                     });
                 }
                 controller_command::Payload::RegisterResponse(_) => {}

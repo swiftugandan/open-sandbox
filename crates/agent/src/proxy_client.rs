@@ -210,19 +210,37 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
             }
         };
 
-        let container_id = match forwarder.sandbox_manager().container_id_for(&sandbox_id) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = outbound_tx
-                    .send(io_error_response(
-                        &stream_id,
-                        "SANDBOX_NOT_FOUND",
-                        &e.to_string(),
-                    ))
-                    .await;
-                return;
-            }
-        };
+        let (container_id, sandbox_state) =
+            match forwarder.sandbox_manager().container_for_io(&sandbox_id) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = outbound_tx
+                        .send(io_error_response(
+                            &stream_id,
+                            "SANDBOX_NOT_FOUND",
+                            &e.to_string(),
+                        ))
+                        .await;
+                    return;
+                }
+            };
+        // Cascade-fix #3: reject IO ops against a paused sandbox up front.
+        // Without this, exec dispatches into the runtime, the runtime
+        // schedules the in-container process, the process never runs
+        // because the cgroup is frozen, and the WebSocket gateway's
+        // keepalive (which terminates outside the container) keeps the
+        // session alive forever. The user sees an indefinite black
+        // terminal with no diagnostic.
+        if sandbox_state == open_sandbox_contracts::controller::SandboxState::Paused {
+            let _ = outbound_tx
+                .send(io_error_response(
+                    &stream_id,
+                    "SANDBOX_PAUSED",
+                    "sandbox is paused; resume it before opening exec or file ops",
+                ))
+                .await;
+            return;
+        }
 
         // Comp-3 A3: per-session client-frame buffer raised so one slow
         // drive_io_session task doesn't head-of-line block the tunnel

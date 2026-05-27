@@ -100,6 +100,18 @@ pub fn build_router<S: SandboxService>(state: Arc<ApiState<S>>) -> Router {
         )
         .route("/v1/sandboxes/{id}", get(handlers::get_sandbox::<S>))
         .route("/v1/sandboxes/{id}", delete(handlers::delete_sandbox::<S>))
+        // v1.0.2: pause / resume. POST so they're semantically write-like
+        // and survive the same `:80/v1` proxy caches that DELETE does.
+        // Returns 202 Accepted with the optimistic transition state;
+        // clients poll GET /v1/sandboxes/{id} for the steady-state.
+        .route(
+            "/v1/sandboxes/{id}/pause",
+            post(handlers::pause_sandbox::<S>),
+        )
+        .route(
+            "/v1/sandboxes/{id}/unpause",
+            post(handlers::unpause_sandbox::<S>),
+        )
         // File ops (REST, unary, backed by proxy OpenIoStream).
         // Comp-6: per-route body-size cap raised to 64 MiB so realistic
         // uploads succeed; the JSON routes above keep the conservative

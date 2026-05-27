@@ -10,6 +10,16 @@ service SandboxManagementService {
   rpc GetSandbox(GetSandboxRequest) returns (GetSandboxResponse);
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
+  // v1.0.2: pause a running sandbox (freezes the in-container
+  // processes via the runtime backend's pause primitive — Docker's
+  // pause API, cgroup-v2 freezer for youki). The container, tunnel,
+  // and exec-registry stay alive; gateway-initiated exec sessions
+  // block until the sandbox is resumed. Idempotent: pausing an
+  // already-paused sandbox is a no-op success.
+  rpc PauseSandbox(PauseSandboxRequest) returns (PauseSandboxResponse);
+  // v1.0.2: resume a paused sandbox. Inverse of PauseSandbox.
+  // Idempotent: unpausing a running sandbox is a no-op success.
+  rpc UnpauseSandbox(UnpauseSandboxRequest) returns (UnpauseSandboxResponse);
 }
 
 message CreateSandboxRequest {
@@ -75,4 +85,38 @@ message ListSandboxesRequest {
 
 message ListSandboxesResponse {
   repeated GetSandboxResponse sandboxes = 1;
+}
+
+// v1.0.2: PauseSandbox / UnpauseSandbox.
+//
+// The response carries the post-transition status so callers don't
+// need a follow-up GetSandbox. The state itself is opaque-as-string
+// because the API gateway has always exposed status as a string
+// (consistent with GetSandboxResponse.status) — clients pattern-match
+// on "running" / "paused" / "stopped" / "failed".
+//
+// Errors:
+//   * NotFound (sandbox_id has no routing entry) → HTTP 404
+//   * FailedPrecondition (sandbox in a state that can't accept this
+//     transition — e.g. PauseSandbox on a stopped sandbox) → HTTP 409
+//   * Internal (agent runtime or tunnel error) → HTTP 500
+//
+// Both RPCs are idempotent on the steady-state side: pausing an
+// already-paused sandbox returns `status="paused"` without dispatching
+// a runtime call; unpausing a running sandbox returns
+// `status="running"` likewise.
+message PauseSandboxRequest {
+  string sandbox_id = 1;
+}
+
+message PauseSandboxResponse {
+  string status = 1;
+}
+
+message UnpauseSandboxRequest {
+  string sandbox_id = 1;
+}
+
+message UnpauseSandboxResponse {
+  string status = 1;
 }

@@ -29,12 +29,24 @@ pub struct ContainerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContainerId(pub String);
 
+/// Runtime-level lifecycle state for a container. Replaces the
+/// `running: bool` binary used by v1.0/v1.0.1 — paused containers
+/// report `running=false` from Docker's list_containers, so without
+/// a tri-state the agent's reconcile pass silently demoted paused
+/// containers to Stopped on every sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerState {
+    Running,
+    Paused,
+    Stopped,
+}
+
 #[derive(Debug, Clone)]
 pub struct ContainerInfo {
     pub id: ContainerId,
     pub sandbox_id: SandboxId,
     pub host_port: u16,
-    pub running: bool,
+    pub state: ContainerState,
 }
 
 /// Parameters for starting a streaming exec inside a container.
@@ -111,6 +123,21 @@ pub trait ContainerRuntime: Send + Sync {
         &self,
         id: &ContainerId,
         timeout: Duration,
+    ) -> impl Future<Output = Result<(), AgentError>> + Send;
+
+    /// v1.0.2: freeze the in-container processes (Docker pause / cgroup
+    /// v2 freezer). Idempotent on the steady-state side — pausing an
+    /// already-paused container returns Ok(()). The tunnel and exec
+    /// registry stay alive; any gateway-initiated exec sessions block
+    /// in-kernel until `unpause` is called.
+    fn pause(&self, id: &ContainerId)
+    -> impl Future<Output = Result<(), AgentError>> + Send;
+
+    /// v1.0.2: resume a paused container. Inverse of `pause`.
+    /// Idempotent: unpausing a running container is a no-op success.
+    fn unpause(
+        &self,
+        id: &ContainerId,
     ) -> impl Future<Output = Result<(), AgentError>> + Send;
 
     fn list_sandbox_containers(

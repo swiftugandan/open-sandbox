@@ -14,9 +14,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use open_sandbox_agent::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, EXEC_CHANNEL_CAPACITY,
-    ExecExitInfo, ExecHandle, ExecStart, consume_inpid_marker, detect_command_not_found,
-    wrap_command_with_inpid_marker,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState,
+    EXEC_CHANNEL_CAPACITY, ExecExitInfo, ExecHandle, ExecStart, consume_inpid_marker,
+    detect_command_not_found, wrap_command_with_inpid_marker,
 };
 use open_sandbox_contracts::constants::DEFAULT_WRITE_CWD;
 use open_sandbox_contracts::error::AgentError;
@@ -340,7 +340,7 @@ impl ContainerRuntime for DockerRuntime {
                         id: ContainerId(created.id),
                         sandbox_id: config.sandbox_id,
                         host_port,
-                        running: true,
+                        state: ContainerState::Running,
                     });
                 }
                 Err(e)
@@ -389,7 +389,54 @@ impl ContainerRuntime for DockerRuntime {
         unreachable!("create_and_start retry loop always returns from inside")
     }
 
+    async fn pause(&self, id: &ContainerId) -> Result<(), AgentError> {
+        match self.client.pause_container(&id.0).await {
+            Ok(_) => Ok(()),
+            // Docker returns 409 Conflict when the container is already
+            // paused. Treat that as idempotent success rather than a
+            // runtime error.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409, ..
+            }) => Ok(()),
+            // Cascade-fix #10: 404 means the container is gone (GC'd
+            // out of band, agent restart with a stale id, etc.). Surface
+            // as SandboxNotFound so the agent reports a non-terminal
+            // state via its dispatch handler instead of writing Failed
+            // to the DB.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Err(AgentError::SandboxNotFound {
+                sandbox_id: id.0.clone(),
+            }),
+            Err(e) => Err(runtime_err(e)),
+        }
+    }
+
+    async fn unpause(&self, id: &ContainerId) -> Result<(), AgentError> {
+        match self.client.unpause_container(&id.0).await {
+            Ok(_) => Ok(()),
+            // 409 → already running; treat as idempotent success.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409, ..
+            }) => Ok(()),
+            // Cascade-fix #10: 404 → SandboxNotFound (see pause above).
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Err(AgentError::SandboxNotFound {
+                sandbox_id: id.0.clone(),
+            }),
+            Err(e) => Err(runtime_err(e)),
+        }
+    }
+
     async fn stop_and_remove(&self, id: &ContainerId, timeout: Duration) -> Result<(), AgentError> {
+        // Cascade-fix #8: unpause before SIGTERM. Modern Docker
+        // (≥19.03) unpauses automatically on `stop`, but older daemons
+        // and some OCI-mode setups don't — SIGTERM gets queued in the
+        // frozen cgroup until SIGKILL replaces it, inflating DELETE
+        // latency by the full grace period. Best-effort: 409 / 404
+        // (already running / container gone) are both fine.
+        let _ = self.client.unpause_container(&id.0).await;
         let stop_opts = StopContainerOptions {
             t: timeout.as_secs() as i64,
         };
@@ -439,7 +486,16 @@ impl ContainerRuntime for DockerRuntime {
                     detail: e.to_string(),
                 })?;
 
-            let running = container.state.as_deref().is_some_and(|s| s == "running");
+            // Docker's summary `state` is one of: created, restarting,
+            // running, paused, exited, removing, dead. Map to the
+            // tri-state used by reconcile — paused MUST NOT collapse
+            // into Stopped or the agent's reconcile pass will overwrite
+            // a legitimately frozen sandbox's state on every sweep.
+            let state = match container.state.as_deref() {
+                Some("running") => ContainerState::Running,
+                Some("paused") => ContainerState::Paused,
+                _ => ContainerState::Stopped,
+            };
 
             let host_port = container
                 .ports
@@ -452,7 +508,7 @@ impl ContainerRuntime for DockerRuntime {
                 id: ContainerId(id.clone()),
                 sandbox_id,
                 host_port,
-                running,
+                state,
             });
         }
 
@@ -1331,7 +1387,7 @@ mod tests {
         let info = runtime.create_and_start(config).await.unwrap();
 
         assert_eq!(info.sandbox_id, sandbox_id);
-        assert!(info.running);
+        assert_eq!(info.state, ContainerState::Running);
         assert!(info.host_port > 0);
         assert!(!info.id.0.is_empty());
 

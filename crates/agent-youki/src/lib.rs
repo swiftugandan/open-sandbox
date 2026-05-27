@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use open_sandbox_agent::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ExecHandle, ExecStart,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState, ExecHandle,
+    ExecStart,
 };
 use open_sandbox_contracts::constants::DEFAULT_WRITE_CWD;
 use open_sandbox_contracts::error::AgentError;
@@ -278,8 +279,63 @@ impl ContainerRuntime for YoukiRuntime {
             id: ContainerId(container_id),
             sandbox_id,
             host_port,
-            running: true,
+            state: ContainerState::Running,
         })
+    }
+
+    async fn pause(&self, id: &ContainerId) -> Result<(), AgentError> {
+        let container_id = id.0.clone();
+        let state_dir = self.state_dir();
+        tokio::task::spawn_blocking(move || -> Result<(), AgentError> {
+            use libcontainer::container::ContainerStatus;
+            let container_root = state_dir.join(&container_id);
+            let mut container =
+                Container::load(container_root).map_err(|e| AgentError::Runtime {
+                    detail: format!("failed to load container for pause: {e}"),
+                })?;
+            // Cascade-fix #6: libcontainer's pause refuses to operate
+            // on an already-paused container (returns an error). Map
+            // that to idempotent success — mirrors agent-docker's 409
+            // handling and avoids surfacing spurious failures when the
+            // in-memory state has drifted from the kernel (e.g. after
+            // an agent restart on a sandbox that was paused before the
+            // restart).
+            if container.status() == ContainerStatus::Paused {
+                return Ok(());
+            }
+            container.pause().map_err(|e| AgentError::Runtime {
+                detail: format!("failed to pause container: {e}"),
+            })
+        })
+        .await
+        .map_err(|e| AgentError::Runtime {
+            detail: format!("pause task panicked: {e}"),
+        })?
+    }
+
+    async fn unpause(&self, id: &ContainerId) -> Result<(), AgentError> {
+        let container_id = id.0.clone();
+        let state_dir = self.state_dir();
+        tokio::task::spawn_blocking(move || -> Result<(), AgentError> {
+            use libcontainer::container::ContainerStatus;
+            let container_root = state_dir.join(&container_id);
+            let mut container =
+                Container::load(container_root).map_err(|e| AgentError::Runtime {
+                    detail: format!("failed to load container for unpause: {e}"),
+                })?;
+            // Cascade-fix #6: idempotent unpause on an already-running
+            // container.
+            if container.status() == ContainerStatus::Running {
+                return Ok(());
+            }
+            container.resume().map_err(|e| AgentError::Runtime {
+                detail: format!("failed to resume container: {e}"),
+            })
+        })
+        .await
+        .map_err(|e| AgentError::Runtime {
+            detail: format!("unpause task panicked: {e}"),
+        })?
     }
 
     async fn stop_and_remove(&self, id: &ContainerId, timeout: Duration) -> Result<(), AgentError> {
@@ -290,11 +346,21 @@ impl ContainerRuntime for YoukiRuntime {
         let cid = container_id.clone();
         let grace = timeout.min(STOP_GRACE_PERIOD);
         tokio::task::spawn_blocking(move || -> Result<(), AgentError> {
+            use libcontainer::container::ContainerStatus;
             let container_root = state_dir.join(&cid);
             let mut container =
                 Container::load(container_root).map_err(|e| AgentError::Runtime {
                     detail: format!("failed to load container for stop: {e}"),
                 })?;
+            // Cascade-fix #8: SIGTERM to a cgroup-frozen process is
+            // queued in-kernel, not delivered, until the freezer is
+            // released. Unpause first so the grace period actually
+            // gives the in-container process a chance to handle the
+            // signal — otherwise DELETE blocks for the full grace
+            // before SIGKILL.
+            if container.status() == ContainerStatus::Paused {
+                let _ = container.resume();
+            }
             // SIGTERM may fail if process already exited — not an error during shutdown
             let _ = container.kill(nix::sys::signal::Signal::SIGTERM, true);
             std::thread::sleep(grace);
@@ -329,16 +395,48 @@ impl ContainerRuntime for YoukiRuntime {
     }
 
     async fn list_sandbox_containers(&self) -> Result<Vec<ContainerInfo>, AgentError> {
-        let containers = self.lock_containers()?;
-        Ok(containers
+        // Snapshot the in-memory map first so the lock isn't held across
+        // libcontainer status reads (each is a blocking filesystem op).
+        let snapshot: Vec<(String, SandboxId, u16)> = self
+            .lock_containers()?
             .iter()
-            .map(|(cid, meta)| ContainerInfo {
-                id: ContainerId(cid.clone()),
-                sandbox_id: meta.sandbox_id.clone(),
-                host_port: meta.host_port,
-                running: true,
-            })
-            .collect())
+            .map(|(cid, meta)| (cid.clone(), meta.sandbox_id.clone(), meta.host_port))
+            .collect();
+        let state_dir = self.state_dir();
+        tokio::task::spawn_blocking(move || {
+            snapshot
+                .into_iter()
+                .map(|(cid, sandbox_id, host_port)| {
+                    // Best-effort: if Container::load fails (state dir
+                    // missing) we treat the entry as Stopped so reconcile
+                    // discards it. Anything other than Running / Paused
+                    // is Stopped — see ContainerState::Paused docs.
+                    let container_root = state_dir.join(&cid);
+                    let state = Container::load(container_root)
+                        .ok()
+                        .map(|c| {
+                            use libcontainer::container::ContainerStatus;
+                            match c.status() {
+                                ContainerStatus::Running => ContainerState::Running,
+                                ContainerStatus::Paused => ContainerState::Paused,
+                                _ => ContainerState::Stopped,
+                            }
+                        })
+                        .unwrap_or(ContainerState::Stopped);
+                    ContainerInfo {
+                        id: ContainerId(cid),
+                        sandbox_id,
+                        host_port,
+                        state,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| AgentError::Runtime {
+            detail: format!("list_sandbox_containers task panicked: {e}"),
+        })
+        .map(Ok)?
     }
 
     async fn start_exec(

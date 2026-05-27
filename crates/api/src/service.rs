@@ -93,6 +93,15 @@ pub struct ReadFileQuery {
     pub cwd: Option<String>,
 }
 
+/// v1.0.2: transition response returned by PauseSandbox / UnpauseSandbox.
+/// `status` is the intermediate state the controller wrote at dispatch
+/// time ("pausing" / "unpausing"); clients poll `GetSandbox` for the
+/// steady-state "paused" / "running" once the agent acknowledges.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TransitionResult {
+    pub status: String,
+}
+
 pub trait SandboxService: Send + Sync + 'static {
     fn create(
         &self,
@@ -107,4 +116,21 @@ pub trait SandboxService: Send + Sync + 'static {
     fn list(&self) -> impl Future<Output = Result<Vec<SandboxInfo>, ApiError>> + Send;
 
     fn delete(&self, sandbox_id: &SandboxId) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// v1.0.2: freeze a running sandbox via the agent runtime's pause
+    /// primitive (Docker pause / cgroup-v2 freezer). Returns the
+    /// optimistic transition state ("pausing"); the steady-state
+    /// "paused" arrives in subsequent GetSandbox / ListSandboxes
+    /// responses.
+    fn pause(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> impl Future<Output = Result<TransitionResult, ApiError>> + Send;
+
+    /// v1.0.2: inverse of `pause`. Returns "unpausing"; steady-state
+    /// is "running".
+    fn unpause(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> impl Future<Output = Result<TransitionResult, ApiError>> + Send;
 }

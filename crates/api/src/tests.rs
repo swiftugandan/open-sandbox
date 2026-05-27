@@ -71,6 +71,36 @@ impl SandboxService for MockService {
             })
         }
     }
+
+    async fn pause(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<crate::service::TransitionResult, ApiError> {
+        if *sandbox_id == self.sandbox.sandbox_id {
+            Ok(crate::service::TransitionResult {
+                status: "pausing".into(),
+            })
+        } else {
+            Err(ApiError::SandboxNotFound {
+                sandbox_id: sandbox_id.to_string(),
+            })
+        }
+    }
+
+    async fn unpause(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<crate::service::TransitionResult, ApiError> {
+        if *sandbox_id == self.sandbox.sandbox_id {
+            Ok(crate::service::TransitionResult {
+                status: "unpausing".into(),
+            })
+        } else {
+            Err(ApiError::SandboxNotFound {
+                sandbox_id: sandbox_id.to_string(),
+            })
+        }
+    }
 }
 
 /// Build a stubbed proxy pool that fails on any open_io_stream
@@ -217,6 +247,58 @@ async fn delete_returns_404_for_unknown() {
     let req = empty_request("DELETE", &format!("/v1/sandboxes/{unknown}"));
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn pause_sandbox_returns_202_and_transition_body() {
+    let (svc, app) = build_app().await;
+    let id = svc.sandbox.sandbox_id.to_string();
+    let req = empty_request("POST", &format!("/v1/sandboxes/{id}/pause"));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], "pausing");
+}
+
+#[tokio::test]
+async fn unpause_sandbox_returns_202_and_transition_body() {
+    let (svc, app) = build_app().await;
+    let id = svc.sandbox.sandbox_id.to_string();
+    let req = empty_request("POST", &format!("/v1/sandboxes/{id}/unpause"));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], "unpausing");
+}
+
+#[tokio::test]
+async fn pause_unknown_returns_404() {
+    let (_, app) = build_app().await;
+    let unknown = SandboxId::new().to_string();
+    let req = empty_request("POST", &format!("/v1/sandboxes/{unknown}/pause"));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn invalid_state_api_error_maps_to_409() {
+    // Cascade-fix #5: ApiError::InvalidState must surface as HTTP 409
+    // Conflict so clients can distinguish a precondition refusal from
+    // an internal error.
+    use open_sandbox_contracts::error::ApiError;
+    let err = ApiError::InvalidState {
+        detail: "cannot pause sandbox in state 'stopped'".into(),
+    };
+    assert_eq!(err.error_code(), "INVALID_STATE");
+}
+
+#[tokio::test]
+async fn pause_without_auth_returns_401() {
+    let (svc, app) = build_app().await;
+    let id = svc.sandbox.sandbox_id.to_string();
+    let req = empty_request_no_auth("POST", &format!("/v1/sandboxes/{id}/pause"));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

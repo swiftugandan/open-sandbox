@@ -1,5 +1,62 @@
 # CHANGELOG
 
+## v1.0.2 (in progress) — Pause/Unpause sandbox lifecycle
+
+Additive lifecycle operation for the v1.0.x sandbox surface. A running
+sandbox can be frozen (in-container processes stop receiving CPU but
+the container, tunnel, exec-registry, and DB row stay alive) and later
+resumed without re-creating anything.
+
+### Additions
+- **Public REST**: `POST /v1/sandboxes/{id}/pause` and
+  `POST /v1/sandboxes/{id}/unpause`. Both return 202 Accepted with a
+  JSON body `{"status": "pausing"}` or `{"status": "unpausing"}` — the
+  optimistic transition state. Clients poll `GET /v1/sandboxes/{id}`
+  for the steady-state `"paused"` / `"running"` once the agent
+  acknowledges (typically tens of milliseconds).
+
+- **Wire protocol** (`proto/api.proto`, `proto/controller.proto`):
+  new RPCs `PauseSandbox` / `UnpauseSandbox` on
+  `SandboxManagementService`; new `ControllerCommand` oneof variants
+  (fields 6 and 7); new `SandboxState` enum variants `PAUSING` (6),
+  `PAUSED` (7), `UNPAUSING` (8). All additive — old clients that
+  pattern-match on the legacy variants round-trip the new ones as
+  their integer values.
+
+- **Agent runtime trait** (`crates/agent/src/container.rs`): new
+  `pause(&ContainerRuntime, &ContainerId)` and `unpause(...)` methods.
+  Implemented in both backends:
+    * **agent-docker**: bollard `pause_container` / `unpause_container`.
+      Docker's 409-on-already-paused is treated as idempotent success.
+    * **agent-youki**: libcontainer's `Container::pause()` /
+      `Container::resume()` — cgroup-v2 freezer write under the hood.
+
+- **SandboxManager** (`crates/agent/src/sandbox.rs`):
+  `pause_sandbox` / `unpause_sandbox` that update the local
+  `SandboxEntry.state` and emit `SandboxStatus(PAUSED|RUNNING)` to
+  the controller. Idempotent — pausing an already-paused sandbox or
+  unpausing a running one returns the steady state without
+  dispatching to the runtime.
+
+- **UI** (`ui/`): pause/play button per sandbox row (lucide
+  `Pause` / `Play` icons), wired to the new REST endpoints; status
+  badge gains `pausing` / `paused` / `unpausing` variants (accent-blue
+  styling, distinct from green-running and red-stopped).
+
+### Tests
+- 4 new agent unit tests (idempotency, state transitions, unknown sandbox)
+- 4 new api gateway HTTP tests (202 responses, transition body, 404, 401)
+- All existing tests still pass.
+
+### Out of scope (future work)
+- **Stop/Start** (graceful shutdown without removal + restart). The
+  current `DELETE /v1/sandboxes/{id}` is "stop and remove" — the
+  container row is destroyed. A retain-on-stop + start-from-stopped
+  flow would need a DB-backed config-retention model and is not part
+  of this change.
+
+---
+
 ## v1.0.2 (in progress) — WebSocket subprotocol auth, opt-in CORS, fail-closed empty key
 
 Additive auth path for browser-based WebSocket clients (the existing

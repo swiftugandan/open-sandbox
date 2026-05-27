@@ -8,12 +8,13 @@ use open_sandbox_contracts::api::sandbox_management_service_client::SandboxManag
 use open_sandbox_contracts::api::{
     CreateSandboxRequest as ProtoCreate, DeleteSandboxRequest as ProtoDelete,
     GetSandboxRequest as ProtoGet, ListSandboxesRequest as ProtoList,
+    PauseSandboxRequest as ProtoPause, UnpauseSandboxRequest as ProtoUnpause,
 };
 use open_sandbox_contracts::error::ApiError;
 use open_sandbox_contracts::types::SandboxId;
 use tonic::transport::Channel;
 
-use crate::service::{CreateRequest, SandboxInfo, SandboxService};
+use crate::service::{CreateRequest, SandboxInfo, SandboxService, TransitionResult};
 
 pub struct GrpcSandboxService {
     client: SandboxManagementServiceClient<Channel>,
@@ -139,6 +140,34 @@ impl SandboxService for GrpcSandboxService {
             .map_err(grpc_to_api)?;
         Ok(())
     }
+
+    async fn pause(&self, sandbox_id: &SandboxId) -> Result<TransitionResult, ApiError> {
+        let mut client = self.client.clone();
+        let resp = client
+            .pause_sandbox(self.authed(ProtoPause {
+                sandbox_id: sandbox_id.to_string(),
+            }))
+            .await
+            .map_err(grpc_to_api)?
+            .into_inner();
+        Ok(TransitionResult {
+            status: resp.status,
+        })
+    }
+
+    async fn unpause(&self, sandbox_id: &SandboxId) -> Result<TransitionResult, ApiError> {
+        let mut client = self.client.clone();
+        let resp = client
+            .unpause_sandbox(self.authed(ProtoUnpause {
+                sandbox_id: sandbox_id.to_string(),
+            }))
+            .await
+            .map_err(grpc_to_api)?
+            .into_inner();
+        Ok(TransitionResult {
+            status: resp.status,
+        })
+    }
 }
 
 fn grpc_to_api(status: tonic::Status) -> ApiError {
@@ -162,6 +191,9 @@ fn grpc_to_api(status: tonic::Status) -> ApiError {
                 sandbox_id: status.message().to_string(),
             },
             "AGENT_NOT_FOUND" => ApiError::ControllerUnavailable {
+                detail: status.message().to_string(),
+            },
+            "INVALID_STATE" => ApiError::InvalidState {
                 detail: status.message().to_string(),
             },
             "NO_AVAILABLE_AGENTS" => ApiError::ControllerUnavailable {
@@ -189,6 +221,13 @@ fn grpc_to_api(status: tonic::Status) -> ApiError {
         // The fail-closed validation is pointless if its rationale
         // gets buried under a generic 5xx at the gateway.
         tonic::Code::InvalidArgument => ApiError::InvalidRequest {
+            detail: status.message().to_string(),
+        },
+        // Cascade-fix #5: precondition failures from the controller
+        // (e.g. pause on a stopped sandbox) surface as HTTP 409 so
+        // clients can distinguish a state-machine refusal from an
+        // internal error.
+        tonic::Code::FailedPrecondition => ApiError::InvalidState {
             detail: status.message().to_string(),
         },
         _ => ApiError::Internal {

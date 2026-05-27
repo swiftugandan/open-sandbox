@@ -77,7 +77,18 @@ This is enforced by the smells checklist in `ENGINEERING_DISCIPLINE.md`. Bare `U
   - `RegisterRequest` / `RegisterResponse` — agent joins the fleet
   - `Heartbeat` / `HeartbeatAck` — liveness signal (interval: 5s per `constants::HEARTBEAT_INTERVAL`)
   - `StartSandbox` / `StopSandbox` — sandbox lifecycle commands from controller
-  - `SandboxStatus` — agent reports sandbox state changes
+  - **v1.0.2** `PauseSandbox` / `UnpauseSandbox` — freeze / resume the
+    in-container processes without destroying the container, tunnel, or
+    exec-registry state. Dispatched by the controller's management
+    `PauseSandbox` / `UnpauseSandbox` RPCs. The agent calls the runtime's
+    pause primitive and reports back via `SandboxStatus` with state
+    `SANDBOX_STATE_PAUSED` (on pause) or `SANDBOX_STATE_RUNNING` (on
+    unpause).
+  - `SandboxStatus` — agent reports sandbox state changes. v1.0.2 adds
+    the `PAUSING` / `PAUSED` / `UNPAUSING` enum variants (field
+    numbers 6/7/8 in the `SandboxState` enum). Old clients that
+    pattern-match on the legacy variants round-trip the new ones as
+    their integer values.
   - `ResourceReport` — agent reports available capacity
   - `FetchLogsCommand` — operator-initiated log fetch
 - **Note:** `ExecCommand` / `ExecResult` were removed in v1.0. Exec is no longer routed through the controller; it flows on the proxy's data plane via `SandboxIoService.OpenIoStream`. The controller stream is now lifecycle-only.
@@ -116,6 +127,17 @@ The proxy's gRPC service, renamed in v1.0 from `TunnelService` to reflect its br
   - `GetSandboxRequest` / `GetSandboxResponse` — query sandbox status
   - `ListSandboxesRequest` / `ListSandboxesResponse` — enumerate all sandboxes the caller owns
   - `DeleteSandboxRequest` / `DeleteSandboxResponse` — stop and remove a sandbox
+  - **v1.0.2** `PauseSandboxRequest` / `PauseSandboxResponse` — freeze the
+    in-container processes via the runtime's pause primitive (Docker
+    pause / cgroup-v2 freezer). Returns the optimistic transition state
+    (`status="pausing"`); the steady-state `paused` arrives in
+    subsequent `GetSandbox` responses once the agent has acknowledged.
+    Public REST surface: `POST /v1/sandboxes/{id}/pause` → 202 Accepted.
+    Idempotent on the steady-state side (pausing an already-paused
+    sandbox is a no-op success).
+  - **v1.0.2** `UnpauseSandboxRequest` / `UnpauseSandboxResponse` —
+    inverse of `PauseSandbox`. `POST /v1/sandboxes/{id}/unpause` → 202.
+    Idempotent on running sandboxes.
 - **Note:** `ExecSandbox` RPC was removed in v1.0. Public exec is now a WebSocket session on the gateway (`WS /v1/sandboxes/{id}/exec`) backed by the proxy's `OpenIoStream`.
 - **Invariants:** `sandbox_id` in responses matches the ID from the create or get request. `subdomain` is always the first 12 hex chars of the sandbox UUID.
 - **Compatibility:** Adding new RPC methods is additive (minor bump). Changing existing message fields is breaking (major bump).

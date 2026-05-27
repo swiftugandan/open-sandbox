@@ -8,9 +8,12 @@ use tonic::{
 use open_sandbox_contracts::api::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    PauseSandboxRequest, PauseSandboxResponse, UnpauseSandboxRequest, UnpauseSandboxResponse,
     sandbox_management_service_server::{SandboxManagementService, SandboxManagementServiceServer},
 };
-use open_sandbox_contracts::controller::{ControllerCommand, StopSandbox, controller_command};
+use open_sandbox_contracts::controller::{
+    ControllerCommand, PauseSandbox, StopSandbox, UnpauseSandbox, controller_command,
+};
 use open_sandbox_contracts::types::SandboxId;
 
 use crate::auth::{AdminAuthInterceptor, LIST_SANDBOXES_MAX};
@@ -169,6 +172,125 @@ impl<S: ControllerStore + 'static> SandboxManagementService for ManagementHandle
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
+    async fn pause_sandbox(
+        &self,
+        request: Request<PauseSandboxRequest>,
+    ) -> Result<Response<PauseSandboxResponse>, Status> {
+        let req = request.into_inner();
+        let sandbox_id = parse_id(&req.sandbox_id)?;
+
+        let entry = self
+            .controller
+            .find_routing_entry(&sandbox_id)
+            .await
+            .map_err(|e| controller_error_to_status(&e))?
+            .ok_or_else(|| Status::not_found(req.sandbox_id.clone()))?;
+
+        // Cascade-fix #5: precondition check. Pause only makes sense
+        // for a sandbox the agent has reported as Running (or already
+        // Pausing/Paused — idempotent). Refusing here returns HTTP 409
+        // so the user sees a clear error rather than a 202 followed by
+        // an agent runtime error → Failed cascade.
+        match self
+            .controller
+            .get_sandbox_state(&sandbox_id)
+            .await
+            .map_err(|e| controller_error_to_status(&e))?
+        {
+            Some(row) => {
+                let s = row.state.as_str();
+                if !matches!(s, "running" | "pausing" | "paused") {
+                    return Err(status_with_invalid_state(format!(
+                        "cannot pause sandbox in state '{s}'"
+                    )));
+                }
+            }
+            // No row yet — sandbox was just created and the agent hasn't
+            // emitted SandboxStatus. Allow the dispatch; the agent's
+            // pause_sandbox path will return SandboxNotFound if the
+            // container isn't ready yet, which maps to NotFound HTTP.
+            None => {}
+        }
+
+        let command = ControllerCommand {
+            payload: Some(controller_command::Payload::PauseSandbox(PauseSandbox {
+                sandbox_id: sandbox_id.to_string(),
+            })),
+        };
+        self.controller
+            .connections
+            .send_command(&entry.agent_id, command)
+            .await
+            .map_err(|e| controller_error_to_status(&e))?;
+        // Persist the optimistic transition state so GetSandbox /
+        // ListSandboxes reflect "pausing" the moment the controller
+        // dispatched (rather than the previous steady-state "running"
+        // until the agent ACKs). Mirrors create_sandbox's "creating"
+        // write. The agent's SandboxStatus(Paused) overwrites this to
+        // "paused" once the runtime call completes. Best-effort — if
+        // the write fails the agent ACK still arrives later and writes
+        // the correct steady-state.
+        let _ = self
+            .controller
+            .save_sandbox_state(&sandbox_id, &entry.agent_id, "pausing", None)
+            .await;
+        Ok(Response::new(PauseSandboxResponse {
+            status: "pausing".into(),
+        }))
+    }
+
+    async fn unpause_sandbox(
+        &self,
+        request: Request<UnpauseSandboxRequest>,
+    ) -> Result<Response<UnpauseSandboxResponse>, Status> {
+        let req = request.into_inner();
+        let sandbox_id = parse_id(&req.sandbox_id)?;
+
+        let entry = self
+            .controller
+            .find_routing_entry(&sandbox_id)
+            .await
+            .map_err(|e| controller_error_to_status(&e))?
+            .ok_or_else(|| Status::not_found(req.sandbox_id.clone()))?;
+
+        // Cascade-fix #5: unpause precondition. The DB row must show
+        // the sandbox is paused (or transitioning).
+        match self
+            .controller
+            .get_sandbox_state(&sandbox_id)
+            .await
+            .map_err(|e| controller_error_to_status(&e))?
+        {
+            Some(row) => {
+                let s = row.state.as_str();
+                if !matches!(s, "paused" | "unpausing" | "running") {
+                    return Err(status_with_invalid_state(format!(
+                        "cannot unpause sandbox in state '{s}'"
+                    )));
+                }
+            }
+            None => {}
+        }
+
+        let command = ControllerCommand {
+            payload: Some(controller_command::Payload::UnpauseSandbox(UnpauseSandbox {
+                sandbox_id: sandbox_id.to_string(),
+            })),
+        };
+        self.controller
+            .connections
+            .send_command(&entry.agent_id, command)
+            .await
+            .map_err(|e| controller_error_to_status(&e))?;
+        let _ = self
+            .controller
+            .save_sandbox_state(&sandbox_id, &entry.agent_id, "unpausing", None)
+            .await;
+        Ok(Response::new(UnpauseSandboxResponse {
+            status: "unpausing".into(),
+        }))
+    }
+
     async fn list_sandboxes(
         &self,
         _request: Request<ListSandboxesRequest>,
@@ -219,6 +341,22 @@ fn parse_id(id: &str) -> Result<SandboxId, Status> {
     uuid::Uuid::parse_str(id)
         .map(SandboxId::from)
         .map_err(|_| Status::invalid_argument("invalid sandbox_id"))
+}
+
+/// Build a FailedPrecondition Status carrying the
+/// `x-os-error-code: INVALID_STATE` trailer so the api gateway routes
+/// it to ApiError::InvalidState → HTTP 409 (rather than the legacy
+/// tonic::Code::FailedPrecondition fallback). Cascade-fix #5.
+fn status_with_invalid_state(msg: impl Into<String>) -> Status {
+    let mut status = Status::failed_precondition(msg.into());
+    if let Ok(v) =
+        tonic::metadata::MetadataValue::try_from("INVALID_STATE")
+    {
+        status
+            .metadata_mut()
+            .insert(open_sandbox_contracts::constants::ERROR_CODE_HEADER, v);
+    }
+    status
 }
 
 /// Wrap the management service with the required admin-token interceptor.

@@ -260,6 +260,42 @@ pub async fn delete_sandbox<S: SandboxService>(
     }
 }
 
+pub async fn pause_sandbox<S: SandboxService>(
+    State(state): State<Arc<ApiState<S>>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = check_rest_auth(&headers, &state) {
+        return r;
+    }
+    let sandbox_id = match parse_sandbox_id(&id) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    match state.lifecycle.pause(&sandbox_id).await {
+        Ok(result) => (StatusCode::ACCEPTED, Json(result)).into_response(),
+        Err(e) => api_error_response(e),
+    }
+}
+
+pub async fn unpause_sandbox<S: SandboxService>(
+    State(state): State<Arc<ApiState<S>>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = check_rest_auth(&headers, &state) {
+        return r;
+    }
+    let sandbox_id = match parse_sandbox_id(&id) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    match state.lifecycle.unpause(&sandbox_id).await {
+        Ok(result) => (StatusCode::ACCEPTED, Json(result)).into_response(),
+        Err(e) => api_error_response(e),
+    }
+}
+
 // ===== File ops (REST, unary, backed by proxy OpenIoStream) =====
 
 pub async fn write_files<S: SandboxService>(
@@ -599,6 +635,7 @@ fn api_error_response(err: ApiError) -> Response {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
         }
         ApiError::IoStreamFailed { .. } => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        ApiError::InvalidState { .. } => (StatusCode::CONFLICT, err.to_string()),
         ApiError::Internal { .. } => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };

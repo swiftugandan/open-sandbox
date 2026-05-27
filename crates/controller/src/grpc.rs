@@ -463,6 +463,9 @@ fn sandbox_state_to_str(state: SandboxState) -> &'static str {
         SandboxState::Stopping => "stopping",
         SandboxState::Stopped => "stopped",
         SandboxState::Failed => "failed",
+        SandboxState::Pausing => "pausing",
+        SandboxState::Paused => "paused",
+        SandboxState::Unpausing => "unpausing",
         SandboxState::Unspecified => "unknown",
     }
 }

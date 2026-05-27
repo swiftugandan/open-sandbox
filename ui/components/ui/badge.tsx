@@ -8,6 +8,9 @@ const STATUS: Record<string, string> = {
   stopped: "border-err/30 bg-err/10 text-err",
   failed: "border-err/30 bg-err/10 text-err",
   gone: "border-err/30 bg-err/10 text-err",
+  pausing: "border-accent/30 bg-accent/10 text-accent",
+  paused: "border-accent/40 bg-accent/15 text-accent",
+  unpausing: "border-accent/30 bg-accent/10 text-accent",
 };
 
 export function StatusBadge({ status }: { status: string }) {

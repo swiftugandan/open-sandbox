@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Pause, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
 import type { Sandbox, ApiConfig } from "@/lib/api";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -43,6 +43,19 @@ export function SandboxList({
         setError(e instanceof Error ? e.message : String(e));
       }
     });
+  };
+
+  const togglePause = async (sb: Sandbox) => {
+    try {
+      if (sb.status === "running") {
+        await api.pause(config, sb.sandbox_id);
+      } else if (sb.status === "paused") {
+        await api.unpause(config, sb.sandbox_id);
+      }
+      onMutated();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   const remove = async (id: string) => {
@@ -124,6 +137,24 @@ export function SandboxList({
                 </div>
               </div>
               <StatusBadge status={sb.status} />
+              {(sb.status === "running" || sb.status === "paused") && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    togglePause(sb);
+                  }}
+                  // Same hover-visibility behavior as Delete: always
+                  // visible on touch, dimmed-until-hover at >=lg.
+                  className="rounded p-1.5 text-fg-muted transition hover:bg-accent/20 hover:text-accent lg:p-1 lg:opacity-0 lg:group-hover:opacity-100"
+                  title={sb.status === "running" ? "Pause" : "Resume"}
+                >
+                  {sb.status === "running" ? (
+                    <Pause className="size-3.5" />
+                  ) : (
+                    <Play className="size-3.5" />
+                  )}
+                </button>
+              )}
               <button
                 onClick={(e) => {
                   e.stopPropagation();
