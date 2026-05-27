@@ -35,7 +35,7 @@ use open_sandbox_proxy::routing_cache::RoutingCache;
 use open_sandbox_proxy::stream_mux::StreamMux;
 use open_sandbox_proxy::tunnel_pool::TunnelPool;
 
-use crate::cli::{AgentArgs, ApiArgs, ControllerArgs, ProxyArgs};
+use crate::cli::{AgentArgs, ApiArgs, ControllerArgs, MigrateArgs, ProxyArgs};
 use crate::http_client::ReqwestHttpClient;
 
 #[cfg(feature = "docker")]
@@ -55,8 +55,15 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
     info!("controller starting");
     let pool = sqlx::PgPool::connect(args.database_url.expose()).await?;
     let pg_store = Arc::new(PgStore::new(pool));
-    pg_store.migrate().await?;
-    info!("database migrations applied");
+    if args.auto_migrate {
+        pg_store.migrate().await?;
+        info!("controller migrations applied (auto-migrate)");
+    } else {
+        info!(
+            "skipping controller migrations (auto-migrate off); \
+             run `open-sandbox migrate` separately"
+        );
+    }
 
     let join_token = std::env::var("OPEN_SANDBOX_JOIN_TOKEN").map_err(|_| {
         "OPEN_SANDBOX_JOIN_TOKEN must be set for the controller to validate agent registrations"
@@ -102,32 +109,16 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
 pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>> {
     info!("proxy starting");
     let pg_pool = sqlx::PgPool::connect(args.database_url.expose()).await?;
-    // Comp-2 A3: proxy owns the routing_entries_subdomain_idx functional
-    // index; the controller owns the table itself. Retry the index
-    // creation since the proxy can race the controller's migrate().
-    let migration_store = PgRoutingStore::new(pg_pool.clone());
-    for attempt in 1..=PROXY_STARTUP_RETRY_ATTEMPTS {
-        match migration_store.migrate().await {
-            Ok(()) => {
-                info!("proxy migrations applied");
-                break;
-            }
-            Err(e) if attempt < PROXY_STARTUP_RETRY_ATTEMPTS => {
-                warn!(
-                    attempt,
-                    max = PROXY_STARTUP_RETRY_ATTEMPTS,
-                    error = %e,
-                    "proxy migration not ready (controller may not have created routing_entries yet), retrying"
-                );
-                tokio::time::sleep(PROXY_STARTUP_RETRY_INTERVAL).await;
-            }
-            Err(e) => {
-                return Err(format!(
-                    "proxy migration failed after {PROXY_STARTUP_RETRY_ATTEMPTS} attempts: {e}"
-                )
-                .into());
-            }
-        }
+    if args.auto_migrate {
+        // Comp-2 A3: proxy owns the routing_entries_subdomain_idx functional
+        // index; the controller owns the table itself. Retry the index
+        // creation since the proxy can race the controller's migrate().
+        apply_proxy_migrations_with_retry(&pg_pool).await?;
+    } else {
+        info!(
+            "skipping proxy migrations (auto-migrate off); \
+             run `open-sandbox migrate` separately"
+        );
     }
     // Hold a second store handle for the LISTEN subscriber below. The
     // PgListener needs its own dedicated connection (LISTEN occupies the
@@ -211,6 +202,12 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         (ProxyRole::Combined, ProxyRole::Combined)
     };
 
+    // PLAN_12FACTOR.md Phase 4 drain flag, shared by public + internal
+    // gRPC handlers. Flipped by the supervisor task below when SIGTERM
+    // arrives, causing both `OpenTunnel` and `OpenIoStream` to reject
+    // new calls with `Unavailable` while in-flight sessions finish.
+    let drain_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let grpc_addr = format!("0.0.0.0:{}", args.grpc_port);
     let grpc_listener = TcpListener::bind(&grpc_addr).await?;
     let public_service = sandbox_io_service_with_role(
@@ -221,6 +218,7 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         internal_token.clone(),
         tunnel_token.clone(),
         public_role,
+        drain_flag.clone(),
     );
 
     let http_addr = format!("0.0.0.0:{}", args.http_port);
@@ -287,10 +285,100 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         }
     });
 
+    // PLAN_12FACTOR.md Phase 4: drain coordinator.
+    //
+    // One `tokio::sync::watch` channel signals "drain is complete; tonic
+    // may begin its own graceful shutdown" to every listener task. The
+    // supervisor:
+    //   1. Awaits SIGTERM via shutdown_signal().
+    //   2. Flips the shared drain flag — new OpenTunnel / OpenIoStream
+    //      calls now return Unavailable.
+    //   3. Polls IoSessions::is_empty() every 100ms until drained OR
+    //      `--shutdown-drain-timeout` (default 30s) elapses.
+    //   4. On timeout: sends each remaining session a terminal
+    //      Unavailable frame via IoSessions::fail_all_remaining so the
+    //      gateway never sees a silent disconnect.
+    //   5. Sends `true` on the watch channel.
+    // Each listener awaits the watch channel and passes that future to
+    // tonic's `serve_with_incoming_shutdown`.
+    //
+    // INTENTIONAL: this only drains IoSessions (gateway-facing
+    // bidirectional streams). The TunnelPool (agent OpenTunnel response
+    // streams) is NOT given a terminal frame on shutdown — agents
+    // detect the abrupt close and enter their existing exponential-
+    // backoff reconnect loop (see crates/agent/src/.../reconnect logic;
+    // run.rs:434-446 wraps the OpenTunnel call). Adding tunnel-side
+    // terminal frames would require a new TunnelRequest payload variant
+    // (a Phase 4+ contract change) and provides no observable benefit
+    // over reconnect-on-RST. See docs/design/SCALING_TIERS.md for the
+    // partner ADR ("agent reconnect is the primary recovery mechanism;
+    // proxy is a connection-affinity tier, not a stateful peer").
+    // Code-review finding #10.
+    let (drain_complete_tx, drain_complete_rx) = tokio::sync::watch::channel(false);
+    let drain_timeout = Duration::from_secs(args.shutdown_drain_timeout);
+    {
+        let drain_flag = drain_flag.clone();
+        let sessions_for_drain = sessions.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            info!("proxy: SIGTERM received, beginning drain");
+            drain_flag.store(true, std::sync::atomic::Ordering::Release);
+            let start = std::time::Instant::now();
+            // Code-review finding #6: race the drain loop against a
+            // SECOND shutdown_signal so a second SIGTERM/Ctrl-C
+            // escalates to immediate-fail instead of being silently
+            // coalesced for up to `drain_timeout` seconds. Operators
+            // who hit Ctrl-C twice expecting fast exit now get it.
+            let drain_loop = async {
+                while !sessions_for_drain.is_empty() && start.elapsed() < drain_timeout {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            tokio::select! {
+                () = drain_loop => {
+                    let remaining = sessions_for_drain.len();
+                    if remaining == 0 {
+                        info!(
+                            elapsed_ms = start.elapsed().as_millis() as u64,
+                            "proxy: drain complete"
+                        );
+                    } else {
+                        warn!(
+                            remaining,
+                            timeout_secs = drain_timeout.as_secs(),
+                            elapsed_ms = start.elapsed().as_millis() as u64,
+                            "proxy: drain timeout; failing remaining sessions with Unavailable"
+                        );
+                        sessions_for_drain.fail_all_remaining(tonic::Status::unavailable(
+                            "proxy shutting down (drain timeout)",
+                        ));
+                    }
+                }
+                () = shutdown_signal() => {
+                    let remaining = sessions_for_drain.len();
+                    warn!(
+                        remaining,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "proxy: second SIGTERM received during drain; failing remaining sessions immediately"
+                    );
+                    sessions_for_drain.fail_all_remaining(tonic::Status::unavailable(
+                        "proxy shutting down (escalated)",
+                    ));
+                }
+            }
+            // Even if no listener has subscribed yet (the spawn race),
+            // watch::Sender holds the value so later subscribers observe
+            // it via `borrow_and_update()` on first poll. Unlike Notify,
+            // there is no "wakeup happens before await" hazard here.
+            let _ = drain_complete_tx.send(true);
+        });
+    }
+
     // Comp-2 C5 / comp-9: optional in-binary ACME for the public listener.
     // Operator opts in via TUNNEL_ACME_DOMAIN + ACME_EMAIL; otherwise the
     // listener serves plaintext h2c (development mode).
     let acme_settings = crate::tls::AcmeSettings::from_env();
+    let public_drain_rx = drain_complete_rx.clone();
     let public_grpc_handle = tokio::spawn(async move {
         // Comp-2 B4: HTTP/2 keepalive pings detect a frozen-but-TCP-alive
         // agent within the documented spike-03 budget.
@@ -303,7 +391,7 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
                 info!("public listener: ACME-managed TLS");
                 let incoming = crate::tls::acme_incoming(grpc_listener, settings);
                 builder
-                    .serve_with_incoming_shutdown(incoming, shutdown_signal())
+                    .serve_with_incoming_shutdown(incoming, wait_for_drain(public_drain_rx))
                     .await
             }
             None => {
@@ -313,7 +401,7 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
                 builder
                     .serve_with_incoming_shutdown(
                         TcpListenerStream::new(grpc_listener),
-                        shutdown_signal(),
+                        wait_for_drain(public_drain_rx),
                     )
                     .await
             }
@@ -326,21 +414,23 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         let internal_service = sandbox_io_service_with_role(
             mux,
             tunnel_pool,
-            sessions,
+            sessions.clone(),
             cache.clone(),
             internal_token,
             // Internal listener does NOT accept OpenTunnel; no token needed
             // there. Public listener already enforced tunnel_token above.
             None,
             internal_role,
+            drain_flag.clone(),
         );
         info!(internal_grpc = %internal_addr, "proxy: internal listener ready");
+        let internal_drain_rx = drain_complete_rx.clone();
         Some(tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(internal_service)
                 .serve_with_incoming_shutdown(
                     TcpListenerStream::new(internal_listener),
-                    shutdown_signal(),
+                    wait_for_drain(internal_drain_rx),
                 )
                 .await
         }))
@@ -348,25 +438,50 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
         None
     };
 
-    let http_handle = tokio::spawn(async move { http_server.run(http_listener).await });
+    // Code-review finding #2: http listener gets the same drain signal
+    // as the gRPC listeners so long-running HTTP responses (SSE, large
+    // file transfers through sandbox subdomains) aren't aborted with a
+    // TCP RST when the proxy shuts down. The HTTP server tracks
+    // in-flight connections via a JoinSet and waits up to `drain_timeout`
+    // for them to finish their current response.
+    let http_drain_rx = drain_complete_rx.clone();
+    let http_drain_timeout = drain_timeout;
+    let http_handle = tokio::spawn(async move {
+        http_server
+            .run_with_shutdown(http_listener, wait_for_drain(http_drain_rx), http_drain_timeout)
+            .await
+    });
 
     if let Some(internal_handle) = internal_grpc_handle {
         tokio::select! {
             result = public_grpc_handle => { result??; }
             result = internal_handle => { result??; }
             result = http_handle => { result?.map_err(|e| e.to_string())?; }
-            () = shutdown_signal() => {}
         }
     } else {
         tokio::select! {
             result = public_grpc_handle => { result??; }
             result = http_handle => { result?.map_err(|e| e.to_string())?; }
-            () = shutdown_signal() => {}
         }
     }
 
     info!("proxy shut down");
     Ok(())
+}
+
+/// Resolves when the proxy's drain coordinator signals "tonic may
+/// shut down now." Each listener subscribes to the same watch channel
+/// via a clone of the receiver; `borrow_and_update()` on first poll
+/// observes the value even if the send happened before subscription.
+async fn wait_for_drain(mut rx: tokio::sync::watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow_and_update() {
+            return;
+        }
+    }
 }
 
 pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -538,6 +653,62 @@ pub async fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     info!("api gateway shut down");
     Ok(())
+}
+
+/// Run both controller and proxy schema migrations against a single
+/// Postgres URL. Idempotent: every statement is `CREATE TABLE/INDEX
+/// IF NOT EXISTS`, so re-running is a no-op. Production deploys
+/// invoke this via `open-sandbox migrate` once before starting the
+/// long-running services; dev environments set `--auto-migrate`
+/// instead. The proxy index depends on the controller's
+/// `routing_entries` table, so the controller migration is applied
+/// first and the proxy migration uses the same retry loop the
+/// long-running proxy uses (the index creation can race a concurrent
+/// `CREATE TABLE` on a cold DB).
+pub async fn run_migrate(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    info!("running schema migrations");
+    let pool = sqlx::PgPool::connect(args.database_url.expose()).await?;
+    let pg_store = PgStore::new(pool.clone());
+    pg_store.migrate().await?;
+    info!("controller migrations applied");
+    apply_proxy_migrations_with_retry(&pool).await?;
+    info!("migrations complete");
+    Ok(())
+}
+
+/// Apply the proxy's index creation with bounded retries. Shared
+/// between `run_proxy` (when `--auto-migrate` is set) and
+/// `run_migrate`. The retry exists because the index is created
+/// against the controller's `routing_entries` table; on a fresh DB,
+/// concurrent invocations can race the table creation.
+async fn apply_proxy_migrations_with_retry(
+    pool: &sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let migration_store = PgRoutingStore::new(pool.clone());
+    for attempt in 1..=PROXY_STARTUP_RETRY_ATTEMPTS {
+        match migration_store.migrate().await {
+            Ok(()) => {
+                info!("proxy migrations applied");
+                return Ok(());
+            }
+            Err(e) if attempt < PROXY_STARTUP_RETRY_ATTEMPTS => {
+                warn!(
+                    attempt,
+                    max = PROXY_STARTUP_RETRY_ATTEMPTS,
+                    error = %e,
+                    "proxy migration not ready (controller may not have created routing_entries yet), retrying"
+                );
+                tokio::time::sleep(PROXY_STARTUP_RETRY_INTERVAL).await;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "proxy migration failed after {PROXY_STARTUP_RETRY_ATTEMPTS} attempts: {e}"
+                )
+                .into());
+            }
+        }
+    }
+    unreachable!("loop above either returns Ok or Err")
 }
 
 async fn shutdown_signal() {

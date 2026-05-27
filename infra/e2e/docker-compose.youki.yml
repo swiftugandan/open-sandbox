@@ -18,7 +18,7 @@ services:
       dockerfile: infra/e2e/Dockerfile.youki
       args:
         FEATURES: docker
-    command: controller --database-url postgres://postgres:test@10.0.0.2:5432/open_sandbox
+    command: controller --auto-migrate --database-url postgres://postgres:test@10.0.0.2:5432/open_sandbox
     environment:
       OPEN_SANDBOX_JOIN_TOKEN: e2e-token
       RUST_LOG: info
@@ -35,7 +35,7 @@ services:
       dockerfile: infra/e2e/Dockerfile.youki
       args:
         FEATURES: docker
-    command: proxy --database-url postgres://postgres:test@10.0.0.2:5432/open_sandbox
+    command: proxy --auto-migrate --database-url postgres://postgres:test@10.0.0.2:5432/open_sandbox
     environment:
       OPEN_SANDBOX_INTERNAL_TOKEN: e2e-internal-token
       RUST_LOG: info

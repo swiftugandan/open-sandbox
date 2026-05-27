@@ -82,6 +82,11 @@ export CONTROLLER_ADMIN_TOKEN=dev-admin \
        OPEN_SANDBOX_INTERNAL_TOKEN=dev-internal \
        OPEN_SANDBOX_API_KEY=dev-api-key
 
+# Apply schema migrations once (idempotent). Production deploys do this
+# step separately so a migration failure doesn't crash-loop the services;
+# dev environments can alternatively pass --auto-migrate on controller/proxy.
+./target/release/open-sandbox migrate --database-url "$DBURL"
+
 ./target/release/open-sandbox controller --database-url "$DBURL"  &
 ./target/release/open-sandbox proxy      --database-url "$DBURL"  &
 ./target/release/open-sandbox api        --controller-url http://127.0.0.1:50051 --proxy-url http://127.0.0.1:50053 &
@@ -181,6 +186,19 @@ pulumi up
 ```
 
 Single Pulumi stack provisions controller VM + worker VMs + DNS + TLS cert. Cost: <$20/month at default scale.
+
+## Environment variables
+
+The runtime services (`controller`, `proxy`, `api`, `agent`) are configured entirely from the environment. Copy [`.env.example`](.env.example) to `.env`, fill in the required values, and source it before launching a service.
+
+Required variables fail-closed — services refuse to start if a required token or database URL is missing. The full surface, organized by service, lives in [`.env.example`](.env.example); the most-asked questions:
+
+- **Where do I generate tokens?** `openssl rand -hex 32` for every `CHANGE_ME` line.
+- **Which `OPEN_SANDBOX_PROXY_URL` do I set?** Different per service. The **api gateway** points at the proxy's **internal** listener (default `50053`); the **agent** points at the proxy's **public** listener (default `50052`). Crossing them gets you `Unimplemented` at the proxy's role gate.
+- **Why does the proxy need `OPEN_SANDBOX_INTERNAL_TOKEN` even in split-listener mode?** Defense in depth. The internal listener should already be network-isolated to the api gateway's segment; the bearer token covers you if that isolation is misconfigured.
+- **Which variables are read by which binary?** Each section of `.env.example` is headed by the service that consumes it; cross-service variables (the join tokens, the database URL, the internal token) are noted explicitly.
+
+The source of truth for the variable surface is `crates/cli/src/cli.rs` (clap `env =` attributes) and direct `std::env::var(...)` reads in `crates/cli/src/run.rs`.
 
 ## Engineering discipline
 

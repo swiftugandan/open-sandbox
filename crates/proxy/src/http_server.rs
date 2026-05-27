@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -8,6 +9,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 
 use open_sandbox_contracts::error::ProxyError;
 
@@ -42,27 +44,90 @@ impl<S: RoutingStore + 'static> HttpServer<S> {
         Self { router }
     }
 
+    /// Run the accept loop until cancelled externally (e.g. via task
+    /// abort). Used by tests that drive their own lifetime. Production
+    /// wiring uses `run_with_shutdown`, which exits cleanly on a
+    /// shutdown signal and drains in-flight connections.
     pub async fn run(&self, listener: TcpListener) -> Result<(), ProxyError> {
+        self.run_with_shutdown(listener, std::future::pending::<()>(), Duration::ZERO)
+            .await
+    }
+
+    /// Accept loop + bounded in-flight drain.
+    ///
+    /// On `shutdown`, stops accepting new TCP connections and waits up
+    /// to `drain_timeout` for in-flight HTTP responses to complete.
+    /// Connections still in flight after the deadline are aborted with
+    /// a warning (the peer sees a TCP RST). `drain_timeout == 0`
+    /// disables the bounded wait and waits forever — used by tests
+    /// where the future is `std::future::pending`.
+    ///
+    /// PLAN_12FACTOR.md Phase 4 / code-review finding #2: without this
+    /// drain, a SIGTERM that completed the proxy's gRPC drain would
+    /// abort `http_handle` mid-response, killing long-running HTTP
+    /// requests (SSE, large file transfer) with a TCP RST.
+    pub async fn run_with_shutdown(
+        &self,
+        listener: TcpListener,
+        shutdown: impl std::future::Future<Output = ()>,
+        drain_timeout: Duration,
+    ) -> Result<(), ProxyError> {
+        tokio::pin!(shutdown);
+        let mut connections: JoinSet<()> = JoinSet::new();
         loop {
-            let (stream, _) = listener.accept().await.map_err(|e| ProxyError::Internal {
-                detail: e.to_string(),
-            })?;
-
-            let router = self.router.clone();
-            tokio::spawn(async move {
-                let service = service_fn(move |req: Request<Incoming>| {
-                    let router = router.clone();
-                    async move { handle_request(router, req).await }
-                });
-
-                if let Err(e) = http1::Builder::new()
-                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                    .await
-                {
-                    tracing::warn!(error = %e, "http connection error");
+            tokio::select! {
+                accept = listener.accept() => {
+                    let (stream, _) = accept.map_err(|e| ProxyError::Internal {
+                        detail: e.to_string(),
+                    })?;
+                    let router = self.router.clone();
+                    connections.spawn(async move {
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let router = router.clone();
+                            async move { handle_request(router, req).await }
+                        });
+                        if let Err(e) = http1::Builder::new()
+                            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "http connection error");
+                        }
+                    });
                 }
-            });
+                // Reap completed connections so the JoinSet doesn't grow
+                // unboundedly for long-lived servers. join_next() returns
+                // Pending (never fires) when the set is empty.
+                Some(_) = connections.join_next() => {}
+                () = &mut shutdown => {
+                    tracing::info!(
+                        in_flight = connections.len(),
+                        "http server: shutdown signaled, stopping accept"
+                    );
+                    break;
+                }
+            }
         }
+        let in_flight_at_drain = connections.len();
+        let drain_fut = async {
+            while connections.join_next().await.is_some() {}
+        };
+        if drain_timeout.is_zero() {
+            drain_fut.await;
+        } else if tokio::time::timeout(drain_timeout, drain_fut).await.is_err() {
+            tracing::warn!(
+                remaining = connections.len(),
+                started_with = in_flight_at_drain,
+                timeout_secs = drain_timeout.as_secs(),
+                "http server: drain timeout; aborting remaining connections"
+            );
+            connections.abort_all();
+        } else {
+            tracing::info!(
+                drained = in_flight_at_drain,
+                "http server: clean drain"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -361,6 +426,85 @@ mod tests {
         assert_eq!(resp.status(), 413);
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_server_stops_accepting_on_shutdown_and_drains_in_flight() {
+        // Code-review finding #2: shutdown future must stop the accept
+        // loop AND wait for in-flight HTTP responses to finish their
+        // current body before returning, so peers don't see a TCP RST.
+        let sandbox_id = SandboxId::new();
+        let agent_id = AgentId::new();
+        let (router, mux, mut rx) = setup_router_with_agent(&sandbox_id, &agent_id);
+        let server = HttpServer::new(router);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            server
+                .run_with_shutdown(
+                    listener,
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+
+        // Agent task that holds the request body open for 300ms before
+        // responding — simulates a long-running response that must finish
+        // even after shutdown signal arrives.
+        let mux_clone = mux.clone();
+        let agent_id_clone = agent_id.clone();
+        let agent_handle = tokio::spawn(async move {
+            if let Some(req) = rx.recv().await {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let response = HttpResponse {
+                    status_code: 200,
+                    headers: Default::default(),
+                    body: b"slow body finished".to_vec(),
+                };
+                mux_clone.deliver_response(&req.stream_id, &agent_id_clone, response);
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Issue the request, then immediately signal shutdown. The
+        // shutdown should NOT cancel the in-flight response.
+        let host = format!("{}.sandbox.example.com", sandbox_id.subdomain());
+        let req_handle = tokio::spawn({
+            let host = host.clone();
+            async move {
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(3))
+                    .build()
+                    .unwrap();
+                client
+                    .get(format!("http://{addr}/"))
+                    .header("host", &host)
+                    .send()
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = shutdown_tx.send(());
+
+        let body = req_handle.await.unwrap();
+        assert_eq!(body.as_ref(), b"slow body finished");
+
+        let server_result = tokio::time::timeout(Duration::from_secs(2), server_handle)
+            .await
+            .expect("server should exit cleanly after drain");
+        server_result.unwrap().unwrap();
+        agent_handle.abort();
     }
 
     #[tokio::test]

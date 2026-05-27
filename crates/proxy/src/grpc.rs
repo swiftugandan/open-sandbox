@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -68,27 +69,25 @@ pub struct SandboxIoHandler<S: RoutingStore> {
     tunnel_token: Option<String>,
     /// Which RPCs this handler instance accepts. See [`ProxyRole`].
     role: ProxyRole,
+    /// Set to `true` by the proxy shutdown coordinator (PLAN_12FACTOR.md
+    /// Phase 4 / factor #9). While draining, both `OpenTunnel` and
+    /// `OpenIoStream` reject new calls with `Unavailable` so the
+    /// in-flight `IoSessions` can finish without competing for
+    /// scheduling. Shared across the proxy's public + internal handler
+    /// instances via `Arc<AtomicBool>`.
+    draining: Arc<AtomicBool>,
 }
 
 impl<S: RoutingStore> SandboxIoHandler<S> {
-    pub fn new(
-        mux: Arc<StreamMux>,
-        pool: Arc<TunnelPool>,
-        sessions: Arc<IoSessions>,
-        routing: Arc<RoutingCache<S>>,
-        internal_token: Option<String>,
-    ) -> Self {
-        Self::with_role(
-            mux,
-            pool,
-            sessions,
-            routing,
-            internal_token,
-            None,
-            ProxyRole::Combined,
-        )
-    }
-
+    /// Construct a handler with the role and drain flag explicit.
+    /// `draining` MUST be the same `Arc<AtomicBool>` shared with the
+    /// proxy shutdown coordinator (and with sibling handlers on the
+    /// other listener) so a single SIGTERM drains both. Tests that
+    /// don't exercise drain pass a fresh `Arc::new(AtomicBool::new(false))`.
+    ///
+    /// Code-review finding #7: `draining` is a required positional
+    /// argument, not optional — there is no way to construct a handler
+    /// that silently bypasses drain.
     pub fn with_role(
         mux: Arc<StreamMux>,
         pool: Arc<TunnelPool>,
@@ -97,6 +96,7 @@ impl<S: RoutingStore> SandboxIoHandler<S> {
         internal_token: Option<String>,
         tunnel_token: Option<String>,
         role: ProxyRole,
+        draining: Arc<AtomicBool>,
     ) -> Self {
         Self {
             mux,
@@ -106,6 +106,7 @@ impl<S: RoutingStore> SandboxIoHandler<S> {
             internal_token,
             tunnel_token,
             role,
+            draining,
         }
     }
 }
@@ -128,6 +129,10 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
         // Without this, a network-reachable attacker can call OpenTunnel
         // claiming any agent_id (or even spam reconnects) and hijack
         // routing for that agent's sandboxes.
+        //
+        // Code-review finding #9: auth runs BEFORE the drain check so
+        // an unauthenticated caller can't distinguish "proxy is draining"
+        // from "proxy is up" by observing Unavailable vs Unauthenticated.
         if let Some(expected) = &self.tunnel_token {
             let got = request
                 .metadata()
@@ -139,6 +144,16 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
                     "missing or invalid tunnel-join token",
                 ));
             }
+        }
+        // PLAN_12FACTOR.md Phase 4: reject new tunnels during drain so
+        // in-flight sessions can finish without competing with new
+        // registrations. Agents will retry against the same proxy (or
+        // a replacement) via the existing exponential-backoff
+        // reconnect loop in run_agent.
+        if self.draining.load(Ordering::Acquire) {
+            return Err(Status::unavailable(
+                "proxy is shutting down; reconnect",
+            ));
         }
         let mut inbound = request.into_inner();
         let (result_tx, outbound_rx) = mpsc::channel::<Result<TunnelRequest, Status>>(32);
@@ -252,6 +267,10 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
         // <token>`. Network isolation (separate listener) is the
         // primary defense; the token is defense in depth and
         // supports cross-host topologies.
+        //
+        // Code-review finding #9: auth runs BEFORE the drain check so
+        // an unauthenticated caller can't distinguish proxy-draining
+        // from proxy-up by observing the response code.
         if let Some(expected) = &self.internal_token {
             let got = request
                 .metadata()
@@ -263,6 +282,14 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
                     "missing or invalid internal authorization",
                 ));
             }
+        }
+        // PLAN_12FACTOR.md Phase 4: reject new io streams during drain.
+        // The api gateway surfaces this as a sandbox error to the
+        // REST/WS caller, who can retry against the post-restart proxy.
+        if self.draining.load(Ordering::Acquire) {
+            return Err(Status::unavailable(
+                "proxy is shutting down; retry",
+            ));
         }
 
         let inbound = request.into_inner();
@@ -283,9 +310,10 @@ impl<S: RoutingStore + 'static> SandboxIoService for SandboxIoHandler<S> {
         let pool = self.pool.clone();
         let sessions = self.sessions.clone();
         let routing = self.routing.clone();
+        let draining = self.draining.clone();
 
         tokio::spawn(dispatch_io_stream(
-            pool, sessions, routing, inbound, server_tx,
+            pool, sessions, routing, inbound, server_tx, draining,
         ));
 
         Ok(Response::new(ReceiverStream::new(server_rx)))
@@ -298,6 +326,7 @@ async fn dispatch_io_stream<S: RoutingStore + 'static>(
     routing: Arc<RoutingCache<S>>,
     mut inbound: Streaming<IoClientFrame>,
     server_tx: mpsc::Sender<Result<IoServerFrame, Status>>,
+    draining: Arc<AtomicBool>,
 ) {
     // Read first IoStart frame.
     let first = match inbound.message().await {
@@ -379,6 +408,23 @@ async fn dispatch_io_stream<S: RoutingStore + 'static>(
             generation,
         },
     );
+
+    // Code-review finding #4: TOCTOU. The drain flag was checked at
+    // open_io_stream entry, BUT routing lookup + agent pool lookup
+    // above can be slow (cold cache, contended Mutex). If SIGTERM
+    // arrived between the entry check and now, the supervisor may
+    // have already polled is_empty() → true (we hadn't inserted yet)
+    // and signaled drain_complete. Re-check after insert so we either
+    // (a) win the race and the supervisor sees our session next poll,
+    // or (b) lose and bail with a clean Unavailable terminal frame
+    // instead of dangling in a session map that nothing will drain.
+    if draining.load(Ordering::Acquire) {
+        sessions.remove(&stream_id);
+        let _ = server_tx
+            .send(Err(Status::unavailable("proxy shutting down")))
+            .await;
+        return;
+    }
 
     info!(
         stream_id = %stream_id,
@@ -492,24 +538,16 @@ async fn dispatch_io_stream<S: RoutingStore + 'static>(
     );
 }
 
-pub fn sandbox_io_service<S: RoutingStore + 'static>(
-    mux: Arc<StreamMux>,
-    pool: Arc<TunnelPool>,
-    sessions: Arc<IoSessions>,
-    routing: Arc<RoutingCache<S>>,
-    internal_token: Option<String>,
-) -> SandboxIoServiceServer<SandboxIoHandler<S>> {
-    sandbox_io_service_with_role(
-        mux,
-        pool,
-        sessions,
-        routing,
-        internal_token,
-        None,
-        ProxyRole::Combined,
-    )
-}
-
+/// Build a `SandboxIoServiceServer` ready to be added to a `tonic`
+/// server. `draining` MUST be the shared `Arc<AtomicBool>` owned by
+/// the proxy shutdown coordinator so a single SIGTERM drains every
+/// listener instance constructed from it. Tests that don't exercise
+/// drain pass a fresh `Arc::new(AtomicBool::new(false))`.
+///
+/// Code-review finding #7: this is the only factory exported. The
+/// prior "drain-optional" variants were deleted to eliminate the
+/// foot-gun where a production callsite could silently bypass drain
+/// by picking the shorter signature.
 pub fn sandbox_io_service_with_role<S: RoutingStore + 'static>(
     mux: Arc<StreamMux>,
     pool: Arc<TunnelPool>,
@@ -518,6 +556,7 @@ pub fn sandbox_io_service_with_role<S: RoutingStore + 'static>(
     internal_token: Option<String>,
     tunnel_token: Option<String>,
     role: ProxyRole,
+    draining: Arc<AtomicBool>,
 ) -> SandboxIoServiceServer<SandboxIoHandler<S>> {
     SandboxIoServiceServer::new(SandboxIoHandler::with_role(
         mux,
@@ -527,6 +566,7 @@ pub fn sandbox_io_service_with_role<S: RoutingStore + 'static>(
         internal_token,
         tunnel_token,
         role,
+        draining,
     ))
 }
 
@@ -551,7 +591,17 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
 
-        let service = sandbox_io_service(mux, pool, sessions, routing, internal_token);
+        let service = sandbox_io_service_with_role(
+            mux,
+            pool,
+            sessions,
+            routing,
+            internal_token,
+            None, // tunnel_token disabled in unit tests
+            ProxyRole::Combined,
+            // tests don't exercise drain — fresh, never-flipped flag
+            Arc::new(AtomicBool::new(false)),
+        );
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)
@@ -700,6 +750,7 @@ mod tests {
             internal_token,
             None, // tunnel_token disabled in unit tests
             role,
+            Arc::new(AtomicBool::new(false)),
         );
         tokio::spawn(async move {
             tonic::transport::Server::builder()
@@ -709,6 +760,103 @@ mod tests {
                 .unwrap();
         });
         addr
+    }
+
+    async fn start_proxy_grpc_with_drain(
+        mux: Arc<StreamMux>,
+        pool: Arc<TunnelPool>,
+        sessions: Arc<IoSessions>,
+        routing: Arc<RoutingCache<InMemoryRoutingStore>>,
+        drain_flag: Arc<AtomicBool>,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let service = sandbox_io_service_with_role(
+            mux,
+            pool,
+            sessions,
+            routing,
+            None,
+            None,
+            ProxyRole::Combined,
+            drain_flag,
+        );
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_tunnel_returns_unavailable_when_draining() {
+        // PLAN_12FACTOR.md Phase 4: while the proxy is draining, new
+        // OpenTunnel calls must be rejected so in-flight sessions
+        // finish without competing with re-registrations.
+        let pool = Arc::new(TunnelPool::new());
+        let mux = Arc::new(StreamMux::new(pool.clone()));
+        let sessions = Arc::new(IoSessions::new());
+        let routing = empty_cache();
+        let drain_flag = Arc::new(AtomicBool::new(true)); // already draining
+        let addr =
+            start_proxy_grpc_with_drain(mux, pool, sessions, routing, drain_flag).await;
+
+        let channel = tonic::transport::Channel::from_shared(addr)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = SandboxIoServiceClient::new(channel);
+
+        let (_outbound_tx, outbound_rx) = mpsc::channel::<TunnelResponse>(1);
+        let outbound = ReceiverStream::new(outbound_rx);
+        let resp = client.open_tunnel(outbound).await;
+        match resp {
+            Err(status) => assert_eq!(
+                status.code(),
+                tonic::Code::Unavailable,
+                "expected Unavailable while draining, got {:?}",
+                status.code()
+            ),
+            Ok(_) => panic!("expected OpenTunnel to be rejected while draining"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_io_stream_returns_unavailable_when_draining() {
+        let pool = Arc::new(TunnelPool::new());
+        let mux = Arc::new(StreamMux::new(pool.clone()));
+        let sessions = Arc::new(IoSessions::new());
+        let routing = empty_cache();
+        let drain_flag = Arc::new(AtomicBool::new(true));
+        let addr =
+            start_proxy_grpc_with_drain(mux, pool, sessions, routing, drain_flag).await;
+
+        let channel = tonic::transport::Channel::from_shared(addr)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = SandboxIoServiceClient::new(channel);
+
+        let sandbox_id = SandboxId::new();
+        let (client_tx, client_rx) = mpsc::channel::<IoClientFrame>(8);
+        client_tx.send(iostart_frame(&sandbox_id)).await.unwrap();
+
+        let result = client.open_io_stream(ReceiverStream::new(client_rx)).await;
+        match result {
+            Err(status) => assert_eq!(status.code(), tonic::Code::Unavailable),
+            Ok(mut resp) => {
+                let first = resp.get_mut().message().await;
+                match first {
+                    Err(e) => assert_eq!(e.code(), tonic::Code::Unavailable),
+                    Ok(_) => panic!("expected Unavailable while draining"),
+                }
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

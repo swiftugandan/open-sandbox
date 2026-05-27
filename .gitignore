@@ -3,6 +3,14 @@ target/
 
 .claude/
 
+# Local env files — .env.example is committed; .env (and variants) hold
+# secrets and must never be committed.
+.env
+.env.local
+.env.*.local
+.env.dev
+.env.prod
+
 # Next.js / Node UI
 ui/node_modules
 ui/.next

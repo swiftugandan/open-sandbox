@@ -1,5 +1,90 @@
 # CHANGELOG
 
+## v1.0.2 (in progress) — 12-factor decomposition: migrate subcommand, env-templated cloud-init
+
+Operator-facing surface changes from `PLAN_12FACTOR.md` phases 1–3 +
+related fixes. No wire protocol changes.
+
+### Additions
+
+- **`open-sandbox migrate` subcommand.** Runs controller + proxy
+  schema migrations and exits. Idempotent (every statement is `CREATE
+  TABLE/INDEX IF NOT EXISTS`). Production deploys should invoke this
+  once before starting the long-running services so a migration
+  failure doesn't cascade into a service-startup crash-loop.
+- **`--auto-migrate` flag on `controller` and `proxy` subcommands**
+  (also env `OPEN_SANDBOX_AUTO_MIGRATE`). Default **off**. When set,
+  preserves the pre-v1.0.2 behavior of running migrations on service
+  startup. Dev environments (`docker-compose.*.yml`, the future
+  `open-sandbox dev`) pass this flag automatically.
+- **`.env.example`** at the repo root documenting every required and
+  optional env var organized by service. README gains an "Environment
+  variables" section pointing at it. `.gitignore` extended so `.env`
+  variants can't be committed by accident.
+- **`apiControllerUrl` / `apiProxyUrl` optional args on
+  `controllerUserData`** (Pulumi infra). Default to the existing
+  `http://127.0.0.1:${port}` templates so single-host deploys are
+  byte-identical; future multi-host deploys can override these without
+  editing infra code.
+- **Proxy SIGTERM drain.** On shutdown signal the proxy now sets a
+  shared drain flag (new `OpenTunnel` / `OpenIoStream` calls return
+  `Status::unavailable`), polls `IoSessions::is_empty()` until empty
+  or `--shutdown-drain-timeout` seconds elapse (env
+  `OPEN_SANDBOX_SHUTDOWN_DRAIN_TIMEOUT`, default 30), then sends each
+  remaining session a terminal `Unavailable` frame so the gateway
+  never sees a silent disconnect. Bounds the blast radius of a
+  planned proxy restart to "sessions older than the drain timeout."
+  Partner to ADR-010's "1-of-N proxy is acceptable" stance.
+- **Release artifact integrity verification** (`infra/src/cloud-init.ts`).
+  Cloud-init now downloads `SHA256SUMS` alongside the binary,
+  matches the per-arch entry, and fails-closed on mismatch. When
+  `SHA256SUMS` is absent (releases pre-dating the policy) it logs a
+  visible warning and continues, so existing deploys keep working.
+  Applies to both controller and worker host bootstraps. **Release
+  publishers should now ship `SHA256SUMS` alongside each binary**
+  (one line per arch: `<sha256>  open-sandbox-linux-<arch>`).
+
+### Behavior changes (operator-visible)
+
+- **Default migration behavior on `controller` / `proxy` startup
+  flipped from "auto-migrate" to "off".** Existing dev environments
+  must either run `open-sandbox migrate` once or pass
+  `--auto-migrate`. Existing production deploys regenerated from the
+  updated `cloud-init.ts` template do the migrate step inline at
+  cloud-init time AND via `ExecStartPre=` on the controller systemd
+  unit (the latter covers in-place binary upgrades by re-running
+  migrations on every service restart). **Deploys that bypass the
+  Pulumi template must add a `migrate` step before starting
+  controller/proxy.**
+
+### Security fixes (cloud-init.ts)
+
+- **`INTERNAL_TOKEN` env var name in the proxy + api systemd units
+  corrected to `OPEN_SANDBOX_INTERNAL_TOKEN`.** The previous name
+  was unread by the binary; the production proxy in split-listener
+  mode was therefore starting with no internal-token auth, and the
+  api gateway was never sending the bearer to the proxy. Both sides
+  silently agreed on `None` so requests succeeded, but the
+  defense-in-depth layer was absent.
+- **`CONTROLLER_ADMIN_TOKEN` added to the api gateway's systemd env**
+  (`infra/src/cloud-init.ts`). Without it the api could not
+  authenticate to the controller's management gRPC — every sandbox
+  create/list/pause/delete call would have returned
+  `Status::unauthenticated`. **Production deployments before this fix
+  were broken at the api layer.** Re-run `pulumi up` (or manually
+  patch `/etc/systemd/system/open-sandbox-api.service` +
+  `systemctl daemon-reload && systemctl restart open-sandbox-api`).
+
+### Architectural documents
+
+- **New `docs/design/SCALING_TIERS.md`** (ADR-010 in `SAD.md`). Locks
+  in the decision that the proxy is a connection-affinity tier and
+  the controller is a single coordinator, both 1-of-N by design;
+  agent fleet is the horizontal scaling unit. Read before proposing
+  any "externalize proxy session state" refactor.
+- **`docs/plans/PLAN_12FACTOR.md`** — the gap-closure plan driving
+  these changes.
+
 ## v1.0.2 (in progress) — Pause/Unpause sandbox lifecycle
 
 Additive lifecycle operation for the v1.0.x sandbox surface. A running

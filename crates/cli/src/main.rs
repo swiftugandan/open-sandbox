@@ -34,5 +34,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Proxy(args) => run::run_proxy(args).await,
         Command::Agent(args) => run::run_agent(args).await,
         Command::Api(args) => run::run_api(args).await,
+        Command::Migrate(args) => run::run_migrate(args).await,
     }
 }

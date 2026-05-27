@@ -9,6 +9,16 @@
 //! Sibling of `StreamMux` (which handles unary HTTP request/response
 //! pairs). Different shape because I/O sessions are bidirectional
 //! streams, not single-response RPCs.
+//!
+//! Code-review finding #8: every `inner.lock()` call here recovers
+//! from poison via `unwrap_or_else(|p| p.into_inner())` instead of
+//! panicking. The drain supervisor in `run_proxy` calls `is_empty()`
+//! / `len()` / `fail_all_remaining()` on SIGTERM; a poisoned mutex
+//! here would otherwise panic the supervisor task, which would skip
+//! the terminal-frame delivery and silently abort drained sessions —
+//! the exact failure mode this module exists to prevent. Inner
+//! `HashMap` invariants are simple enough (just inserts and removes)
+//! that a half-mutation by a prior-panicking writer is harmless.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -60,11 +70,11 @@ impl IoSessions {
     }
 
     pub fn insert(&self, stream_id: String, record: IoSessionRecord) {
-        self.inner.lock().unwrap().insert(stream_id, record);
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).insert(stream_id, record);
     }
 
     pub fn remove(&self, stream_id: &str) -> Option<IoSessionRecord> {
-        self.inner.lock().unwrap().remove(stream_id)
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).remove(stream_id)
     }
 
     /// Forward an `IoServerFrame` from the agent's tunnel into the gateway-
@@ -90,7 +100,7 @@ impl IoSessions {
         frame: IoServerFrame,
     ) -> bool {
         let sender = {
-            let guard = self.inner.lock().unwrap();
+            let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             match guard.get(stream_id) {
                 Some(r) if r.agent_id == *from_agent => Some(r.server_tx.clone()),
                 Some(r) => {
@@ -130,7 +140,7 @@ impl IoSessions {
     /// reaches the gateway instead of silently disappearing and
     /// surfacing as "stream ended without terminal frame".
     pub fn fail_stream(&self, stream_id: &str, status: Status) {
-        let record = self.inner.lock().unwrap().remove(stream_id);
+        let record = self.inner.lock().unwrap_or_else(|p| p.into_inner()).remove(stream_id);
         if let Some(rec) = record {
             send_or_spawn(rec.server_tx, Err(status));
         }
@@ -144,7 +154,7 @@ impl IoSessions {
         agent_id: &AgentId,
         generation: TunnelGeneration,
     ) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let stream_ids: Vec<String> = guard
             .iter()
             .filter(|(_, r)| r.agent_id == *agent_id && r.generation == generation)
@@ -163,11 +173,29 @@ impl IoSessions {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().is_empty()
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
+    }
+
+    /// Fail every remaining session with the given status. Used by the
+    /// proxy SIGTERM drain path (Phase 4 of PLAN_12FACTOR.md) when the
+    /// drain deadline elapses with sessions still open — better to send
+    /// a clean terminal frame than to disappear and let the gateway see
+    /// "stream ended without terminal frame." Returns the number of
+    /// sessions that were drained.
+    pub fn fail_all_remaining(&self, status: Status) -> usize {
+        let drained: Vec<(String, IoSessionRecord)> = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            guard.drain().collect()
+        };
+        let count = drained.len();
+        for (_sid, rec) in drained {
+            send_or_spawn(rec.server_tx, Err(status.clone()));
+        }
+        count
     }
 }
 
@@ -253,6 +281,45 @@ mod tests {
         };
         assert!(!s.deliver_server_frame("io-0", &attacker, frame));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn fail_all_remaining_drains_and_terminates_each_session() {
+        // PLAN_12FACTOR.md Phase 4: when the proxy SIGTERM drain
+        // deadline elapses, every remaining session must receive a
+        // terminal Status (not a silent disconnect). Verifies both that
+        // the map is emptied AND that each gateway receiver sees an Err
+        // frame on its channel.
+        let s = IoSessions::new();
+        let agent = AgentId::new();
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        s.insert(
+            "io-a".into(),
+            IoSessionRecord {
+                agent_id: agent.clone(),
+                server_tx: tx_a,
+                generation: 1,
+            },
+        );
+        s.insert(
+            "io-b".into(),
+            IoSessionRecord {
+                agent_id: agent,
+                server_tx: tx_b,
+                generation: 1,
+            },
+        );
+
+        let drained = s.fail_all_remaining(Status::unavailable("shutting down"));
+
+        assert_eq!(drained, 2);
+        assert_eq!(s.len(), 0);
+        let frame_a = rx_a.try_recv().unwrap();
+        assert!(frame_a.is_err());
+        assert_eq!(frame_a.unwrap_err().code(), tonic::Code::Unavailable);
+        let frame_b = rx_b.try_recv().unwrap();
+        assert!(frame_b.is_err());
     }
 
     #[tokio::test]

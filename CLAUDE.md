@@ -60,10 +60,12 @@ git tag --list 'module/*/live-verified'
 - `PLAN_EXEC_STREAMING.md` — v1.0 streaming-exec implementation plan. **Historical** (shipped, tagged `plan/v0.6.3`). Preserved for archeology; do not act on its instructions as pending work.
 - `PLAN_CONTRACTS_v1.0.2.md` — amendment plan for contracts v1.0.2. Item #13 shipped; #1–#12 pending separate session.
 - `CODE_REVIEW_PLAN.md` — process doc for the component-by-component `/code-review` pass. **Pass complete** (components 0–9, see progress table); kept for the per-component checklist and mechanics.
+- `PLAN_12FACTOR.md` — 12-factor decomposition gap-closure plan (drafted 2026-05-27). Phase 0 (architectural ADR) → Phase 6 (docs); HA deferred. See companion `docs/design/SCALING_TIERS.md` for the load-bearing decision.
 
 **Design (`docs/design/`):**
 
 - `EXEC_STREAMING_DESIGN.md` — **architectural-decision record** for the shipped v1.0 streaming exec refactor. The "why" behind the data-plane choice, the connection-as-lifetime model, and the five spike conclusions. Still the canonical reference for anyone touching exec timeouts, sessions, file ops, process control, computer-use APIs, or VNC-from-browser.
+- `SCALING_TIERS.md` — **architectural-decision record** for the proxy-as-connection-affinity-tier and controller-as-single-coordinator decisions (ADR-010). Read before proposing any "make the proxy stateless" or "externalize sessions to Redis" refactor.
 
 **Reviews (`docs/reviews/`):**
 
@@ -87,3 +89,4 @@ git tag --list 'module/*/live-verified'
 - Cloudflare for DNS regardless of compute cloud
 - Multi-tenancy decision and raw TCP exposure are open questions from the design doc
 - **Exec is a stream-shaped session on the proxy's data plane, not a message exchange.** Shipped in v1.0 — see `EXEC_STREAMING_DESIGN.md` for the rationale. Do not propose band-aids that re-introduce message-shaped exec or route exec/file ops via the controller; the architecture explicitly rejects both. The data-plane choice positions transparent-WebSocket-forwarding (VNC-from-browser, inbound WS apps) and computer-use agent APIs to fall out naturally — those remain v1.1+ work.
+- **The proxy is a connection-affinity tier; the controller is a single coordinator. Both run 1-of-N by design** (ADR-010 + `docs/design/SCALING_TIERS.md`). The proxy's `TunnelPool` / `IoSessions` / `StreamMux` maps hold live socket endpoints, not externalizable state — do not propose moving them to Redis/etcd. The unit of horizontal scaling is the **agent fleet**. HA, when prioritized, is hot-standby (advisory-lock leader election); not active-active. If multi-proxy scaling ever becomes necessary, the path is sticky-L7 with `proxy_id` ownership in the `agents` table, never externalized sessions.

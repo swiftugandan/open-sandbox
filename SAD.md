@@ -420,6 +420,12 @@ Configuration shape per component:
 - **Decision:** Replace Docker Engine with youki/libcontainer as the default production container runtime. The existing `ContainerRuntime` trait remains unchanged. `YoukiRuntime` is a new implementation alongside the existing `DockerRuntime`, each in its own crate (`crates/agent-youki/`, `crates/agent-docker/`). Runtime selection is compile-time via Cargo feature flags: `youki` (for Linux production) and `docker` (default, for macOS development). Dependencies: `libcontainer 0.6.0`, `oci-client 0.17`, `oci-spec 0.9` (versions pinned together). Container networking via CNI plugins (bridge + portmap + loopback). Image pull via `oci-client`.
 - **Consequences:** Worker VMs drop from ~250MB daemon overhead to ~0MB. The agent binary is fully self-contained — no daemon socket, no background process. CNI plugins (~3 small binaries) replace Docker's built-in networking. Image pull via `oci-client` replaces Docker's built-in pull. The `DockerRuntime` remains for macOS development where `libcontainer` cannot link (Linux kernel dependency). Build environment for the `youki` feature requires Linux (Alpine with `musl-dev`, `gcc`, `libseccomp-dev`, `libseccomp-static`, `pkgconf`). Worker VM cloud-init simplifies: no Docker installation, just CNI plugin binaries.
 
+### ADR-010: Proxy and controller are 1-of-N tiers by design
+
+- **Context:** A 12-factor decomposition audit raised that the proxy holds in-memory `TunnelPool` / `IoSessions` / `StreamMux` maps that prevent it from being horizontally scaled, and that the controller's heartbeat sweep + state writes assume a single coordinator. Treated naïvely these look like violations of 12-factor #6 (stateless processes) and #8 (concurrency via the process model).
+- **Decision:** Document the proxy as a **connection-affinity tier** and the controller as a **single coordinator**. The proxy's in-memory maps are not externalizable state — they hold live socket endpoints (the proxy's end of gRPC streaming responses). The controller's coordination role belongs in one process backed by Postgres. The unit of horizontal scaling in this system is the **agent fleet**, where each agent is one independent worker. See `docs/design/SCALING_TIERS.md` for the full rationale.
+- **Consequences:** Proxy and controller run 1-of-N; HA when needed is hot-standby (advisory-lock leader election for controller; passive replica for proxy), not active-active. In-flight sessions drop on failover; agents reconnect within seconds. Future multi-proxy horizontal scaling, if ever needed, takes the sticky-L7 path (add `proxy_id` to the controller's `agents` table) — never the externalize-session-state path. Phase 4 of `PLAN_12FACTOR.md` adds proxy SIGTERM drain so the blast radius of a planned restart is bounded to sessions older than `SHUTDOWN_DRAIN_TIMEOUT`.
+
 ---
 
 ## Confidence gate
@@ -427,7 +433,7 @@ Configuration shape per component:
 ```
 Confidence: high
 Residual risks:
-  - Single-VM default (controller + proxy + Postgres) is a single point of failure for the entire platform. Acceptable for the target scale but the first thing to split when reliability matters.
+  - Single-VM default (controller + proxy + Postgres) is a single point of failure for the entire platform. **Upgraded from "risk" to "deliberate scaling decision" by ADR-010 + docs/design/SCALING_TIERS.md** — proxy and controller are 1-of-N by design; HA is hot-standby when uptime starts to matter. The agent fleet (where actual platform load lives) scales horizontally.
   - Reverse tunnel multiplexing performance under high concurrent request load is unvalidated. The design assumes HTTP/2 stream multiplexing is sufficient, but pathological workloads (many large concurrent responses) could saturate the single TCP connection per agent.
   - Exec-backed file operations (ADR-008) may hit shell escaping edge cases with binary file content. The tar.gz approach mitigates this (binary-safe archive format), but the exec response path (stdout capture for large files) needs flow control.
 Known gaps:
@@ -443,3 +449,5 @@ Amended with proxy startup self-healing failure mode, logging subscriber init de
 Amended with sandbox state persistence (controller), agent graceful shutdown, image pull in both runtimes, API validation envelope consistency. Tagged `sad/v0.5.0`.
 
 Amended with container entrypoint override (agent runtimes), SIGTERM signal handling (agent shutdown), exec error propagation (controller → API), read-file 404 semantics (API), agent lifecycle tracing events. Tagged `sad/v0.6.0`.
+
+Amended with ADR-010 (proxy and controller as 1-of-N tiers by design; agent fleet as the horizontal scaling unit) and corresponding residual-risk reframing. Companion: `docs/design/SCALING_TIERS.md`. Tag pending: `sad/v0.7.0` after PLAN_12FACTOR.md phases 0–6 land.

@@ -7,6 +7,7 @@ async fn run_controller_returns_result() {
         grpc_port: 50051,
         database_url: "postgres://localhost/test".to_string().into(),
         sweep_interval: 15,
+        auto_migrate: false,
     };
     let result = run::run_controller(args).await;
     assert!(
@@ -22,6 +23,8 @@ async fn run_proxy_returns_result() {
         grpc_port: 50052,
         internal_grpc_port: 50053,
         database_url: "postgres://localhost/test".to_string().into(),
+        auto_migrate: false,
+        shutdown_drain_timeout: 30,
     };
     let result = run::run_proxy(args).await;
     assert!(

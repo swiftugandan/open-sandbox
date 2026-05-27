@@ -23,6 +23,12 @@ pub enum Command {
     Agent(AgentArgs),
     /// Start the REST API gateway
     Api(ApiArgs),
+    /// Run database schema migrations (controller + proxy) and exit.
+    /// Idempotent — safe to run multiple times. Production deploys should
+    /// run this once before starting the long-running services; dev
+    /// deploys can rely on --auto-migrate on the controller/proxy
+    /// subcommands instead.
+    Migrate(MigrateArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -42,6 +48,14 @@ pub struct ControllerArgs {
     /// Dead agent sweep interval in seconds
     #[arg(long, default_value_t = 15, env = "OPEN_SANDBOX_SWEEP_INTERVAL")]
     pub sweep_interval: u64,
+
+    /// Run schema migrations on startup. Off by default in production —
+    /// run `open-sandbox migrate` once before starting services so a
+    /// migration failure doesn't cascade into a service-startup failure.
+    /// Dev environments (docker-compose, `open-sandbox dev`) pass this
+    /// flag to preserve a frictionless first-run.
+    #[arg(long, default_value_t = false, env = "OPEN_SANDBOX_AUTO_MIGRATE")]
+    pub auto_migrate: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -71,6 +85,30 @@ pub struct ProxyArgs {
     pub internal_grpc_port: u16,
 
     /// PostgreSQL connection URL (contains the password — never logged)
+    #[arg(long, env = "OPEN_SANDBOX_DATABASE_URL")]
+    pub database_url: Redacted,
+
+    /// Run schema migrations on startup. Off by default in production;
+    /// see ControllerArgs.auto_migrate for the rationale.
+    #[arg(long, default_value_t = false, env = "OPEN_SANDBOX_AUTO_MIGRATE")]
+    pub auto_migrate: bool,
+
+    /// Maximum seconds to wait for in-flight IoSessions to complete
+    /// after SIGTERM before sending each remaining gateway stream a
+    /// terminal `Unavailable` frame and exiting. Bounds the blast
+    /// radius of a planned proxy restart. Default: 30s.
+    #[arg(
+        long,
+        default_value_t = 30,
+        env = "OPEN_SANDBOX_SHUTDOWN_DRAIN_TIMEOUT"
+    )]
+    pub shutdown_drain_timeout: u64,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct MigrateArgs {
+    /// PostgreSQL connection URL (contains the password — never logged).
+    /// Same value as the controller's and proxy's --database-url.
     #[arg(long, env = "OPEN_SANDBOX_DATABASE_URL")]
     pub database_url: Redacted,
 }
