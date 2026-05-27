@@ -30,6 +30,34 @@ export function wsBase(httpBase: string): string {
   );
 }
 
+/** Derive the public reverse-proxy URL for a sandbox given the api
+ *  gateway base. The proxy serves `<subdomain>.<host>:<proxy_port>`;
+ *  for local dev (loopback hosts) we substitute `localtest.me`, which
+ *  resolves to 127.0.0.1 without any /etc/hosts edits (per
+ *  PLAN_DEV_MODE.md probe #4). Proxy port defaults to 8080 when the
+ *  api base uses the dev convention (8081 → 8080 swap); otherwise we
+ *  reuse the api host's port verbatim (production single-port
+ *  deployments). */
+export function publicUrl(apiBase: string, subdomain: string): string {
+  try {
+    const u = new URL(trimBase(apiBase));
+    const isLocal =
+      u.hostname === "127.0.0.1" ||
+      u.hostname === "localhost" ||
+      u.hostname === "::1" ||
+      u.hostname === "[::1]";
+    const host = isLocal ? "localtest.me" : u.hostname;
+    // 8081 (api) → 8080 (proxy) is the convention dev-up.sh uses; any
+    // other port is left alone so production deployments terminating
+    // the api and the proxy on the same hostname:port both work.
+    const port = u.port === "8081" ? "8080" : u.port;
+    const portStr = port ? `:${port}` : "";
+    return `${u.protocol}//${subdomain}.${host}${portStr}`;
+  } catch {
+    return `http://${subdomain}.localtest.me:8080`;
+  }
+}
+
 // base64url-no-padding — keeps the API key inside the RFC 7230 token
 // grammar that browsers enforce on subprotocol values.
 export function b64urlEncode(s: string): string {

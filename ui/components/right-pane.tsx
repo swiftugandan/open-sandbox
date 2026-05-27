@@ -1,8 +1,17 @@
 "use client";
 
-import { useState } from "react";
-import { Terminal, FileText, Info, ListChecks } from "lucide-react";
+import { useEffect, useState } from "react";
+import {
+  Check,
+  Copy,
+  ExternalLink,
+  FileText,
+  Info,
+  ListChecks,
+  Terminal,
+} from "lucide-react";
 import type { ApiConfig, Sandbox } from "@/lib/api";
+import { publicUrl } from "@/lib/api";
 import { ExecTerminal } from "@/components/exec-terminal";
 import { FilesPanel } from "@/components/files-panel";
 import { Button } from "@/components/ui/button";
@@ -43,8 +52,11 @@ export function RightPane({ config, sandbox, onOpenList }: Props) {
     );
   }
 
+  const url = publicUrl(config.base, sandbox.subdomain);
+
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
+      <SandboxUrlBar url={url} />
       <nav className="flex shrink-0 items-stretch overflow-x-auto border-b border-border bg-surface">
         {TABS.map(({ id, label, icon: Icon }) => (
           <button
@@ -84,6 +96,83 @@ export function RightPane({ config, sandbox, onOpenList }: Props) {
           </pre>
         </div>
       </div>
+    </div>
+  );
+}
+
+function SandboxUrlBar({ url }: { url: string }) {
+  const [copied, setCopied] = useState(false);
+  // Auto-clear the "copied" indicator after a short window so the
+  // button doesn't read as "copied" indefinitely after the user moves
+  // on; cleanup cancels the timer if they click again first.
+  useEffect(() => {
+    if (!copied) return;
+    const t = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(t);
+  }, [copied]);
+
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+    } catch {
+      // clipboard.writeText rejects when the page isn't focused / in
+      // an insecure context; fall back to a selection-based copy via
+      // a hidden textarea so the user still gets *something*.
+      const ta = document.createElement("textarea");
+      ta.value = url;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        setCopied(true);
+      } catch {
+        /* nothing left to try */
+      }
+      document.body.removeChild(ta);
+    }
+  };
+
+  return (
+    <div className="flex shrink-0 items-center gap-1.5 border-b border-border bg-surface px-3 py-1.5">
+      <span className="shrink-0 text-[10.5px] uppercase tracking-wider text-fg-muted">
+        URL
+      </span>
+      <a
+        href={url}
+        target="_blank"
+        rel="noreferrer noopener"
+        className="group flex min-w-0 flex-1 items-center gap-1 truncate font-mono text-[11.5px] text-fg-muted transition-colors hover:text-accent"
+        title={`Open ${url} in a new tab`}
+      >
+        <span className="truncate">{url}</span>
+        <ExternalLink className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
+      </a>
+      <button
+        type="button"
+        onClick={onCopy}
+        title={copied ? "Copied!" : "Copy URL"}
+        className={cn(
+          "flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] transition-colors",
+          copied
+            ? "text-ok"
+            : "text-fg-muted hover:bg-surface-2 hover:text-fg",
+        )}
+      >
+        {copied ? (
+          <>
+            <Check className="size-3.5" />
+            <span>copied</span>
+          </>
+        ) : (
+          <>
+            <Copy className="size-3.5" />
+            <span className="hidden sm:inline">copy</span>
+          </>
+        )}
+      </button>
     </div>
   );
 }
