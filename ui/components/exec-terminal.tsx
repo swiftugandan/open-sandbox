@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Play, Square, Plug, PlugZap } from "lucide-react";
-import type { ApiConfig } from "@/lib/api";
+import type { ApiConfig, SandboxStatus } from "@/lib/api";
 import {
   WS_AUTH_SENTINEL,
   b64urlEncode,
+  isRunningStatus,
   parseCommand,
   wsBase,
 } from "@/lib/api";
@@ -21,15 +22,30 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/cn";
+import { consumeExecPrefill } from "@/lib/exec-prefill";
 
 type WsState = "idle" | "connecting" | "open" | "closed";
 
 interface Props {
   config: ApiConfig;
   sandboxId: string;
+  // Drives the autorun gate: the agent rejects exec attempts before
+  // the sandbox is fully registered (SANDBOX_NOT_FOUND), so an
+  // auto-fire from a template prefill has to wait until the parent's
+  // poll observes status="running".
+  sandboxStatus: SandboxStatus;
+  /** Notify the parent when this sandbox has (probably) a process
+   *  listening on :8080. Called true on a Started frame, false on
+   *  Exited / Error / WS close. Drives the RightPane's URL bar. */
+  onUrlExpectedChange: (id: string, on: boolean) => void;
 }
 
-export function ExecTerminal({ config, sandboxId }: Props) {
+export function ExecTerminal({
+  config,
+  sandboxId,
+  sandboxStatus,
+  onUrlExpectedChange,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<{
     term: import("@xterm/xterm").Terminal;
@@ -37,8 +53,29 @@ export function ExecTerminal({ config, sandboxId }: Props) {
   } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
-  const [cmd, setCmd] = useState('sh -c "uname -a && echo hello"');
+  // The right pane re-keys this component on sandboxId change, so the
+  // lazy initializers below run once per mount per sandbox — exactly
+  // the window we want to consume a single-shot template prefill.
+  const prefill = useRef(consumeExecPrefill(sandboxId)).current;
+  const [cmd, setCmd] = useState<string>(
+    prefill?.command ?? 'sh -c "uname -a && echo hello"',
+  );
   const [state, setState] = useState<WsState>("idle");
+  // Autorun lifecycle: `pending` from prefill if the create form told
+  // us to fire as soon as we can; `fired` once we've sent the Start
+  // frame, so a flap to "running" → "starting" → "running" doesn't
+  // re-fire and stomp the user's first session.
+  const [autorun, setAutorun] = useState<"pending" | "fired" | "off">(
+    prefill?.autorun ? "pending" : "off",
+  );
+  // One-shot copy so we only print the "waiting…" line once per
+  // pending autorun, not on every render the status churns.
+  const waitingPrintedRef = useRef(false);
+  // Flips to true once xterm has finished its async init below.
+  // Drives the autorun effect — without this, an autorun arriving
+  // before xterm is ready would silently no-op because the effect
+  // bails on `termRef.current == null`.
+  const [termReady, setTermReady] = useState(false);
 
   // Init xterm once
   useEffect(() => {
@@ -76,6 +113,7 @@ export function ExecTerminal({ config, sandboxId }: Props) {
         }
       });
       termRef.current = { term, fit };
+      setTermReady(true);
     })();
 
     return () => {
@@ -111,9 +149,13 @@ export function ExecTerminal({ config, sandboxId }: Props) {
     setState("idle");
   };
 
-  const run = () => {
+  const run = useCallback(() => {
     if (!termRef.current) return;
-    if (wsRef.current) closeWS();
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+      setState("idle");
+    }
     const argv = parseCommand(cmd.trim());
     if (argv.length === 0) return;
     if (!config.key) {
@@ -158,6 +200,7 @@ export function ExecTerminal({ config, sandboxId }: Props) {
           term.writeln(
             `\x1b[38;5;245mstarted exec_id=${s.execId} pid=${s.inContainerPid}\x1b[0m`,
           );
+          onUrlExpectedChange(sandboxId, true);
           break;
         }
         case Kind.Stdout:
@@ -175,11 +218,13 @@ export function ExecTerminal({ config, sandboxId }: Props) {
           term.writeln(
             `\r\n\x1b[${col}mexited ${e.exitCode}${cnf}\x1b[0m`,
           );
+          onUrlExpectedChange(sandboxId, false);
           break;
         }
         case Kind.Error: {
           const e = decodeIoError(body);
           term.writeln(`\r\n\x1b[31m[${e.code}] ${e.detail}\x1b[0m`);
+          onUrlExpectedChange(sandboxId, false);
           break;
         }
         default:
@@ -196,11 +241,36 @@ export function ExecTerminal({ config, sandboxId }: Props) {
       }
       wsRef.current = null;
       setState("closed");
+      // The agent SIGTERMs the in-container process when the WS
+      // closes (spike-01 + ADR-006), so a closed session means
+      // nothing's listening anymore — drop the URL.
+      onUrlExpectedChange(sandboxId, false);
     };
     ws.onerror = () => {
       setState("closed");
     };
-  };
+  }, [cmd, config.base, config.key, sandboxId, onUrlExpectedChange]);
+
+  // Autorun gate. When a template-driven create set autorun=true, we
+  // can't fire immediately — the agent registers the sandbox only
+  // after it transitions to "running"; an earlier attempt would 404
+  // with SANDBOX_NOT_FOUND. Wait for the parent's poll to surface
+  // "running", then fire exactly once.
+  useEffect(() => {
+    if (autorun !== "pending") return;
+    if (!termReady || !termRef.current) return;
+    if (isRunningStatus(sandboxStatus)) {
+      setAutorun("fired");
+      run();
+      return;
+    }
+    if (!waitingPrintedRef.current) {
+      waitingPrintedRef.current = true;
+      termRef.current.term.writeln(
+        `\x1b[38;5;245m· waiting for sandbox to start (status=${sandboxStatus})…\x1b[0m`,
+      );
+    }
+  }, [autorun, sandboxStatus, termReady, run]);
 
   const sigterm = () => {
     const ws = wsRef.current;

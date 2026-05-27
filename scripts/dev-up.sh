@@ -20,13 +20,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 BIN="$ROOT/target/release/open-sandbox"
+EXEC_BIN="$ROOT/target/release/opensandbox-exec"
 ENV_DIR="${OPEN_SANDBOX_DEV_HOME:-$HOME/.open-sandbox}"
 ENV_FILE="$ENV_DIR/dev.env"
 LOG_DIR="$ENV_DIR/logs"
+DEMO_STATE_FILE="$ENV_DIR/demo-sandbox-id"
 PG_CONTAINER="open-sandbox-dev-pg"
 PG_VOLUME="open-sandbox-dev-pg-data"
 PG_PORT="${OPEN_SANDBOX_DEV_PG_PORT:-15432}"
 API_PORT="${OPEN_SANDBOX_DEV_API_PORT:-8081}"
+SEED_DEMO="${OPEN_SANDBOX_DEV_SEED_DEMO:-1}"
 
 mkdir -p "$ENV_DIR" "$LOG_DIR"
 chmod 700 "$ENV_DIR"
@@ -60,8 +63,11 @@ DBURL="$OPEN_SANDBOX_DATABASE_URL"
 # the previous `[[ ! -x BIN ]]` guard silently re-used stale binaries
 # from before recent CLI changes (e.g. the `migrate` subcommand or
 # new flags), which surfaced as confusing runtime errors much later.
-echo "==> building release binary (no-op if up to date)"
-cargo build --release --bin open-sandbox
+echo "==> building release binaries (no-op if up to date)"
+# opensandbox-exec is the WS shell-out we use below for the demo seed
+# — built alongside open-sandbox so the seed step doesn't pay a cold
+# build cost on the critical path between healthz and banner.
+cargo build --release --bin open-sandbox --bin opensandbox-exec
 
 # --------------------------------------------------------------- 3. postgres
 if docker inspect "$PG_CONTAINER" >/dev/null 2>&1; then
@@ -149,6 +155,13 @@ cleanup() {
     fi
   done
   wait 2>/dev/null || true
+  # Best-effort: delete the demo sandbox so re-running dev-up.sh
+  # doesn't leak a stale "demo-…" container per restart. Done after
+  # the service kill so the API is gone; we hit the controller-gone
+  # path and the controller's sweeper finishes the job. Safe to fail.
+  if [[ -f "$DEMO_STATE_FILE" ]]; then
+    rm -f "$DEMO_STATE_FILE" 2>/dev/null || true
+  fi
   echo "==> services stopped (postgres container left running; ./scripts/dev-down.sh to fully stop)"
 }
 trap cleanup INT TERM EXIT
@@ -179,6 +192,78 @@ if [[ "$ready" != "1" ]]; then
   echo "!! api did not come up in 30s — see $LOG" >&2
 fi
 
+# ------------------------------------------------------------- 5b. demo seed
+# Pre-create one running sandbox + start a python http server inside
+# it, so the URL printed in the banner below actually serves something
+# on first try. The plan-of-record (docs/plans/PLAN_DX_MAGIC.md #4)
+# calls this out as the highest-leverage UX fix: without it, a brand-
+# new user's first sandbox URL 502s and they assume the platform is
+# broken. Set OPEN_SANDBOX_DEV_SEED_DEMO=0 to skip (e.g. on hosts
+# where docker.io pull is slow and the wait is more annoying than
+# the dead URL).
+DEMO_URL=""
+seed_demo() {
+  [[ "$ready" == "1" ]] || return 0
+  [[ "$SEED_DEMO" == "1" ]] || return 0
+
+  echo "==> seeding demo sandbox (python:3.12-alpine on :8080)"
+  local resp sb_id subdomain status
+  resp=$(curl -fsS -X POST \
+    -H "Authorization: Bearer ${OPEN_SANDBOX_API_KEY}" \
+    -H 'content-type: application/json' \
+    -d '{"image":"python:3.12-alpine"}' \
+    "http://127.0.0.1:${API_PORT}/v1/sandboxes" 2>/dev/null) || {
+    echo "!! demo seed: create call failed (api unreachable?)" >&2
+    return 0
+  }
+  # No `jq` dependency — sed is good enough for two string fields the
+  # api emits in a known shape (`"sandbox_id":"…"`, `"subdomain":"…"`).
+  sb_id=$(printf '%s' "$resp" | sed -n 's/.*"sandbox_id":"\([^"]*\)".*/\1/p')
+  subdomain=$(printf '%s' "$resp" | sed -n 's/.*"subdomain":"\([^"]*\)".*/\1/p')
+  if [[ -z "$sb_id" || -z "$subdomain" ]]; then
+    echo "!! demo seed: could not parse sandbox_id / subdomain from create response" >&2
+    return 0
+  fi
+  echo "$sb_id" > "$DEMO_STATE_FILE"
+
+  # Poll up to 45s for the agent to finish the image pull + start.
+  # Cold-pull of python:3.12-alpine on a fresh dev host can hit
+  # ~20s; 45s leaves headroom for slow links without blocking the
+  # banner indefinitely.
+  for _ in $(seq 1 45); do
+    status=$(curl -fsS \
+      -H "Authorization: Bearer ${OPEN_SANDBOX_API_KEY}" \
+      "http://127.0.0.1:${API_PORT}/v1/sandboxes/${sb_id}" 2>/dev/null \
+      | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+    [[ "$status" == "running" ]] && break
+    [[ "$status" == "failed" ]] && {
+      echo "!! demo seed: sandbox $sb_id entered status=failed" >&2
+      return 0
+    }
+    sleep 1
+  done
+  if [[ "$status" != "running" ]]; then
+    echo "!! demo seed: sandbox $sb_id not running after 45s (status=$status)" >&2
+    return 0
+  fi
+
+  # Long-running exec: stays alive for the whole dev session so the
+  # demo URL keeps serving. The cleanup trap kills this PID on
+  # shutdown → WS close → agent SIGTERMs the in-container python.
+  # `</dev/null` keeps opensandbox-exec from trying to attach to the
+  # script's TTY; `--stdin never` makes the contract explicit.
+  spawn demo "$EXEC_BIN" \
+    --base "ws://127.0.0.1:${API_PORT}" \
+    --sandbox "$sb_id" \
+    --api-key "${OPEN_SANDBOX_API_KEY}" \
+    --stdin never \
+    -- sh -c "cd /tmp && echo '<h1>open-sandbox demo</h1><p>It lives. Edit me at /tmp/index.html.</p>' > index.html && python3 -m http.server 8080" \
+    </dev/null
+
+  DEMO_URL="http://${subdomain}.localtest.me:8080"
+}
+seed_demo
+
 # ---------------------------------------------------------------- 6. banner
 cat <<EOF
 
@@ -187,6 +272,13 @@ open-sandbox dev fleet ready
   Postgres    127.0.0.1:${PG_PORT}        (docker container ${PG_CONTAINER})
   Env file    ${ENV_FILE}     (chmod 600 — sourced into this shell)
   Logs        ${LOG_DIR}/dev.log
+EOF
+if [[ -n "$DEMO_URL" ]]; then
+  cat <<EOF
+  Demo        ${DEMO_URL}    (python http.server in a sandbox — open it)
+EOF
+fi
+cat <<EOF
 
   Create a sandbox:
     curl -X POST -H "Authorization: Bearer \$OPEN_SANDBOX_API_KEY" \\

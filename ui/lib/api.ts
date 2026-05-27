@@ -5,11 +5,38 @@
 // Must match WS_AUTH_PROTOCOL_SENTINEL in crates/contracts/src/constants.rs.
 export const WS_AUTH_SENTINEL = "open-sandbox.v1";
 
+/** The status strings the controller serializes for `SandboxInfo.status`.
+ *  Source of truth: `sandbox_state_to_str` in `crates/controller/src/grpc.rs`.
+ *  The intersection with `string & {}` keeps autocompletion of the known
+ *  variants but still accepts unknown strings — the contract's
+ *  `SandboxState` enum is `#[non_exhaustive]`, so a future variant we
+ *  haven't mirrored here shouldn't crash the UI. */
+export type SandboxStatus =
+  | "creating"
+  | "running"
+  | "stopping"
+  | "stopped"
+  | "failed"
+  | "pausing"
+  | "paused"
+  | "unpausing"
+  | "unknown"
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  | (string & {});
+
+/** True when the sandbox is ready to accept exec / serve traffic.
+ *  Centralizing the predicate so we don't sprinkle string literals
+ *  across components (and so we can refine the rule without touching
+ *  every call site). */
+export function isRunningStatus(s: SandboxStatus): boolean {
+  return s === "running";
+}
+
 export interface Sandbox {
   sandbox_id: string;
   agent_id: string;
   subdomain: string;
-  status: string;
+  status: SandboxStatus;
   error?: string | null;
 }
 
@@ -139,11 +166,38 @@ export const api = {
     request<{ sandboxes: Sandbox[] }>(cfg, "/v1/sandboxes"),
   get: (cfg: ApiConfig, id: string) =>
     request<Sandbox>(cfg, `/v1/sandboxes/${id}`),
-  create: (cfg: ApiConfig, image: string) =>
-    request<Sandbox>(cfg, "/v1/sandboxes", {
+  create: (
+    cfg: ApiConfig,
+    image: string,
+    opts: {
+      exposedPort?: number;
+      envVars?: Record<string, string>;
+      cpuMillicores?: number;
+      memoryBytes?: number;
+    } = {},
+  ) => {
+    // Only include non-default fields so the controller's
+    // "0 → DEFAULT_*" fallbacks stay in charge of platform defaults.
+    // Sending 0 explicitly works today but leaks contract-internal
+    // magic values into the wire.
+    const body: Record<string, unknown> = { image };
+    if (opts.exposedPort && opts.exposedPort > 0) {
+      body.exposed_port = opts.exposedPort;
+    }
+    if (opts.envVars && Object.keys(opts.envVars).length > 0) {
+      body.env_vars = opts.envVars;
+    }
+    if (opts.cpuMillicores && opts.cpuMillicores > 0) {
+      body.cpu_millicores = opts.cpuMillicores;
+    }
+    if (opts.memoryBytes && opts.memoryBytes > 0) {
+      body.memory_bytes = opts.memoryBytes;
+    }
+    return request<Sandbox>(cfg, "/v1/sandboxes", {
       method: "POST",
-      body: JSON.stringify({ image }),
-    }),
+      body: JSON.stringify(body),
+    });
+  },
   remove: (cfg: ApiConfig, id: string) =>
     request<void>(cfg, `/v1/sandboxes/${id}`, { method: "DELETE" }),
   pause: (cfg: ApiConfig, id: string) =>

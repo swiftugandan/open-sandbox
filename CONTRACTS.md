@@ -35,7 +35,7 @@ Summary of v1.0 changes vs v0.7:
 ### Serialization
 
 - Format: Protocol Buffers for gRPC wire messages (defined in `proto/controller.proto` and `proto/proxy.proto`). JSON via `serde` for API responses, Postgres JSONB columns, and debugging.
-- Field naming: Proto messages use `snake_case` per proto3 convention. Serde-serialized Rust types use `#[serde(rename_all = "camelCase")]` for API-facing JSON only; internal types use Rust's default `snake_case`.
+- Field naming: **`snake_case` everywhere on the wire** — proto3 convention for gRPC messages and, intentionally, the same convention for the public REST API. Serde-serialized Rust types at API boundaries (e.g. `CreateRequest`, `SandboxInfo` in `crates/api/src/service.rs`) use Rust's default `snake_case` field naming — no `#[serde(rename_all = "camelCase")]` — so external clients can read a single naming convention across REST and gRPC. (Earlier revisions of this doc claimed camelCase for API JSON, but the implementation has never matched that claim; ratified as snake_case here so the doc and the wire agree.)
 - Unknown field handling: Proto3 preserves unknown fields by default. Serde types are `#[serde(deny_unknown_fields)]` at API boundaries, permissive internally.
 
 ### Versioning

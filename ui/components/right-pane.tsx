@@ -10,8 +10,8 @@ import {
   ListChecks,
   Terminal,
 } from "lucide-react";
-import type { ApiConfig, Sandbox } from "@/lib/api";
-import { publicUrl } from "@/lib/api";
+import type { ApiConfig, Sandbox, SandboxStatus } from "@/lib/api";
+import { isRunningStatus, publicUrl } from "@/lib/api";
 import { ExecTerminal } from "@/components/exec-terminal";
 import { FilesPanel } from "@/components/files-panel";
 import { Button } from "@/components/ui/button";
@@ -31,17 +31,39 @@ const TABS: {
 interface Props {
   config: ApiConfig;
   sandbox: Sandbox | null;
+  /** Drives the no-selection empty state: with zero sandboxes
+   *  anywhere, "Select a sandbox" is a lie — there's nothing to
+   *  select. Swap to a "pick a template" pointer in that case. */
+  hasAnySandboxes: boolean;
+  /** Best-effort signal: did ExecTerminal observe a Started frame
+   *  without a subsequent Exited? Drives the URL bar — false means
+   *  hide the URL (nothing's bound to :8080). */
+  urlExpected: boolean;
+  /** Plumbed down to ExecTerminal so its WS lifecycle can update the
+   *  Console-level urlExpected map. */
+  onUrlExpectedChange: (id: string, on: boolean) => void;
   /** Provided on mobile: lets the empty/active panes reopen the sandbox list drawer. */
   onOpenList?: () => void;
 }
 
-export function RightPane({ config, sandbox, onOpenList }: Props) {
+export function RightPane({
+  config,
+  sandbox,
+  hasAnySandboxes,
+  urlExpected,
+  onUrlExpectedChange,
+  onOpenList,
+}: Props) {
   const [tab, setTab] = useState<Tab>("exec");
 
   if (!sandbox) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-[12.5px] text-fg-muted">
-        <p>Select a sandbox to start, or create one from the list.</p>
+        <p>
+          {hasAnySandboxes
+            ? "Select a sandbox from the list to see its terminal, files, and URL here."
+            : "Configure a sandbox on the left — pick a template (or create a blank one), set env vars or resources if you need them, then hit Create & run."}
+        </p>
         {onOpenList && (
           <Button onClick={onOpenList} variant="secondary">
             <ListChecks className="size-3.5" />
@@ -53,10 +75,15 @@ export function RightPane({ config, sandbox, onOpenList }: Props) {
   }
 
   const url = publicUrl(config.base, sandbox.subdomain);
+  const urlVisible = isRunningStatus(sandbox.status) && urlExpected;
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <SandboxUrlBar url={url} />
+      <SandboxUrlBar
+        url={url}
+        visible={urlVisible}
+        status={sandbox.status}
+      />
       <nav className="flex shrink-0 items-stretch overflow-x-auto border-b border-border bg-surface">
         {TABS.map(({ id, label, icon: Icon }) => (
           <button
@@ -80,6 +107,8 @@ export function RightPane({ config, sandbox, onOpenList }: Props) {
             key={sandbox.sandbox_id}
             config={config}
             sandboxId={sandbox.sandbox_id}
+            sandboxStatus={sandbox.status}
+            onUrlExpectedChange={onUrlExpectedChange}
           />
         </div>
         <div className={cn("h-full", tab !== "files" && "hidden")}>
@@ -100,7 +129,38 @@ export function RightPane({ config, sandbox, onOpenList }: Props) {
   );
 }
 
-function SandboxUrlBar({ url }: { url: string }) {
+function SandboxUrlBar({
+  url,
+  visible,
+  status,
+}: {
+  url: string;
+  visible: boolean;
+  status: SandboxStatus;
+}) {
+  // When the URL would 502, show context instead. Three cases worth
+  // distinguishing: not yet running (still booting), running but
+  // nothing observed bound to :8080 (blank sandbox, exited process,
+  // or just hasn't been started yet), and the happy path.
+  if (!visible) {
+    const message = !isRunningStatus(status)
+      ? `URL appears once the sandbox is running (status: ${status})`
+      : "Start a process on :8080 in the Exec tab to get a public URL";
+    return (
+      <div className="flex shrink-0 items-center gap-1.5 border-b border-border bg-surface px-3 py-1.5">
+        <span className="shrink-0 text-[10.5px] uppercase tracking-wider text-fg-muted">
+          URL
+        </span>
+        <span className="min-w-0 flex-1 truncate text-[11.5px] italic text-fg-muted">
+          {message}
+        </span>
+      </div>
+    );
+  }
+  return <SandboxUrlBarLive url={url} />;
+}
+
+function SandboxUrlBarLive({ url }: { url: string }) {
   const [copied, setCopied] = useState(false);
   // Auto-clear the "copied" indicator after a short window so the
   // button doesn't read as "copied" indefinitely after the user moves
