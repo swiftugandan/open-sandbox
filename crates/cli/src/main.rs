@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use open_sandbox::cli::{Cli, Command};
-use open_sandbox::{run, run_subcommand};
+use open_sandbox::{run, run_subcommand, ssh};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -41,6 +41,8 @@ async fn main() -> ExitCode {
         Command::Api(args) => report(run::run_api(args).await),
         Command::Migrate(args) => report(run::run_migrate(args).await),
         Command::Run(args) => run_subcommand::run(args).await,
+        Command::Ssh(args) => ssh::ssh(args),
+        Command::SshPipe(args) => ssh::ssh_pipe(args).await,
     }
 }
 

@@ -84,6 +84,51 @@ fn run_without_image_fails() {
 }
 
 #[test]
+fn ssh_help_shows_flags() {
+    Command::cargo_bin("open-sandbox")
+        .unwrap()
+        .args(["ssh", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SANDBOX_ID"))
+        .stdout(predicate::str::contains("--no-install"))
+        .stdout(predicate::str::contains("--ssh-key"))
+        .stdout(predicate::str::contains("--api-base"));
+}
+
+#[test]
+fn ssh_hidden_subcommand_does_not_leak_in_top_help() {
+    // ssh-pipe is `hide = true` — should not appear in `--help`.
+    Command::cargo_bin("open-sandbox")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ssh-pipe").not());
+}
+
+#[test]
+fn ssh_pipe_is_still_callable_when_hidden() {
+    // Hidden, but invocable + has its own help.
+    Command::cargo_bin("open-sandbox")
+        .unwrap()
+        .args(["ssh-pipe", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SANDBOX_ID"));
+}
+
+#[test]
+fn ssh_without_sandbox_id_fails() {
+    Command::cargo_bin("open-sandbox")
+        .unwrap()
+        .args(["ssh", "--api-key", "k"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("SANDBOX_ID"));
+}
+
+#[test]
 fn run_rejects_malformed_env() {
     Command::cargo_bin("open-sandbox")
         .unwrap()

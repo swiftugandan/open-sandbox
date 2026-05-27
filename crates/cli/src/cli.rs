@@ -35,6 +35,18 @@ pub enum Command {
     /// created, the command is exec'd over the streaming WebSocket,
     /// and on exit the sandbox is destroyed.
     Run(RunArgs),
+    /// SSH into a running sandbox. Wraps a local `ssh` client whose
+    /// ProxyCommand pipes through the streaming exec WebSocket — no
+    /// inbound ports, no port-forwarding, no NAT. The first connect
+    /// to a sandbox auto-installs openssh-server inside it; subsequent
+    /// connects are immediate.
+    Ssh(SshArgs),
+    /// `ProxyCommand` backend for `open-sandbox ssh`. Pipes local
+    /// stdin/stdout to an in-container `sshd -i` over the exec
+    /// WebSocket. Not intended for direct human use — invoked by
+    /// the local `ssh` client via `-o ProxyCommand=...`.
+    #[command(name = "ssh-pipe", hide = true)]
+    SshPipe(SshPipeArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -215,6 +227,67 @@ fn parse_pull_policy(s: &str) -> Result<open_sandbox_contracts::types::PullPolic
             "unknown pull policy `{other}`; expected if-not-present, always, or never"
         )),
     }
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct SshArgs {
+    /// Sandbox ID to ssh into.
+    pub sandbox_id: String,
+
+    /// Skip the auto-install of openssh-server inside the sandbox.
+    /// Use when the image already bundles sshd, or for air-gapped
+    /// images that must not run `apk add` / `apt-get install`.
+    #[arg(long)]
+    pub no_install: bool,
+
+    /// SSH identity (private-key file) to present. Optional — the
+    /// default openssh bootstrap permits empty-password root login
+    /// because the WS exec channel is already authenticated by the
+    /// api key one layer up.
+    #[arg(long = "ssh-key", short = 'i')]
+    pub ssh_key: Option<String>,
+
+    /// Base URL of the open-sandbox api gateway. http(s) for REST,
+    /// same host:port speaks ws(s) for the exec stream.
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:8081",
+        env = "OPEN_SANDBOX_API_BASE"
+    )]
+    pub api_base: String,
+
+    /// Bearer API key for the api gateway (never logged).
+    #[arg(long, env = "OPEN_SANDBOX_API_KEY")]
+    pub api_key: Redacted,
+
+    /// Trailing command and arguments to run on the remote, just
+    /// like plain `ssh user@host -- cmd args`. Empty = interactive
+    /// shell.
+    #[arg(trailing_var_arg = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct SshPipeArgs {
+    /// Sandbox ID to open a pipe into.
+    pub sandbox_id: String,
+
+    /// Skip the openssh-server auto-install. Inherited from
+    /// `open-sandbox ssh --no-install`.
+    #[arg(long)]
+    pub no_install: bool,
+
+    /// Base URL of the open-sandbox api gateway.
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:8081",
+        env = "OPEN_SANDBOX_API_BASE"
+    )]
+    pub api_base: String,
+
+    /// Bearer API key for the api gateway.
+    #[arg(long, env = "OPEN_SANDBOX_API_KEY")]
+    pub api_key: Redacted,
 }
 
 #[derive(Parser, Debug, Clone)]

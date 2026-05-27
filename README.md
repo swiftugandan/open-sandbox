@@ -114,6 +114,40 @@ curl -X POST -H "Authorization: Bearer dev-api-key" \
      http://127.0.0.1:8081/v1/sandboxes/<id>/unpause    # → 202 {"status":"unpausing"}
 ```
 
+### SSH into a sandbox
+
+`open-sandbox ssh` shells out to the local `ssh` client with a
+`ProxyCommand` that pipes through the streaming exec WebSocket — no
+inbound ports, no port forwarding. First connect auto-installs
+`openssh-server` inside the sandbox (~3s); subsequent connects are
+~200ms.
+
+```sh
+export OPEN_SANDBOX_API_KEY=…
+open-sandbox ssh <sandbox-id>                       # interactive shell
+open-sandbox ssh <sandbox-id> -- uname -a           # one-shot command
+open-sandbox ssh <sandbox-id> --no-install          # skip auto-install (pre-baked images)
+```
+
+Once you've connected once, this lets `scp`, `rsync`, `git push`,
+and VS Code Remote-SSH work directly without `open-sandbox` in the
+command line — export `OPEN_SANDBOX_API_KEY` in your shell and add
+to `~/.ssh/config`:
+
+```
+Host sandbox-*
+    ProxyCommand open-sandbox ssh-pipe %h
+    User root
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+```
+
+(`ssh-pipe` accepts both the bare UUID and the `sandbox-<uuid>`
+form, so the `%h` wildcard works as-is.)
+
+Then `ssh sandbox-<id>`, `scp file sandbox-<id>:/tmp/`, and
+`code --remote ssh-remote+sandbox-<id> /workspace` all work.
+
 ### Web console (`ui/`)
 
 The repo ships a Next.js 16 dev console:
