@@ -35,9 +35,9 @@ BYO devs ──install──► [Agent on their machine]               │
 ## Status
 
 - **Frozen wire shape:** `contracts/v1.0.0-frozen` (2026-05-23)
-- **Current contracts version on `main`:** `contracts/v1.0.2` — item #13 (`PullPolicy` + warm-startup optimization arc) shipped 2026-05-26; items #1–#12 pending a separate session (see [`docs/plans/PLAN_CONTRACTS_v1.0.2.md`](docs/plans/PLAN_CONTRACTS_v1.0.2.md))
+- **Current contracts version on `main`:** `contracts/v1.0.2` — item #13 (`PullPolicy` + warm-startup optimization arc) shipped 2026-05-26; subsequent v1.0.2 additions: WebSocket subprotocol auth (browsers), opt-in CORS, fail-closed-on-empty API key, Pause/Unpause sandbox lifecycle. Items #1–#12 pending a separate session (see [`docs/plans/PLAN_CONTRACTS_v1.0.2.md`](docs/plans/PLAN_CONTRACTS_v1.0.2.md))
 - **Tag note:** the `contracts/v1.0.2` git tag points at the initial v1.0.2 commit (`0e68177`, pre-#13); tag movement deferred until #1–#12 ship
-- 86 macOS unit tests + 31 Linux youki tests green on `main`
+- 154 unit tests green on `main` across contracts/agent/agent-docker/api/controller; 31 Linux youki tests green
 
 ## Repository layout
 
@@ -50,9 +50,11 @@ BYO devs ──install──► [Agent on their machine]               │
 | `crates/api/` | REST/WebSocket gateway. Translates HTTP ↔ gRPC, owns the public surface |
 | `crates/agent/` | Agent core: tunnel client, sandbox manager, exec session driver |
 | `crates/agent-docker/` | Docker Engine runtime impl (dev fallback) |
-| `crates/agent-youki/` | youki/libcontainer runtime impl (production) |
+| `crates/agent-youki/` | youki/libcontainer runtime impl (production) — includes a Linux dev-container compose so the agent builds + runs from a macOS host |
 | `crates/ws-client/` | Rust SDK for the WebSocket exec API |
-| `crates/cli/` | The `open-sandbox` binary — bundles all subcommands |
+| `crates/cli/` | The `open-sandbox` binary — bundles all subcommands. Cargo features: `docker` (default), `youki` (Linux only) |
+| `ui/` | Next.js 16 dev console (React 19 + Tailwind v4 + xterm.js + lucide icons). Lists / creates / deletes sandboxes, streams exec, reads + writes files |
+| `ui-legacy-index.html` | Original single-file vanilla-HTML console — kept as the simplest possible reference client for the wire API |
 | `infra/` | Pulumi stack (TypeScript) and end-to-end shell scenarios |
 | `spikes/` | Time-boxed investigations with `RESULT.md` write-ups |
 | `SPEC.md`, `SAD.md`, `CONTRACTS.md` | Functional spec, architecture doc, contracts prose |
@@ -85,29 +87,78 @@ export CONTROLLER_ADMIN_TOKEN=dev-admin \
 ./target/release/open-sandbox api        --controller-url http://127.0.0.1:50051 --proxy-url http://127.0.0.1:50053 &
 ./target/release/open-sandbox agent      --controller-url http://127.0.0.1:50051 --proxy-url http://127.0.0.1:50052 &
 
-# Create a sandbox
+# Create a sandbox (returns sandbox_id, subdomain, agent_id, status="creating")
 curl -X POST -H "Authorization: Bearer dev-api-key" -H 'content-type: application/json' \
      -d '{"image":"alpine:3.21"}' \
      http://127.0.0.1:8081/v1/sandboxes
+
+# Pause / resume a running sandbox (v1.0.2)
+curl -X POST -H "Authorization: Bearer dev-api-key" \
+     http://127.0.0.1:8081/v1/sandboxes/<id>/pause      # → 202 {"status":"pausing"}
+curl -X POST -H "Authorization: Bearer dev-api-key" \
+     http://127.0.0.1:8081/v1/sandboxes/<id>/unpause    # → 202 {"status":"unpausing"}
 ```
 
-### Optional: dev console (browser UI)
+### Web console (`ui/`)
 
-A single-file dev console lives at [`ui/index.html`](ui/index.html) — sandbox list / create / delete, streaming exec terminal (xterm.js over the WS endpoint), and file read/write. To serve it from a different origin than the API, set `OPEN_SANDBOX_API_CORS_ORIGINS` on the api binary:
+The repo ships a Next.js 16 dev console:
 
 ```sh
-OPEN_SANDBOX_API_CORS_ORIGINS=http://127.0.0.1:8090 \
+# Allow the console (8090) to call the API (8081) cross-origin
+OPEN_SANDBOX_API_CORS_ORIGINS='*' \
     ./target/release/open-sandbox api ...
 
-(cd ui && python3 -m http.server 8090)
+# Run the console (binds 0.0.0.0:8090 — reachable from your LAN)
+cd ui && pnpm install && pnpm dev
 ```
 
-`OPEN_SANDBOX_API_CORS_ORIGINS` accepts a comma-separated list, or sole `*` for wildcard. Unset → no CORS layer (production default). The console authenticates WS upgrades via `Sec-WebSocket-Protocol: open-sandbox.v1, bearer.<base64url(key)>` — see `CONTRACTS.md § WebSocket auth`.
+Then open `http://127.0.0.1:8090` (or `http://<your-LAN-IP>:8090` from another device — the API base auto-derives from `window.location.hostname`).
 
-### Build/test the youki runtime (Linux only — runs inside a dev container on macOS)
+Features:
+- Sandbox list with status badges, **Pause / Resume / Delete** actions (lucide icons)
+- Three-tab right pane: **Exec** (xterm.js + streaming WS), **Files** (read/write), **Info** (raw JSON)
+- React confirm dialogs (replaces `window.confirm`), settings drawer for the API key
+- Mobile-friendly: hamburger drawer ≤lg, every interactive component verified at 390×844
+
+`OPEN_SANDBOX_API_CORS_ORIGINS` accepts a comma-separated list (sole `*` = wildcard). Unset → no CORS layer (production default). Browser WS upgrades authenticate via `Sec-WebSocket-Protocol: open-sandbox.v1, bearer.<base64url(key)>` — see [`CONTRACTS.md § WebSocket auth`](CONTRACTS.md).
+
+A single-file vanilla-HTML version of the same console lives at [`ui-legacy-index.html`](ui-legacy-index.html) — useful as the simplest possible reference client for the wire API (no Node toolchain required).
+
+### Run the dev fleet with the youki agent (Linux runtime, daemonless)
+
+The default `open-sandbox` binary on macOS builds with `--features docker`. To run the **youki** runtime — daemonless libcontainer, cgroup-v2 freezer for pause/unpause — the agent must run on Linux. The repo ships a Linux dev container; bring it up, build the youki-feature binary inside it, and have it dial out to the host's controller / proxy:
 
 ```sh
+# 1. Start the dev container (also brings up a postgres sidecar; we use the host's instead)
 docker compose -f crates/agent-youki/docker-compose.dev.yml up -d
+
+# 2. Build the youki-feature binary inside the container (~9 min cold; seconds on rebuilds)
+docker compose -f crates/agent-youki/docker-compose.dev.yml exec dev \
+    cargo build --release --bin open-sandbox \
+        --no-default-features --features youki
+
+# 3. Stop the host's docker-runtime agent (keep controller/proxy/api up)
+pkill -TERM -f 'open-sandbox agent'
+
+# 4. Run the youki agent inside the container, dialing the host
+docker compose -f crates/agent-youki/docker-compose.dev.yml exec -d dev \
+    sh -c 'OPEN_SANDBOX_JOIN_TOKEN=dev-join \
+           TUNNEL_JOIN_TOKEN=dev-tunnel \
+           /build/target/release/open-sandbox agent \
+             --controller-url http://host.docker.internal:50051 \
+             --proxy-url      http://host.docker.internal:50052 \
+           > /tmp/agent.log 2>&1'
+
+# 5. Verify registration
+docker compose -f crates/agent-youki/docker-compose.dev.yml exec dev \
+    grep -E 'runtime|registered' /tmp/agent.log
+```
+
+The agent's log will show `runtime: "youki"` and `registered with controller`. New sandboxes created via the REST API or the web console now land on the youki agent. Pause/unpause uses libcontainer's cgroup-v2 freezer.
+
+### Test the youki runtime crate in isolation
+
+```sh
 docker compose -f crates/agent-youki/docker-compose.dev.yml exec dev \
     cargo test -p open-sandbox-agent-youki -- --nocapture
 ```
