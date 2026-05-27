@@ -157,11 +157,26 @@ export function SandboxList({
             const isDeleting = inFlight === "delete";
             const isToggling = inFlight === "pause" || inFlight === "unpause";
             return (
-              <button
+              // role=button + tabIndex so the row stays keyboard-
+              // selectable, but rendered as a <div> because HTML forbids
+              // nested interactive elements (the pause/delete <button>s
+              // live inside this row). Keyboard handler mirrors the
+              // implicit Enter/Space behavior a real <button> would
+              // provide, but stopPropagation on the inner buttons keeps
+              // them from also triggering selection.
+              <div
                 key={sb.sandbox_id}
+                role="button"
+                tabIndex={0}
                 onClick={() => onSelect(sb.sandbox_id)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    onSelect(sb.sandbox_id);
+                  }
+                }}
                 className={cn(
-                  "group flex w-full items-center gap-2 border-l-2 border-transparent px-3 py-2.5 text-left transition-colors hover:bg-surface-2",
+                  "group flex w-full cursor-pointer items-center gap-2 border-l-2 border-transparent px-3 py-2.5 text-left transition-colors hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50",
                   sb.sandbox_id === selectedId &&
                     "border-l-accent bg-surface-2",
                   // Optimistic visual: dim the row while a destructive
@@ -237,7 +252,7 @@ export function SandboxList({
                     <Trash2 className="size-3.5" />
                   )}
                 </button>
-              </button>
+              </div>
             );
           })
         )}
