@@ -129,24 +129,30 @@ open-sandbox ssh <sandbox-id> -- uname -a           # one-shot command
 open-sandbox ssh <sandbox-id> --no-install          # skip auto-install (pre-baked images)
 ```
 
-Once you've connected once, this lets `scp`, `rsync`, `git push`,
-and VS Code Remote-SSH work directly without `open-sandbox` in the
-command line — export `OPEN_SANDBOX_API_KEY` in your shell and add
-to `~/.ssh/config`:
+`scp`, `rsync`, `git push`, and VS Code Remote-SSH work via the
+same ProxyCommand pattern — export `OPEN_SANDBOX_API_KEY` in your
+shell, then:
+
+```sh
+scp -o ProxyCommand='open-sandbox ssh-pipe <id>' \
+    file root@<id>:/tmp/
+
+code --remote ssh-remote+<id> /workspace   # with the snippet below
+```
+
+If you want `ssh <id>` (and `scp <id>:…`, `code --remote …`) to
+work without re-typing `-o ProxyCommand` every time, add a matching
+block to `~/.ssh/config`. Pick whatever Host pattern fits — e.g.:
 
 ```
-Host sandbox-*
-    ProxyCommand open-sandbox ssh-pipe %h
+Host *.sb
+    ProxyCommand sh -c 'exec open-sandbox ssh-pipe "${1%.sb}"' _ %h
     User root
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
 ```
 
-(`ssh-pipe` accepts both the bare UUID and the `sandbox-<uuid>`
-form, so the `%h` wildcard works as-is.)
-
-Then `ssh sandbox-<id>`, `scp file sandbox-<id>:/tmp/`, and
-`code --remote ssh-remote+sandbox-<id> /workspace` all work.
+Then `ssh <id>.sb`, `scp file <id>.sb:/tmp/`, etc. all work.
 
 ### Web console (`ui/`)
 

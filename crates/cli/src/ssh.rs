@@ -46,11 +46,11 @@
 //! on first connect. `--no-install` skips this for air-gapped /
 //! pre-baked images.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::ExitCode;
 
 use open_sandbox_ws_client::{ExecParams, ExecSession, ServerFrame, WsClientError};
-use tokio::sync::mpsc;
+use tokio::io::AsyncReadExt;
 
 use crate::cli::{SshArgs, SshPipeArgs};
 
@@ -74,6 +74,11 @@ if ! command -v sshd >/dev/null 2>&1; then
   if command -v apk >/dev/null 2>&1; then
     apk add --no-cache openssh-server >&2 || exit 127
   elif command -v apt-get >/dev/null 2>&1; then
+    # Recover from any prior interrupted install (Ctrl-C during the
+    # apt-get path leaves /var/lib/dpkg/lock-frontend held and the
+    # package half-configured; without this every subsequent connect
+    # fails with `Could not get lock`).
+    dpkg --configure -a >&2 2>/dev/null || true
     apt-get update >&2 && apt-get install -y openssh-server >&2 || exit 127
   else
     echo "open-sandbox ssh: no supported package manager (apk / apt-get); rerun with --no-install on an image that already bundles sshd" >&2
@@ -81,8 +86,20 @@ if ! command -v sshd >/dev/null 2>&1; then
   fi
   ssh-keygen -A >&2 || exit 127
   passwd -d root >&2 || true
+  # Set PermitRootLogin / PermitEmptyPasswords. Replace the line if
+  # present (commented or not); APPEND if absent — some minimal
+  # sshd_configs omit them entirely and we'd otherwise inherit the
+  # compile-time defaults (`prohibit-password` + `no`) which break
+  # the empty-password auth this bootstrap promises.
   if [ -f /etc/ssh/sshd_config ]; then
-    sed -i 's|^#*PermitRootLogin.*|PermitRootLogin yes|; s|^#*PermitEmptyPasswords.*|PermitEmptyPasswords yes|' /etc/ssh/sshd_config 2>/dev/null || true
+    for kv in 'PermitRootLogin yes' 'PermitEmptyPasswords yes'; do
+      k="${kv%% *}"
+      if grep -qE "^[[:space:]]*#?[[:space:]]*${k}([[:space:]]|\$)" /etc/ssh/sshd_config; then
+        sed -i -E "s|^[[:space:]]*#?[[:space:]]*${k}.*|${kv}|" /etc/ssh/sshd_config
+      else
+        printf '%s\n' "${kv}" >> /etc/ssh/sshd_config
+      fi
+    done
   fi
 fi
 exec "$(command -v sshd)" -i -e
@@ -94,21 +111,17 @@ exec "$(command -v sshd)" -i -e
 const SSHD_INETD_LAUNCHER_NO_INSTALL: &str = r#"exec "$(command -v sshd)" -i -e"#;
 
 pub async fn ssh_pipe(args: SshPipeArgs) -> ExitCode {
-    let api_base = ws_base(&args.api_base);
+    // Trim a trailing slash so `OPEN_SANDBOX_API_BASE=http://h:8081/`
+    // doesn't produce `ws://h:8081//v1/sandboxes/…` (which routers
+    // reject with 404). Mirrors run_subcommand.
+    let api_base = ws_base(args.api_base.trim_end_matches('/'));
     let api_key = args.api_key.into_inner();
     if api_key.is_empty() {
         eprintln!("error: OPEN_SANDBOX_API_KEY (or --api-key) must be non-empty");
         return ExitCode::from(EXIT_CONNECT_FAILED);
     }
 
-    // Accept both bare UUIDs ("abc123…") and the `sandbox-<uuid>`
-    // form so the recommended `~/.ssh/config` block (which has
-    // `Host sandbox-*` and uses `%h` as the ssh-pipe argument)
-    // works without a shell-substitution wrapper.
-    let sandbox_id = args
-        .sandbox_id
-        .strip_prefix("sandbox-")
-        .unwrap_or(&args.sandbox_id);
+    let sandbox_id = args.sandbox_id.as_str();
 
     let launcher = if args.no_install {
         SSHD_INETD_LAUNCHER_NO_INSTALL
@@ -125,30 +138,12 @@ pub async fn ssh_pipe(args: SshPipeArgs) -> ExitCode {
         }
     };
 
-    // Stdin pump: read from local stdin in a blocking thread, hand
-    // chunks to the async loop via mpsc. ProxyCommand is always a
-    // pipe (never a TTY), so we don't need TTY-detection.
-    let (tx, mut stdin_rx) = mpsc::channel::<StdinMsg>(8);
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut handle = stdin.lock();
-        let mut buf = [0u8; 8192];
-        loop {
-            match handle.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx
-                        .blocking_send(StdinMsg::Chunk(buf[..n].to_vec()))
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = tx.blocking_send(StdinMsg::Eof);
-    });
+    // Async stdin via tokio::io::stdin (still spawn_blocking under
+    // the hood, but the worker is owned by the runtime — when the
+    // process exits, the runtime tears it down). ProxyCommand is
+    // always a pipe, so no TTY detection needed.
+    let mut stdin = tokio::io::stdin();
+    let mut buf = vec![0u8; 8192];
     let mut stdin_done = false;
 
     loop {
@@ -156,18 +151,27 @@ pub async fn ssh_pipe(args: SshPipeArgs) -> ExitCode {
             session.next_frame().await
         } else {
             tokio::select! {
-                msg = stdin_rx.recv() => {
-                    match msg {
-                        Some(StdinMsg::Chunk(c)) => {
-                            if let Err(e) = session.send_stdin(c).await {
-                                eprintln!("# ssh-pipe: stdin send: {e}");
-                            }
-                            continue;
-                        }
-                        Some(StdinMsg::Eof) | None => {
+                read = stdin.read(&mut buf) => {
+                    match read {
+                        Ok(0) => {
                             let _ = session.close_stdin().await;
                             stdin_done = true;
                             continue;
+                        }
+                        Ok(n) => {
+                            // FAIL FAST on send error. Logging-and-continuing
+                            // drops the in-flight ssh bytes, desynchronizing
+                            // the SSH transport irreversibly while leaving the
+                            // local ssh client unaware.
+                            if let Err(e) = session.send_stdin(buf[..n].to_vec()).await {
+                                eprintln!("# ssh-pipe: stdin send: {e}");
+                                return ExitCode::from(EXIT_IO_ERROR);
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("# ssh-pipe: stdin read: {e}");
+                            return ExitCode::from(EXIT_IO_ERROR);
                         }
                     }
                 }
@@ -180,7 +184,10 @@ pub async fn ssh_pipe(args: SshPipeArgs) -> ExitCode {
             Ok(Some(ServerFrame::Stdout(b))) => {
                 if std::io::stdout().write_all(&b).is_err() {
                     // Local ssh client closed its end of the pipe.
-                    return ExitCode::SUCCESS;
+                    // Surface as I/O failure (not SUCCESS) so an ssh
+                    // wrapper (git push, code-remote) doesn't
+                    // misclassify a torn session as clean.
+                    return ExitCode::from(EXIT_IO_ERROR);
                 }
                 let _ = std::io::stdout().flush();
             }
@@ -188,7 +195,22 @@ pub async fn ssh_pipe(args: SshPipeArgs) -> ExitCode {
                 let _ = std::io::stderr().write_all(&b);
                 let _ = std::io::stderr().flush();
             }
-            Ok(Some(ServerFrame::Exited { exit_code, .. })) => {
+            Ok(Some(ServerFrame::Exited {
+                exit_code,
+                command_not_found,
+            })) => {
+                if command_not_found {
+                    // Common failure mode on distroless / scratch images
+                    // that lack /bin/sh entirely. The bootstrap can never
+                    // succeed there; give the user an actionable hint
+                    // rather than a bare "connection closed".
+                    eprintln!(
+                        "# ssh-pipe: in-container command not found — \
+                         the image likely lacks /bin/sh. open-sandbox ssh \
+                         requires a busybox-class image (alpine, ubuntu, \
+                         debian, …)."
+                    );
+                }
                 return ExitCode::from((exit_code & 0xff) as u8);
             }
             Ok(Some(ServerFrame::Error { code, detail })) => {
@@ -206,11 +228,6 @@ pub async fn ssh_pipe(args: SshPipeArgs) -> ExitCode {
             }
         }
     }
-}
-
-enum StdinMsg {
-    Chunk(Vec<u8>),
-    Eof,
 }
 
 /// User-facing `open-sandbox ssh <id>`. Builds and execs a local
@@ -231,6 +248,8 @@ pub fn ssh(args: SshArgs) -> ExitCode {
         }
     };
 
+    let sandbox_id = args.sandbox_id.as_str();
+
     // Build the ProxyCommand. CRITICAL: the api key must NOT appear
     // in argv — anything passed via `-o ProxyCommand=...` becomes
     // argv of the local `ssh` AND of the spawned `ssh-pipe`, both
@@ -240,12 +259,23 @@ pub fn ssh(args: SshArgs) -> ExitCode {
     let mut proxy_cmd = format!(
         "{} ssh-pipe {} --api-base {}",
         shell_quote(&self_path.display().to_string()),
-        shell_quote(&args.sandbox_id),
+        shell_quote(sandbox_id),
         shell_quote(&args.api_base),
     );
     if args.no_install {
         proxy_cmd.push_str(" --no-install");
     }
+
+    // OpenSSH applies the FIRST value seen for any `-o KEY=...` on
+    // the command line. To make `--ssh-key` actually restrict auth
+    // (otherwise the user's hardening intent silently falls back to
+    // the empty-password root account), pick the auth list UP FRONT
+    // and only emit one `-o PreferredAuthentications=…`.
+    let auth_pref = if args.ssh_key.is_some() {
+        "publickey"
+    } else {
+        "publickey,password"
+    };
 
     let mut cmd = std::process::Command::new("ssh");
     // Set the api key explicitly even if the parent shell already
@@ -263,10 +293,8 @@ pub fn ssh(args: SshArgs) -> ExitCode {
         "StrictHostKeyChecking=no",
         "-o",
         "UserKnownHostsFile=/dev/null",
-        // The default openssh bootstrap sets root with an empty
-        // password; ask the ssh client to try that first.
         "-o",
-        "PreferredAuthentications=publickey,password",
+        &format!("PreferredAuthentications={auth_pref}"),
         // Quiet the "Warning: Permanently added …" line. Real
         // errors still surface.
         "-o",
@@ -274,11 +302,9 @@ pub fn ssh(args: SshArgs) -> ExitCode {
     ]);
     if let Some(key) = args.ssh_key.as_ref() {
         cmd.args(["-i", key]);
-        cmd.args(["-o", "PreferredAuthentications=publickey"]);
     }
-    cmd.arg(format!("root@sandbox-{}", args.sandbox_id));
+    cmd.arg(format!("root@{sandbox_id}"));
     if !args.command.is_empty() {
-        cmd.arg("--");
         cmd.args(&args.command);
     }
 
