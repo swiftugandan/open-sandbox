@@ -54,7 +54,7 @@ BYO devs ──install──► [Agent on their machine]               │
 | `crates/ws-client/` | Rust SDK for the WebSocket exec API |
 | `crates/cli/` | The `open-sandbox` binary — bundles all subcommands. Cargo features: `docker` (default), `youki` (Linux only) |
 | `ui/` | Next.js 16 dev console (React 19 + Tailwind v4 + xterm.js + lucide icons). Lists / creates / deletes sandboxes, streams exec, reads + writes files |
-| `ui-legacy-index.html` | Original single-file vanilla-HTML console — kept as the simplest possible reference client for the wire API |
+| `ui/legacy/index.html` | Original single-file vanilla-HTML console — kept as the simplest possible reference client for the wire API |
 | `infra/` | Pulumi stack (TypeScript) and end-to-end shell scenarios |
 | `spikes/` | Time-boxed investigations with `RESULT.md` write-ups |
 | `SPEC.md`, `SAD.md`, `CONTRACTS.md` | Functional spec, architecture doc, contracts prose |
@@ -122,7 +122,7 @@ Features:
 
 `OPEN_SANDBOX_API_CORS_ORIGINS` accepts a comma-separated list (sole `*` = wildcard). Unset → no CORS layer (production default). Browser WS upgrades authenticate via `Sec-WebSocket-Protocol: open-sandbox.v1, bearer.<base64url(key)>` — see [`CONTRACTS.md § WebSocket auth`](CONTRACTS.md).
 
-A single-file vanilla-HTML version of the same console lives at [`ui-legacy-index.html`](ui-legacy-index.html) — useful as the simplest possible reference client for the wire API (no Node toolchain required).
+A single-file vanilla-HTML version of the same console lives at [`ui/legacy/index.html`](ui/legacy/index.html) — useful as the simplest possible reference client for the wire API (no Node toolchain required).
 
 ### Run the dev fleet with the youki agent (Linux runtime, daemonless)
 
