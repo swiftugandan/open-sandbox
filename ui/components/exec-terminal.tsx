@@ -204,8 +204,18 @@ export function ExecTerminal({ config, sandboxId }: Props) {
 
   const sigterm = () => {
     const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const term = termRef.current?.term;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      term?.writeln(
+        "\x1b[38;5;245m(no active session — nothing to signal)\x1b[0m",
+      );
+      return;
+    }
     ws.send(frame(Kind.Signal, encodeIoSignal(15)));
+    // Immediate user feedback: fire-and-forget signals otherwise
+    // look identical to a dead button. The eventual "exited" line
+    // confirms delivery; this line confirms intent.
+    term?.writeln("\x1b[38;5;245m↳ sent SIGTERM (15)\x1b[0m");
   };
 
   const StateIcon = state === "open" ? PlugZap : Plug;
@@ -240,8 +250,7 @@ export function ExecTerminal({ config, sandboxId }: Props) {
         <Button
           variant="danger"
           onClick={sigterm}
-          disabled={state !== "open"}
-          title="SIGTERM"
+          title="Send SIGTERM to the running process"
         >
           <Square className="size-3.5" />
         </Button>
