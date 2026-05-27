@@ -130,9 +130,8 @@ pub fn acme_incoming(
                 } else {
                     match start.into_stream(default_config).await {
                         Ok(tls) => {
-                            if tx.send(Ok(tls)).await.is_err() {
-                                return; // listener consumer dropped
-                            }
+                            // Ignore send error: listener consumer dropped.
+                            let _ = tx.send(Ok(tls)).await;
                         }
                         Err(e) => {
                             warn!(peer = %peer, error = %e, "TLS handshake failed");

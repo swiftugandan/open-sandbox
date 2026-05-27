@@ -75,9 +75,8 @@ pub async fn run_controller(args: ControllerArgs) -> Result<(), Box<dyn std::err
     // F1: management gRPC requires CONTROLLER_ADMIN_TOKEN. Bind refuses to
     // start if the token is unset — fail closed rather than silently exposing
     // a no-auth management surface.
-    let admin_auth = AdminAuthInterceptor::from_env().map_err(|e| {
-        format!("CONTROLLER_ADMIN_TOKEN required for management gRPC: {e}")
-    })?;
+    let admin_auth = AdminAuthInterceptor::from_env()
+        .map_err(|e| format!("CONTROLLER_ADMIN_TOKEN required for management gRPC: {e}"))?;
 
     let controller = Arc::new(Controller::new(pg_store, validator));
     let agent_service = controller.grpc_service();
@@ -185,11 +184,13 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
     // when missing.
     let tunnel_token = std::env::var("TUNNEL_JOIN_TOKEN").ok();
     if tunnel_token.is_none() {
-        return Err("TUNNEL_JOIN_TOKEN must be set so agents calling OpenTunnel \
+        return Err(
+            "TUNNEL_JOIN_TOKEN must be set so agents calling OpenTunnel \
                     are authenticated; without it any network-reachable caller \
                     can register as any agent_id and hijack routing for that \
                     agent's sandboxes"
-            .into());
+                .into(),
+        );
     }
     let (public_role, internal_role) = if split_listeners {
         (ProxyRole::Public, ProxyRole::Internal)
@@ -448,7 +449,11 @@ pub async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error>
     let http_drain_timeout = drain_timeout;
     let http_handle = tokio::spawn(async move {
         http_server
-            .run_with_shutdown(http_listener, wait_for_drain(http_drain_rx), http_drain_timeout)
+            .run_with_shutdown(
+                http_listener,
+                wait_for_drain(http_drain_rx),
+                http_drain_timeout,
+            )
             .await
     });
 
@@ -556,7 +561,10 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
                 }
             }
             let delay = backoff.next_delay();
-            info!(reconnect_delay_ms = delay.as_millis() as u64, "controller reconnect backoff");
+            info!(
+                reconnect_delay_ms = delay.as_millis() as u64,
+                "controller reconnect backoff"
+            );
             tokio::time::sleep(delay).await;
         }
     });
@@ -572,7 +580,10 @@ pub async fn run_agent(args: AgentArgs) -> Result<(), Box<dyn std::error::Error>
                 }
             }
             let delay = backoff.next_delay();
-            info!(reconnect_delay_ms = delay.as_millis() as u64, "proxy reconnect backoff");
+            info!(
+                reconnect_delay_ms = delay.as_millis() as u64,
+                "proxy reconnect backoff"
+            );
             tokio::time::sleep(delay).await;
         }
     });
@@ -696,7 +707,12 @@ where
         match dial().await {
             Ok(v) => {
                 if attempt > 1 {
-                    info!(upstream = label, target = target, attempt, "upstream connected");
+                    info!(
+                        upstream = label,
+                        target = target,
+                        attempt,
+                        "upstream connected"
+                    );
                 }
                 return Ok(v);
             }

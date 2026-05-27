@@ -1,10 +1,12 @@
+use std::process::ExitCode;
+
 use clap::Parser;
 use open_sandbox::cli::{Cli, Command};
-use open_sandbox::run;
+use open_sandbox::{run, run_subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
     // Comp-8: report a malformed RUST_LOG via stderr before falling back
     // to "info", so operator typos are visible during incident triage.
     let env_filter = match EnvFilter::try_from_default_env() {
@@ -16,7 +18,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             EnvFilter::new("info")
         }
     };
-    tracing_subscriber::fmt().json().with_env_filter(env_filter).init();
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(env_filter)
+        .init();
 
     // Comp-8: abort the process on any spawned-task panic instead of
     // letting tokio swallow it and continue running with broken state.
@@ -30,10 +35,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Controller(args) => run::run_controller(args).await,
-        Command::Proxy(args) => run::run_proxy(args).await,
-        Command::Agent(args) => run::run_agent(args).await,
-        Command::Api(args) => run::run_api(args).await,
-        Command::Migrate(args) => run::run_migrate(args).await,
+        Command::Controller(args) => report(run::run_controller(args).await),
+        Command::Proxy(args) => report(run::run_proxy(args).await),
+        Command::Agent(args) => report(run::run_agent(args).await),
+        Command::Api(args) => report(run::run_api(args).await),
+        Command::Migrate(args) => report(run::run_migrate(args).await),
+        Command::Run(args) => run_subcommand::run(args).await,
+    }
+}
+
+fn report(r: Result<(), Box<dyn std::error::Error>>) -> ExitCode {
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::FAILURE
+        }
     }
 }

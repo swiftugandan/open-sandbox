@@ -29,6 +29,12 @@ pub enum Command {
     /// deploys can rely on --auto-migrate on the controller/proxy
     /// subcommands instead.
     Migrate(MigrateArgs),
+    /// Run a one-off command in a fresh sandbox and stream its output.
+    /// Like `docker run --rm`, but the workload executes on whatever
+    /// agent fleet the api gateway is in front of. The sandbox is
+    /// created, the command is exec'd over the streaming WebSocket,
+    /// and on exit the sandbox is destroyed.
+    Run(RunArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -134,6 +140,81 @@ pub struct AgentArgs {
         env = "OPEN_SANDBOX_PROXY_URL"
     )]
     pub proxy_url: String,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct RunArgs {
+    /// Container image to run (e.g. `ubuntu:22.04`, `python:3.12-alpine`).
+    #[arg(long)]
+    pub image: String,
+
+    /// Environment variable to set inside the sandbox, in `KEY=VAL`
+    /// form. Repeat the flag for multiple variables.
+    #[arg(long = "env", value_parser = parse_env_kv)]
+    pub env: Vec<(String, String)>,
+
+    /// CPU allocation in millicores (1000 = 1 vCPU).
+    #[arg(
+        long,
+        default_value_t = open_sandbox_contracts::constants::DEFAULT_SANDBOX_CPU_MILLICORES,
+    )]
+    pub cpu_millicores: u32,
+
+    /// Memory allocation in bytes.
+    #[arg(
+        long,
+        default_value_t = open_sandbox_contracts::constants::DEFAULT_SANDBOX_MEMORY_BYTES,
+    )]
+    pub memory_bytes: u64,
+
+    /// Working directory inside the container.
+    #[arg(long)]
+    pub cwd: Option<String>,
+
+    /// Image pull policy: `if-not-present` (default), `always`, or `never`.
+    #[arg(long, value_parser = parse_pull_policy)]
+    pub pull_policy: Option<open_sandbox_contracts::types::PullPolicy>,
+
+    /// Base URL of the open-sandbox api gateway. http(s) for REST,
+    /// the same host:port speaks ws(s) for the exec stream.
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:8081",
+        env = "OPEN_SANDBOX_API_BASE"
+    )]
+    pub api_base: String,
+
+    /// Bearer API key for the api gateway (never logged).
+    #[arg(long, env = "OPEN_SANDBOX_API_KEY")]
+    pub api_key: Redacted,
+
+    /// Seconds to wait for the sandbox to reach `running` before
+    /// giving up. Image pulls of unfamiliar images can take 5–30s.
+    #[arg(long, default_value_t = 120)]
+    pub start_timeout_secs: u64,
+
+    /// Command and arguments to exec inside the sandbox.
+    #[arg(trailing_var_arg = true, required = true)]
+    pub command: Vec<String>,
+}
+
+fn parse_env_kv(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(format!("expected KEY=VAL with non-empty KEY, got `{s}`")),
+    }
+}
+
+fn parse_pull_policy(s: &str) -> Result<open_sandbox_contracts::types::PullPolicy, String> {
+    use open_sandbox_contracts::types::PullPolicy;
+    match s {
+        "if-not-present" => Ok(PullPolicy::IfNotPresent),
+        "always" => Ok(PullPolicy::Always),
+        "never" => Ok(PullPolicy::Never),
+        other => Err(format!(
+            "unknown pull policy `{other}`; expected if-not-present, always, or never"
+        )),
+    }
 }
 
 #[derive(Parser, Debug, Clone)]

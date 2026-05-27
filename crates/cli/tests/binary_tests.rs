@@ -60,6 +60,50 @@ fn agent_help_shows_flags() {
 }
 
 #[test]
+fn run_help_shows_flags() {
+    Command::cargo_bin("open-sandbox")
+        .unwrap()
+        .args(["run", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--image"))
+        .stdout(predicate::str::contains("--env"))
+        .stdout(predicate::str::contains("--api-base"))
+        .stdout(predicate::str::contains("--api-key"))
+        .stdout(predicate::str::contains("COMMAND"));
+}
+
+#[test]
+fn run_without_image_fails() {
+    Command::cargo_bin("open-sandbox")
+        .unwrap()
+        .args(["run", "--api-key", "k", "--", "true"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--image"));
+}
+
+#[test]
+fn run_rejects_malformed_env() {
+    Command::cargo_bin("open-sandbox")
+        .unwrap()
+        .args([
+            "run",
+            "--image",
+            "alpine:3.21",
+            "--api-key",
+            "k",
+            "--env",
+            "no-equals-here",
+            "--",
+            "true",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("KEY=VAL"));
+}
+
+#[test]
 fn agent_without_token_fails() {
     Command::cargo_bin("open-sandbox")
         .unwrap()
