@@ -64,7 +64,17 @@ BYO devs ──install──► [Agent on their machine]               │
 
 ## Quick start
 
-### Run the dev fleet locally (macOS/Linux, requires Docker)
+### Try it in 30 seconds (macOS/Linux, requires Docker)
+
+```sh
+./scripts/dev-up.sh        # build (first run), generate dev tokens, spawn all 4 services, tail one log stream
+./scripts/dev-down.sh      # stop services + managed postgres (volume preserved)
+./scripts/dev-down.sh --reset   # also wipe the postgres volume
+```
+
+First run generates `~/.open-sandbox/dev.env` (chmod 600) with stable tokens and brings up a managed `postgres:16-alpine` container at `127.0.0.1:15432`. Subsequent runs re-use both. Ctrl-C stops the services; the postgres container is left running so restart stays fast. This is the Phase 0 shell-wrapper bridge to the future `open-sandbox dev` subcommand — see [`docs/plans/PLAN_DEV_MODE.md`](docs/plans/PLAN_DEV_MODE.md).
+
+### Run the dev fleet manually (full control)
 
 ```sh
 cargo build --release --bin open-sandbox

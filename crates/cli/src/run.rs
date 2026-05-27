@@ -612,19 +612,29 @@ pub async fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
         "api gateway starting"
     );
 
-    let lifecycle = Arc::new(
-        GrpcSandboxService::connect(&args.controller_url)
-            .await
-            .map_err(|e| format!("failed to connect to controller: {e}"))?,
-    );
+    let lifecycle = Arc::new({
+        let url = args.controller_url.clone();
+        connect_upstream_with_retry("controller", &args.controller_url, move || {
+            let url = url.clone();
+            async move { GrpcSandboxService::connect(&url).await }
+        })
+        .await
+        .map_err(|e| format!("failed to connect to controller: {e}"))?
+    });
 
     let internal_token = std::env::var(open_sandbox_contracts::constants::INTERNAL_TOKEN_ENV).ok();
 
-    let proxy = Arc::new(
-        ProxyClientPool::connect(&args.proxy_url, DEFAULT_POOL_SIZE, internal_token)
-            .await
-            .map_err(|e| format!("failed to connect to proxy: {e}"))?,
-    );
+    let proxy = Arc::new({
+        let url = args.proxy_url.clone();
+        let token = internal_token.clone();
+        connect_upstream_with_retry("proxy", &args.proxy_url, move || {
+            let url = url.clone();
+            let token = token.clone();
+            async move { ProxyClientPool::connect(&url, DEFAULT_POOL_SIZE, token).await }
+        })
+        .await
+        .map_err(|e| format!("failed to connect to proxy: {e}"))?
+    });
 
     let api_key = args.api_key.into_inner();
     if api_key.is_empty() {
@@ -653,6 +663,62 @@ pub async fn run_api(args: ApiArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     info!("api gateway shut down");
     Ok(())
+}
+
+/// Total wall-clock budget for an upstream dial at api startup. Longer
+/// than a typical k8s pod-restart window so a transient controller or
+/// proxy outage doesn't crash the api into a tight restart loop; short
+/// enough that a genuinely-misconfigured upstream surfaces as a
+/// process exit (and a supervisor alert) within a minute.
+const STARTUP_DIAL_BUDGET: Duration = Duration::from_secs(60);
+const STARTUP_DIAL_INITIAL: Duration = Duration::from_millis(250);
+const STARTUP_DIAL_CAP: Duration = Duration::from_secs(5);
+
+/// Dial an upstream gRPC endpoint at api startup with exponential
+/// backoff, bounded by `STARTUP_DIAL_BUDGET`. Without this, parallel
+/// spawn of controller + api (dev fleet) or pod-restart ordering
+/// (k8s) deterministically kills the api on its first attempt.
+async fn connect_upstream_with_retry<T, E, F, Fut>(
+    label: &'static str,
+    target: &str,
+    mut dial: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let deadline = tokio::time::Instant::now() + STARTUP_DIAL_BUDGET;
+    let mut delay = STARTUP_DIAL_INITIAL;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match dial().await {
+            Ok(v) => {
+                if attempt > 1 {
+                    info!(upstream = label, target = target, attempt, "upstream connected");
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(e);
+                }
+                warn!(
+                    upstream = label,
+                    target = target,
+                    attempt,
+                    error = %e,
+                    retry_in_ms = delay.as_millis() as u64,
+                    "upstream not ready, retrying"
+                );
+                let remaining = deadline.saturating_duration_since(now);
+                tokio::time::sleep(delay.min(remaining)).await;
+                delay = (delay * 2).min(STARTUP_DIAL_CAP);
+            }
+        }
+    }
 }
 
 /// Run both controller and proxy schema migrations against a single

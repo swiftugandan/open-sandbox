@@ -93,6 +93,10 @@ fn dev_cors_layer() -> Option<CorsLayer> {
 
 pub fn build_router<S: SandboxService>(state: Arc<ApiState<S>>) -> Router {
     let router = Router::new()
+        // Liveness probe. Unauthenticated by design — readiness checks
+        // (k8s, dev-up.sh, future `open-sandbox dev`) need to confirm
+        // the listener is up before any credential is in play.
+        .route("/healthz", get(|| async { "ok" }))
         // Lifecycle (JSON bodies, kept at axum's default cap)
         .route(
             "/v1/sandboxes",
