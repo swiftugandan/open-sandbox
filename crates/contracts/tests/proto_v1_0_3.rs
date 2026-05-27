@@ -37,10 +37,9 @@ fn list_dir_params_roundtrip() {
 fn list_dir_entry_roundtrips_all_fields() {
     let original = proxy::ListDirEntry {
         name: "src".to_string(),
-        // The `type` field is named `entry_type` in the Rust binding
-        // because `type` is a Rust keyword (prost renames it). The wire
-        // name is `type`.
-        entry_type: proxy::ListDirEntryType::Dir as i32,
+        // prost emits the field as `r#type` (raw identifier) because
+        // `type` is a Rust keyword. The wire name is `type`.
+        r#type: proxy::ListDirEntryType::Dir as i32,
         size: 0,
         revision: "1716800123:0".to_string(),
         mode: "0755".to_string(),
@@ -49,7 +48,7 @@ fn list_dir_entry_roundtrips_all_fields() {
     let bytes = original.encode_to_vec();
     let decoded = proxy::ListDirEntry::decode(bytes.as_slice()).unwrap();
     assert_eq!(decoded.name, "src");
-    assert_eq!(decoded.entry_type, proxy::ListDirEntryType::Dir as i32);
+    assert_eq!(decoded.r#type, proxy::ListDirEntryType::Dir as i32);
     assert_eq!(decoded.revision, "1716800123:0");
     assert_eq!(decoded.mode, "0755");
 }
@@ -58,7 +57,7 @@ fn list_dir_entry_roundtrips_all_fields() {
 fn list_dir_entry_symlink_carries_target() {
     let original = proxy::ListDirEntry {
         name: "logs".to_string(),
-        entry_type: proxy::ListDirEntryType::Symlink as i32,
+        r#type: proxy::ListDirEntryType::Symlink as i32,
         size: 16,
         revision: "1716800100:16".to_string(),
         mode: "0777".to_string(),
@@ -66,7 +65,7 @@ fn list_dir_entry_symlink_carries_target() {
     };
     let bytes = original.encode_to_vec();
     let decoded = proxy::ListDirEntry::decode(bytes.as_slice()).unwrap();
-    assert_eq!(decoded.entry_type, proxy::ListDirEntryType::Symlink as i32);
+    assert_eq!(decoded.r#type, proxy::ListDirEntryType::Symlink as i32);
     assert_eq!(decoded.target, "/var/log");
 }
 

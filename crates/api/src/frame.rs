@@ -13,8 +13,8 @@ use bytes::Bytes;
 use prost::Message;
 
 use open_sandbox_contracts::proxy::{
-    IoClientFrame, IoError, IoExited, IoServerFrame, IoSignal, IoStart, IoStarted, io_client_frame,
-    io_server_frame,
+    FileMeta, IoClientFrame, IoError, IoExited, IoServerFrame, IoSignal, IoStart, IoStarted,
+    ListDirResult, WaitPortListeningResult, io_client_frame, io_server_frame,
 };
 
 // Client → server kinds (0x00–0x0f reserved).
@@ -29,6 +29,10 @@ pub const KIND_STDERR: u8 = 0x12;
 pub const KIND_EXITED: u8 = 0x13;
 pub const KIND_ERROR: u8 = 0x14;
 pub const KIND_STARTED: u8 = 0x15;
+// v1.0.3 additions.
+pub const KIND_LIST_DIR_RESULT: u8 = 0x16;
+pub const KIND_WAIT_PORT_LISTENING_RESULT: u8 = 0x17;
+pub const KIND_FILE_META: u8 = 0x18;
 
 #[derive(Debug)]
 pub enum FrameError {
@@ -130,6 +134,30 @@ pub fn encode_server(frame: &IoServerFrame) -> Result<Bytes, FrameError> {
             })?;
             (KIND_STARTED, Bytes::from(buf))
         }
+        io_server_frame::Payload::ListDirResult(r) => {
+            let mut buf = Vec::with_capacity(r.encoded_len());
+            r.encode(&mut buf).map_err(|e| FrameError::DecodeFailed {
+                kind: KIND_LIST_DIR_RESULT,
+                detail: e.to_string(),
+            })?;
+            (KIND_LIST_DIR_RESULT, Bytes::from(buf))
+        }
+        io_server_frame::Payload::WaitPortListeningResult(r) => {
+            let mut buf = Vec::with_capacity(r.encoded_len());
+            r.encode(&mut buf).map_err(|e| FrameError::DecodeFailed {
+                kind: KIND_WAIT_PORT_LISTENING_RESULT,
+                detail: e.to_string(),
+            })?;
+            (KIND_WAIT_PORT_LISTENING_RESULT, Bytes::from(buf))
+        }
+        io_server_frame::Payload::FileMeta(m) => {
+            let mut buf = Vec::with_capacity(m.encoded_len());
+            m.encode(&mut buf).map_err(|e| FrameError::DecodeFailed {
+                kind: KIND_FILE_META,
+                detail: e.to_string(),
+            })?;
+            (KIND_FILE_META, Bytes::from(buf))
+        }
     };
     let mut out = Vec::with_capacity(1 + body.len());
     out.push(kind);
@@ -167,6 +195,28 @@ pub fn decode_server(bytes: &[u8]) -> Result<io_server_frame::Payload, FrameErro
                 detail: e.to_string(),
             })?;
             Ok(io_server_frame::Payload::Started(s))
+        }
+        KIND_LIST_DIR_RESULT => {
+            let r = ListDirResult::decode(payload).map_err(|e| FrameError::DecodeFailed {
+                kind,
+                detail: e.to_string(),
+            })?;
+            Ok(io_server_frame::Payload::ListDirResult(r))
+        }
+        KIND_WAIT_PORT_LISTENING_RESULT => {
+            let r =
+                WaitPortListeningResult::decode(payload).map_err(|e| FrameError::DecodeFailed {
+                    kind,
+                    detail: e.to_string(),
+                })?;
+            Ok(io_server_frame::Payload::WaitPortListeningResult(r))
+        }
+        KIND_FILE_META => {
+            let m = FileMeta::decode(payload).map_err(|e| FrameError::DecodeFailed {
+                kind,
+                detail: e.to_string(),
+            })?;
+            Ok(io_server_frame::Payload::FileMeta(m))
         }
         _ => Err(FrameError::UnknownKind(kind)),
     }

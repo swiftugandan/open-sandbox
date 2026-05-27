@@ -380,6 +380,12 @@ pub async fn write_file<S: SandboxService>(
             params: Some(io_start::Params::WriteFile(WriteFileParams {
                 path: body.path,
                 cwd: body.cwd.unwrap_or_default(),
+                // v1.0.3 fields. Default values preserve v1.0.2
+                // behavior: empty `expected_revision` skips the
+                // precondition check; `force` is irrelevant in that
+                // case. Group C wires the gateway-side opt-in.
+                expected_revision: String::new(),
+                force: false,
             })),
         },
         Some(content),

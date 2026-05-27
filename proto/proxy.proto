@@ -119,6 +119,17 @@ message IoServerFrame {
     // Runtime-level error (container gone, exec API failed,
     // signal delivery failed, etc). Terminates the stream.
     IoError error = 6;
+    // v1.0.3: typed one-level directory listing result for
+    // ListDir IoStart sessions. One emit, then Exited.
+    ListDirResult list_dir_result = 7;
+    // v1.0.3: typed TCP-probe result for WaitPortListening
+    // IoStart sessions. One emit, then Exited.
+    WaitPortListeningResult wait_port_listening_result = 8;
+    // v1.0.3: emitted before the first Stdout chunk of a ReadFile
+    // session AND in the post-write ACK of a WriteFile session.
+    // Carries the opaque file revision token used by the UI to
+    // gate optimistic writes (X-File-Revision in the gateway).
+    FileMeta file_meta = 9;
   }
 }
 
@@ -131,6 +142,16 @@ message IoStart {
     ReadFileParams read_file = 3;
     WriteFileParams write_file = 4;
     WriteFilesTargzParams write_files_targz = 5;
+    // v1.0.3: one-level directory listing for the UI file tree.
+    // Caps at 5000 entries with `truncated` flag; the agent
+    // enforces the cap so a runaway readdir can't OOM the
+    // gateway. See ListDirResult below for the response shape.
+    ListDirParams list_dir = 6;
+    // v1.0.3: TCP-probe `127.0.0.1:<host_port>` from the agent
+    // host until the in-container dev-server is listening or
+    // `timeout_ms` elapses. Used by the UI save-chain to gate
+    // the preview-iframe refresh on watchexec-restart completion.
+    WaitPortListeningParams wait_port_listening = 7;
   }
 }
 
@@ -158,6 +179,14 @@ message ReadFileParams {
 message WriteFileParams {
   string path = 1;
   string cwd = 2;
+  // v1.0.3: opaque revision token the caller previously received
+  // for this file (via FileMeta on the matching read). Empty
+  // string means "no precondition" — preserves wire compat with
+  // v1.0.1/v1.0.2 senders that don't set this field.
+  string expected_revision = 3;
+  // v1.0.3: skip the expected_revision check. Escape hatch for
+  // scripted bulk writes that intentionally last-write-wins.
+  bool force = 4;
 }
 
 // Bulk write via gzipped tar archive. Caller streams the tarball
@@ -197,4 +226,78 @@ message IoError {
   // "EXEC_FAILED", "READ_FAILED"). SDKs match on code.
   string code = 1;
   string detail = 2;
+}
+
+// ===== v1.0.3: live-edit additions =====
+
+// ListDirParams selects one-level directory listing. The runtime
+// reads `path` (relative paths resolve against `cwd`, defaulting
+// to the runtime's DEFAULT_WRITE_CWD) and emits ListDirResult.
+message ListDirParams {
+  string path = 1;
+  string cwd = 2;
+}
+
+// ListDirEntryType collapses the kernel-level inode zoo into the
+// four cases the UI cares about. FIFOs, sockets, device nodes etc
+// collapse to Other so callers don't have to enumerate the long tail.
+enum ListDirEntryType {
+  LIST_DIR_ENTRY_TYPE_UNSPECIFIED = 0;
+  LIST_DIR_ENTRY_TYPE_FILE = 1;
+  LIST_DIR_ENTRY_TYPE_DIR = 2;
+  LIST_DIR_ENTRY_TYPE_SYMLINK = 3;
+  LIST_DIR_ENTRY_TYPE_OTHER = 4;
+}
+
+message ListDirEntry {
+  string name = 1;
+  // Wire field name is `type`. Renamed in the Rust binding to
+  // `entry_type` because `type` is a Rust keyword.
+  ListDirEntryType type = 2;
+  // For files: byte count. For symlinks: target-string length.
+  // For dirs / other: 0.
+  uint64 size = 3;
+  // Same opaque-revision contract as FileMeta below.
+  string revision = 4;
+  // Octal-formatted permission bits, e.g. "0755", "0644".
+  string mode = 5;
+  // Only populated for symlinks. Empty otherwise.
+  string target = 6;
+}
+
+message ListDirResult {
+  string path = 1;
+  repeated ListDirEntry entries = 2;
+  // True when readdir was capped at 5000 entries. UI shows a
+  // "truncated" banner; user can drill in to a subtree to widen.
+  bool truncated = 3;
+  // Number of entries the runtime saw before applying the cap.
+  // Always >= entries.len(). Equal when truncated == false.
+  uint64 total_entries = 4;
+}
+
+// WaitPortListeningParams: TCP-probe the sandbox's host-side port
+// until the in-container dev-server is listening or timeout_ms
+// elapses. `port` is the in-container port the user told us the
+// dev server binds to; the agent translates to the registered
+// host_port for the sandbox.
+message WaitPortListeningParams {
+  uint32 port = 1;
+  uint32 timeout_ms = 2;
+}
+
+message WaitPortListeningResult {
+  bool ready = 1;
+  uint32 elapsed_ms = 2;
+}
+
+// FileMeta carries the opaque revision token + size for a file.
+// Emitted as the first IoServerFrame of a ReadFile session (before
+// any Stdout chunks) AND as the ACK of a WriteFile session (the
+// revision of the just-written content). The UI uses revision to
+// gate optimistic writes; the wire encoding is opaque, but the
+// reference implementation uses `mtime_nanos:size`.
+message FileMeta {
+  string revision = 1;
+  uint64 size = 2;
 }

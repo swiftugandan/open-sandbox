@@ -130,6 +130,29 @@ pub async fn drive_io_session<R, S>(
             )
             .await;
         }
+        // v1.0.3 surface — wire is defined in contracts/v1.0.3 but
+        // the runtime-side handlers ship in group B of the
+        // PLAN_LIVE_EDIT batch. Until then, return a stable
+        // NOT_IMPLEMENTED error so a caller racing the rollout sees
+        // a clean failure instead of an obscure dispatch bug.
+        Some(io_start::Params::ListDir(_)) => {
+            send_error(
+                &server_tx,
+                &stream_id,
+                "NOT_IMPLEMENTED",
+                "ListDir op not yet implemented; lands in PLAN_LIVE_EDIT group B",
+            )
+            .await;
+        }
+        Some(io_start::Params::WaitPortListening(_)) => {
+            send_error(
+                &server_tx,
+                &stream_id,
+                "NOT_IMPLEMENTED",
+                "WaitPortListening op not yet implemented; lands in PLAN_LIVE_EDIT group B",
+            )
+            .await;
+        }
         None => {
             send_error(
                 &server_tx,
