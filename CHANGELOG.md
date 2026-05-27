@@ -1,5 +1,66 @@
 # CHANGELOG
 
+## v1.0.3 (in progress) — Live edit additions
+
+Additive `proxy.proto` surface in support of the in-browser live-edit
+UI scoped in `docs/plans/PLAN_LIVE_EDIT.md` (the "Replit in a tab"
+feature in the DX-magic roadmap). Wire-compatible with v1.0.1 /
+v1.0.2 — no field renames, no removed variants, defaults preserve
+prior behavior on the legacy fields.
+
+### Additions
+
+- **One-level directory listing.** New `ListDirParams` variant on
+  `IoStart.params` (tag 6) requests a `path` (relative to optional
+  `cwd`); the agent emits a single `ListDirResult` payload (tag 7
+  on `IoServerFrame.payload`) carrying typed `ListDirEntry`
+  records — `name`, `type` (new `ListDirEntryType` enum:
+  `File` / `Dir` / `Symlink` / `Other`), `size`, `revision`,
+  `mode`, optional symlink `target`. Hard-capped at 5000 entries
+  with a `truncated` flag and a `total_entries` count so the UI
+  can render a "drill in" affordance instead of OOMing on
+  `node_modules`.
+- **TCP-probe of the sandbox's host port.** New
+  `WaitPortListeningParams` variant on `IoStart.params` (tag 7)
+  takes `{port, timeout_ms}`; the agent polls
+  `127.0.0.1:<host_port>` (resolved via
+  `SandboxManager::host_port_for`) every 50 ms until the
+  in-container dev-server accepts a TCP connect or `timeout_ms`
+  elapses, then emits a `WaitPortListeningResult` payload (tag 8
+  on `IoServerFrame.payload`) with `{ready, elapsed_ms}`. The UI
+  uses this to gate the preview-iframe refresh on `watchexec`
+  restart completion instead of timer-based guessing.
+- **Opaque file revision token.** New `FileMeta` payload (tag 9 on
+  `IoServerFrame.payload`) carrying `{revision, size}`. Emitted
+  before the first `Stdout` chunk of a `ReadFile` session and as
+  the post-write ACK of a `WriteFile` session. The wire encoding
+  is opaque; the reference agent implementation uses
+  `mtime_nanos:size`.
+- **Precondition on writes.** `WriteFileParams` gains
+  `expected_revision` (string, tag 3) and `force` (bool, tag 4).
+  Empty `expected_revision` preserves the v1.0.1 / v1.0.2 "no
+  precondition" behavior so callers that never observed a
+  revision keep working. The agent enforces the check when the
+  field is non-empty and `force` is false; mismatches surface as
+  `IoError { code: "REVISION_MISMATCH", detail: <actual> }` and
+  the gateway maps this to `409 Conflict { actual_revision,
+  conflicting_content_b64 }`.
+
+### Behavior changes (operator-visible)
+
+None. Existing callers are wire-compatible — the new IoStart
+variants are opt-in, and the new WriteFileParams fields default to
+the v1.0.2 behavior.
+
+### Pending in this version
+
+Group A of `PLAN_LIVE_EDIT_TASKS.md` ships the wire surface and
+the matching contracts-crate regression tests; the runtime
+handlers (group B), the gateway routes (group C), and the UI
+(group D) follow on separate PRs. Until group B ships, the agent
+returns `IoError { code: "NOT_IMPLEMENTED" }` for the two new
+`IoStart` variants.
+
 ## v1.0.2 (in progress) — 12-factor decomposition: migrate subcommand, env-templated cloud-init
 
 Operator-facing surface changes from `PLAN_12FACTOR.md` phases 1–3 +

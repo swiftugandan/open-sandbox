@@ -112,9 +112,9 @@ The proxy's gRPC service, renamed in v1.0 from `TunnelService` to reflect its br
    - **Producer:** API gateway (sends `IoClientFrame`)
    - **Consumer:** Proxy → bridges into the owning agent's `OpenTunnel` → agent emits `IoServerFrame` back.
    - **Purpose:** Originate a single bidirectional I/O session for exec or file read. First `IoClientFrame` MUST be `IoStart` carrying `sandbox_id` and op-specific parameters; the proxy routes by `sandbox_id` to the agent that owns the sandbox and bridges the streams.
-   - **Key messages:** `IoStart` (with `ExecParams` or `ReadFileParams` via oneof), `IoStarted`, stdin/stdout/stderr bytes, `IoSignal`, `IoClose`, `IoExited`, `IoError`.
-   - **Invariants:** Exactly one `IoStart` per session, always the first client frame. Exactly one terminator (`IoExited` or `IoError`) per session. `stream_id` is the agent-side `ExecRegistry` key — the agent uses it to track the in-container PID for kill-on-disconnect cleanup.
-- **Compatibility:** Adding new I/O ops via new oneof variants in `IoStart.params` is additive (minor bump).
+   - **Key messages:** `IoStart` (with `ExecParams`, `ReadFileParams`, `WriteFileParams`, `WriteFilesTargzParams`, **v1.0.3** `ListDirParams`, **v1.0.3** `WaitPortListeningParams` via oneof), `IoStarted`, stdin/stdout/stderr bytes, `IoSignal`, `IoClose`, `IoExited`, `IoError`, **v1.0.3** `ListDirResult`, **v1.0.3** `WaitPortListeningResult`, **v1.0.3** `FileMeta`.
+   - **Invariants:** Exactly one `IoStart` per session, always the first client frame. Exactly one terminator (`IoExited` or `IoError`) per session. `stream_id` is the agent-side `ExecRegistry` key — the agent uses it to track the in-container PID for kill-on-disconnect cleanup. **v1.0.3** `FileMeta` is emitted before the first `Stdout` chunk of a `ReadFile` session (so the UI can capture the revision before consuming bytes), and as the post-write ACK of a `WriteFile` session in place of (or alongside) `IoExited`.
+- **Compatibility:** Adding new I/O ops via new oneof variants in `IoStart.params` is additive (minor bump). **v1.0.3** added `ListDir` (tag 6) and `WaitPortListening` (tag 7) under this rule, plus three new server-side payload variants (`ListDirResult` tag 7, `WaitPortListeningResult` tag 8, `FileMeta` tag 9), plus `expected_revision` (tag 3) and `force` (tag 4) on `WriteFileParams` — empty `expected_revision` preserves the pre-v1.0.3 "no precondition" behavior.
 
 ### Sandbox management service (`api.proto`)
 
