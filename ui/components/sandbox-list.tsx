@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useTransition } from "react";
-import { Pause, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { useCallback, useState, useTransition } from "react";
+import { Loader2, Pause, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
 import type { Sandbox, ApiConfig } from "@/lib/api";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -30,6 +30,24 @@ export function SandboxList({
   const [image, setImage] = useState("alpine:3.21");
   const [creating, startCreate] = useTransition();
   const [error, setError] = useState<string | null>(null);
+  // In-flight per-row mutations: maps sandbox_id → the op currently
+  // running. Used to swap action icons for a spinner, dim the row,
+  // and dedupe rapid double-clicks (the 0–3s window between dispatch
+  // and the next poll's status refresh).
+  const [pending, setPending] = useState<
+    Map<string, "pause" | "unpause" | "delete">
+  >(new Map());
+  const setPendingOp = useCallback(
+    (id: string, op: "pause" | "unpause" | "delete" | null) => {
+      setPending((prev) => {
+        const next = new Map(prev);
+        if (op === null) next.delete(id);
+        else next.set(id, op);
+        return next;
+      });
+    },
+    [],
+  );
   const confirm = useConfirm();
 
   const create = () => {
@@ -46,19 +64,31 @@ export function SandboxList({
   };
 
   const togglePause = async (sb: Sandbox) => {
+    if (pending.has(sb.sandbox_id)) return;
+    const op: "pause" | "unpause" | null =
+      sb.status === "running"
+        ? "pause"
+        : sb.status === "paused"
+          ? "unpause"
+          : null;
+    if (!op) return;
+    setPendingOp(sb.sandbox_id, op);
     try {
-      if (sb.status === "running") {
+      if (op === "pause") {
         await api.pause(config, sb.sandbox_id);
-      } else if (sb.status === "paused") {
+      } else {
         await api.unpause(config, sb.sandbox_id);
       }
       onMutated();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPendingOp(sb.sandbox_id, null);
     }
   };
 
   const remove = async (id: string) => {
+    if (pending.has(id)) return;
     const ok = await confirm({
       title: "Delete sandbox?",
       description: (
@@ -71,11 +101,14 @@ export function SandboxList({
       variant: "danger",
     });
     if (!ok) return;
+    setPendingOp(id, "delete");
     try {
       await api.remove(config, id);
       onMutated();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPendingOp(id, null);
     }
   };
 
@@ -93,8 +126,12 @@ export function SandboxList({
         />
         <div className="flex gap-2">
           <Button onClick={create} disabled={creating || !image.trim()}>
-            <Plus className="size-3.5" />
-            Create
+            {creating ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Plus className="size-3.5" />
+            )}
+            {creating ? "Creating…" : "Create"}
           </Button>
           <Button variant="secondary" onClick={onMutated} disabled={refreshing}>
             <RefreshCw
@@ -115,60 +152,94 @@ export function SandboxList({
             No sandboxes yet — create one above.
           </div>
         ) : (
-          sandboxes.map((sb) => (
-            <button
-              key={sb.sandbox_id}
-              onClick={() => onSelect(sb.sandbox_id)}
-              className={cn(
-                "group flex w-full items-center gap-2 border-l-2 border-transparent px-3 py-2.5 text-left transition-colors hover:bg-surface-2",
-                sb.sandbox_id === selectedId &&
-                  "border-l-accent bg-surface-2",
-              )}
-            >
-              <div className="min-w-0 flex-1">
-                <div
-                  className="truncate font-mono text-[11.5px] font-medium"
-                  title={sb.sandbox_id}
-                >
-                  {sb.sandbox_id.slice(0, 8)}…{sb.sandbox_id.slice(-4)}
+          sandboxes.map((sb) => {
+            const inFlight = pending.get(sb.sandbox_id);
+            const isDeleting = inFlight === "delete";
+            const isToggling = inFlight === "pause" || inFlight === "unpause";
+            return (
+              <button
+                key={sb.sandbox_id}
+                onClick={() => onSelect(sb.sandbox_id)}
+                className={cn(
+                  "group flex w-full items-center gap-2 border-l-2 border-transparent px-3 py-2.5 text-left transition-colors hover:bg-surface-2",
+                  sb.sandbox_id === selectedId &&
+                    "border-l-accent bg-surface-2",
+                  // Optimistic visual: dim the row while a destructive
+                  // mutation is in flight so the user gets immediate
+                  // confirmation without waiting for the next poll.
+                  isDeleting && "opacity-50",
+                )}
+              >
+                <div className="min-w-0 flex-1">
+                  <div
+                    className="truncate font-mono text-[11.5px] font-medium"
+                    title={sb.sandbox_id}
+                  >
+                    {sb.sandbox_id.slice(0, 8)}…{sb.sandbox_id.slice(-4)}
+                  </div>
+                  <div className="truncate text-[10.5px] text-fg-muted">
+                    agent {sb.agent_id.slice(0, 8)} · {sb.subdomain}
+                  </div>
                 </div>
-                <div className="truncate text-[10.5px] text-fg-muted">
-                  agent {sb.agent_id.slice(0, 8)} · {sb.subdomain}
-                </div>
-              </div>
-              <StatusBadge status={sb.status} />
-              {(sb.status === "running" || sb.status === "paused") && (
+                <StatusBadge status={sb.status} />
+                {(sb.status === "running" || sb.status === "paused") && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      togglePause(sb);
+                    }}
+                    disabled={isToggling || isDeleting}
+                    // Pinned visible while busy so the spinner stays on
+                    // screen (otherwise opacity-0 would hide it once the
+                    // pointer leaves the row).
+                    className={cn(
+                      "rounded p-1.5 text-fg-muted transition hover:bg-accent/20 hover:text-accent lg:p-1",
+                      isToggling
+                        ? "lg:opacity-100"
+                        : "lg:opacity-0 lg:group-hover:opacity-100",
+                    )}
+                    title={
+                      isToggling
+                        ? inFlight === "pause"
+                          ? "pausing…"
+                          : "resuming…"
+                        : sb.status === "running"
+                          ? "Pause"
+                          : "Resume"
+                    }
+                  >
+                    {isToggling ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : sb.status === "running" ? (
+                      <Pause className="size-3.5" />
+                    ) : (
+                      <Play className="size-3.5" />
+                    )}
+                  </button>
+                )}
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    togglePause(sb);
+                    remove(sb.sandbox_id);
                   }}
-                  // Same hover-visibility behavior as Delete: always
-                  // visible on touch, dimmed-until-hover at >=lg.
-                  className="rounded p-1.5 text-fg-muted transition hover:bg-accent/20 hover:text-accent lg:p-1 lg:opacity-0 lg:group-hover:opacity-100"
-                  title={sb.status === "running" ? "Pause" : "Resume"}
+                  disabled={isDeleting || isToggling}
+                  className={cn(
+                    "rounded p-1.5 text-fg-muted transition hover:bg-err/20 hover:text-err lg:p-1",
+                    isDeleting
+                      ? "lg:opacity-100"
+                      : "lg:opacity-0 lg:group-hover:opacity-100",
+                  )}
+                  title={isDeleting ? "deleting…" : "Delete"}
                 >
-                  {sb.status === "running" ? (
-                    <Pause className="size-3.5" />
+                  {isDeleting ? (
+                    <Loader2 className="size-3.5 animate-spin" />
                   ) : (
-                    <Play className="size-3.5" />
+                    <Trash2 className="size-3.5" />
                   )}
                 </button>
-              )}
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  remove(sb.sandbox_id);
-                }}
-                // Always visible on touch (hover state doesn't exist there);
-                // dimmed-until-hover only at >=lg.
-                className="rounded p-1.5 text-fg-muted transition hover:bg-err/20 hover:text-err lg:p-1 lg:opacity-0 lg:group-hover:opacity-100"
-                title="Delete"
-              >
-                <Trash2 className="size-3.5" />
               </button>
-            </button>
-          ))
+            );
+          })
         )}
       </div>
     </div>

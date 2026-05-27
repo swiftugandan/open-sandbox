@@ -1,7 +1,14 @@
 "use client";
 
-import { useState } from "react";
-import { Boxes, Eye, EyeOff, Menu, Settings } from "lucide-react";
+import { useEffect, useState } from "react";
+import {
+  AlertTriangle,
+  Boxes,
+  Eye,
+  EyeOff,
+  Menu,
+  Settings,
+} from "lucide-react";
 import type { ApiConfig } from "@/lib/api";
 import { Input } from "@/components/ui/input";
 import { Drawer } from "@/components/ui/drawer";
@@ -12,14 +19,25 @@ interface Props {
   onChange: (next: ApiConfig) => void;
   connState: "connected" | "connecting" | "error";
   detail: string;
+  /** When non-null, localStorage.setItem failed (private mode, disabled
+   *  storage). Surfaced in the settings drawer so the user knows their
+   *  config won't persist across reloads. */
+  storageError?: string | null;
   onMenu?: () => void;
 }
+
+// Idle window after the last keystroke before we propagate config
+// edits up to the parent. Without this, every keystroke triggers a
+// poll cycle against the partial value and the connection-state dot
+// flashes connecting → error → connecting → ... while the user types.
+const COMMIT_DEBOUNCE_MS = 300;
 
 export function HeaderBar({
   config,
   onChange,
   connState,
   detail,
+  storageError,
   onMenu,
 }: Props) {
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -56,9 +74,9 @@ export function HeaderBar({
         {/* Inline API config — desktop only */}
         <div className="ml-2 hidden items-center gap-3 lg:flex">
           <span className="text-[11px] text-fg-muted">API</span>
-          <Input
+          <DebouncedInput
             value={config.base}
-            onChange={(e) => onChange({ ...config, base: e.target.value })}
+            onCommit={(v) => onChange({ ...config, base: v })}
             className="w-60"
             spellCheck={false}
           />
@@ -95,9 +113,9 @@ export function HeaderBar({
             <label className="text-[11px] font-medium uppercase tracking-wider text-fg-muted">
               API base
             </label>
-            <Input
+            <DebouncedInput
               value={config.base}
-              onChange={(e) => onChange({ ...config, base: e.target.value })}
+              onCommit={(v) => onChange({ ...config, base: v })}
               spellCheck={false}
             />
           </div>
@@ -118,6 +136,21 @@ export function HeaderBar({
               <span className="text-fg-muted">{detail}</span>
             </div>
           </div>
+          {storageError && (
+            <div className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[11.5px] text-warn">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+              <div>
+                <div className="font-medium">Settings won't persist</div>
+                <div className="text-[11px] opacity-80">
+                  Browser storage is unavailable (private mode? disabled?).
+                  Edits work for this tab but are lost on reload.
+                  <span className="ml-1 font-mono opacity-70">
+                    ({storageError})
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </Drawer>
     </>
@@ -136,10 +169,10 @@ function BearerInput({
   const [show, setShow] = useState(false);
   return (
     <div className={cn("relative", !expand && "w-48")}>
-      <Input
+      <DebouncedInput
         type={show ? "text" : "password"}
         value={config.key}
-        onChange={(e) => onChange({ ...config, key: e.target.value })}
+        onCommit={(v) => onChange({ ...config, key: v })}
         className={cn("pr-7", expand && "w-full")}
         spellCheck={false}
       />
@@ -156,5 +189,40 @@ function BearerInput({
         )}
       </button>
     </div>
+  );
+}
+
+/** Input that keeps a local "draft" string and only calls `onCommit`
+ *  after COMMIT_DEBOUNCE_MS of typing inactivity. Resyncs the draft
+ *  if the parent value changes externally (cross-tab `storage` event).
+ *  Used for config fields whose every-keystroke commit triggers a
+ *  network poll downstream. */
+function DebouncedInput({
+  value,
+  onCommit,
+  ...rest
+}: Omit<React.InputHTMLAttributes<HTMLInputElement>, "value" | "onChange"> & {
+  value: string;
+  onCommit: (next: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  // External value change (e.g. another tab updated localStorage) → sync.
+  useEffect(() => {
+    setDraft(value);
+  }, [value]);
+  // Debounced commit. Re-runs on every keystroke; the cleanup cancels
+  // the previous timer so only the final value after the idle window
+  // is propagated up.
+  useEffect(() => {
+    if (draft === value) return;
+    const t = setTimeout(() => onCommit(draft), COMMIT_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [draft, value, onCommit]);
+  return (
+    <Input
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      {...rest}
+    />
   );
 }

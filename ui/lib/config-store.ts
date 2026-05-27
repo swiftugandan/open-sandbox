@@ -32,19 +32,29 @@ function loadInitial(): ApiConfig {
   return defaults;
 }
 
-export function useConfig(): [ApiConfig, (next: ApiConfig) => void] {
+export function useConfig(): [
+  ApiConfig,
+  (next: ApiConfig) => void,
+  string | null,
+] {
   // Lazy init so DEFAULTS are picked up immediately on first render — no
   // separate "hydrated" gate is needed. On the server the lazy init still
   // returns DEFAULTS (typeof window === "undefined"); on the client it
   // reads localStorage synchronously.
   const [config, setConfig] = useState<ApiConfig>(loadInitial);
+  // Tracks the most recent localStorage.setItem failure. Stays set
+  // until a subsequent setItem succeeds. UI surfaces this so private-
+  // mode / disabled-storage users know why their settings won't stick
+  // across reloads (was previously swallowed silently).
+  const [storageError, setStorageError] = useState<string | null>(null);
 
   const update = (next: ApiConfig) => {
     setConfig(next);
     try {
       window.localStorage.setItem(KEY, JSON.stringify(next));
-    } catch {
-      /* ignore */
+      setStorageError((prev) => (prev ? null : prev));
+    } catch (e) {
+      setStorageError(e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -64,5 +74,5 @@ export function useConfig(): [ApiConfig, (next: ApiConfig) => void] {
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
-  return [config, update];
+  return [config, update, storageError];
 }

@@ -17,7 +17,6 @@ type Resolver = (value: boolean) => void;
 
 interface ConfirmState extends ConfirmOptions {
   open: boolean;
-  resolve: Resolver | null;
 }
 
 const ConfirmContext = React.createContext<
@@ -31,25 +30,29 @@ export function ConfirmProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = React.useState<ConfirmState>({
     open: false,
     title: "",
-    resolve: null,
   });
   const confirmBtnRef = React.useRef<HTMLButtonElement>(null);
+  // The pending resolver lives in a ref, not in state. React state
+  // updater functions must be pure (Strict Mode invokes them twice in
+  // dev), so calling resolve(...) inside setState would run the .then
+  // chain twice. A ref sidesteps the purity requirement and also
+  // avoids re-renders when only the resolver changes.
+  const resolveRef = React.useRef<Resolver | null>(null);
 
   const close = React.useCallback((result: boolean) => {
-    setState((prev) => {
-      prev.resolve?.(result);
-      return { ...prev, open: false, resolve: null };
-    });
+    setState((prev) => ({ ...prev, open: false }));
+    const r = resolveRef.current;
+    resolveRef.current = null;
+    r?.(result);
   }, []);
 
   const confirm = React.useCallback(
     (opts: ConfirmOptions): Promise<boolean> => {
       return new Promise((resolve) => {
-        setState((prev) => {
-          // If a previous prompt is still pending, dismiss it.
-          prev.resolve?.(false);
-          return { ...opts, open: true, resolve };
-        });
+        // If a previous prompt is still pending, dismiss it.
+        resolveRef.current?.(false);
+        resolveRef.current = resolve;
+        setState({ ...opts, open: true });
       });
     },
     [],

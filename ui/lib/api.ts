@@ -45,10 +45,31 @@ export function b64urlEncode(s: string): string {
 export class ApiError extends Error {
   constructor(
     message: string,
+    // status === 0 is the convention for transport-level failures
+    // (network unreachable, CORS rejection, mixed-content block, DNS,
+    // TLS, etc.) — anything where fetch() itself threw and we never
+    // got an HTTP response. UI code can branch on this to render
+    // actionable messages instead of the raw "TypeError: Failed to
+    // fetch".
     public readonly status: number,
     public readonly errorCode?: string,
   ) {
     super(message);
+  }
+}
+
+/** Run a fetch and re-shape transport-level errors as ApiError(…, 0).
+ *  Without this wrapper a network drop / CORS block surfaces as a raw
+ *  TypeError that callers print verbatim ("TypeError: Failed to fetch"). */
+async function safeFetch(input: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(input, init);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    throw new ApiError(
+      `network error: ${detail} (check API base URL, CORS, and that the api gateway is running)`,
+      0,
+    );
   }
 }
 
@@ -64,7 +85,7 @@ async function request<T>(
       : {}),
     ...((init.headers as Record<string, string>) ?? {}),
   };
-  const res = await fetch(trimBase(cfg.base) + path, { ...init, headers });
+  const res = await safeFetch(trimBase(cfg.base) + path, { ...init, headers });
   const text = await res.text();
   if (!res.ok) {
     let code: string | undefined;
@@ -106,7 +127,7 @@ export const api = {
       method: "POST",
     }),
   readFile: async (cfg: ApiConfig, id: string, path: string) => {
-    const r = await fetch(
+    const r = await safeFetch(
       trimBase(cfg.base) +
         `/v1/sandboxes/${id}/files/read?path=${encodeURIComponent(path)}`,
       { headers: { Authorization: `Bearer ${cfg.key}` } },

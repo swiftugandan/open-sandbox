@@ -26,7 +26,7 @@ function useIsMobile() {
 }
 
 export function Console() {
-  const [config, setConfig] = useConfig();
+  const [config, setConfig, storageError] = useConfig();
   const [sandboxes, setSandboxes] = useState<Sandbox[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [connState, setConnState] = useState<
@@ -50,6 +50,11 @@ export function Console() {
       setConnState("error");
       if (e instanceof ApiError && e.status === 401) {
         setDetail("unauthorized — check Bearer");
+      } else if (e instanceof ApiError && e.status === 0) {
+        // Transport-level failure (network, CORS, DNS, mixed-content,
+        // api gateway not running). The wrapped ApiError message has
+        // the actionable detail; render that, not "HTTP 0".
+        setDetail(e.message);
       } else if (e instanceof ApiError) {
         setDetail(`HTTP ${e.status}`);
       } else {
@@ -93,6 +98,7 @@ export function Console() {
         onChange={setConfig}
         connState={connState}
         detail={detail}
+        storageError={storageError}
         onMenu={isMobile ? () => setDrawerOpen(true) : undefined}
       />
       <main className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)] lg:grid-cols-[300px_minmax(0,1fr)]">
