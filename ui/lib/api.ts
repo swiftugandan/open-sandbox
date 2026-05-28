@@ -108,6 +108,13 @@ export class ApiError extends Error {
     // fetch".
     public readonly status: number,
     public readonly errorCode?: string,
+    /** v1.0.3: on `errorCode === "REVISION_MISMATCH"` (HTTP 409 on
+     *  write_file) the gateway echoes the live revision token in the
+     *  response body so a UI conflict banner can offer "reload" /
+     *  "overwrite" without a separate stat round-trip. Empty string
+     *  here means the file did not exist at the time of the
+     *  precondition check (i.e. someone deleted it underneath). */
+    public readonly actualRevision?: string,
   ) {
     super(message);
   }
@@ -147,7 +154,14 @@ async function request<T>(
     try {
       const j = JSON.parse(text);
       code = j.error_code;
-      throw new ApiError(j.error ?? text, res.status, code);
+      // v1.0.3: write_file 409 carries the live revision token in
+      // an `actual_revision` field so the UI conflict banner can
+      // offer reload/overwrite without re-fetching the file.
+      const actualRevision =
+        code === "REVISION_MISMATCH" && typeof j.actual_revision === "string"
+          ? (j.actual_revision as string)
+          : undefined;
+      throw new ApiError(j.error ?? text, res.status, code, actualRevision);
     } catch (e) {
       if (e instanceof ApiError) throw e;
       throw new ApiError(text || res.statusText, res.status);
@@ -208,7 +222,16 @@ export const api = {
     request<{ status: string }>(cfg, `/v1/sandboxes/${id}/unpause`, {
       method: "POST",
     }),
-  readFile: async (cfg: ApiConfig, id: string, path: string) => {
+  /** v1.0.3: read_file returns both the body bytes AND the opaque
+   *  revision token from the `X-File-Revision` response header (when
+   *  the runtime supports it). The revision is required to feed
+   *  writeFile's optimistic-concurrency precondition; treat it as
+   *  opaque on the client. */
+  readFile: async (
+    cfg: ApiConfig,
+    id: string,
+    path: string,
+  ): Promise<{ bytes: Uint8Array; revision: string | null }> => {
     const r = await safeFetch(
       trimBase(cfg.base) +
         `/v1/sandboxes/${id}/files/read?path=${encodeURIComponent(path)}`,
@@ -218,18 +241,96 @@ export const api = {
       const t = await r.text();
       throw new ApiError(t || r.statusText, r.status);
     }
-    return new Uint8Array(await r.arrayBuffer());
+    return {
+      bytes: new Uint8Array(await r.arrayBuffer()),
+      revision: r.headers.get("x-file-revision"),
+    };
   },
-  writeFile: (cfg: ApiConfig, id: string, path: string, content: string) =>
-    request<{ success: boolean }>(
+  /** v1.0.3: writeFile accepts the optional optimistic-concurrency
+   *  precondition. Pass `expected_revision` to require the file's
+   *  current revision matches; the gateway returns 409 with a
+   *  `{actual_revision}` JSON body on mismatch (surfaced as
+   *  ApiError with `actualRevision` populated by the request helper
+   *  below). `force=true` is the escape hatch for scripted bulk
+   *  writes that intentionally last-write-wins. */
+  writeFile: (
+    cfg: ApiConfig,
+    id: string,
+    path: string,
+    content: string,
+    opts: { expectedRevision?: string; force?: boolean } = {},
+  ) =>
+    request<{ success: boolean; revision?: string }>(
       cfg,
       `/v1/sandboxes/${id}/files/write_file`,
       {
         method: "POST",
-        body: JSON.stringify({ path, content }),
+        body: JSON.stringify({
+          path,
+          content,
+          ...(opts.expectedRevision !== undefined && {
+            expected_revision: opts.expectedRevision,
+          }),
+          ...(opts.force !== undefined && { force: opts.force }),
+        }),
+      },
+    ),
+  /** v1.0.3: one-level directory listing for the UI file tree.
+   *  Hard-capped at 5000 entries server-side; `truncated=true` flags
+   *  the cap. Relative paths resolve against `cwd` (or the runtime's
+   *  default writeable cwd). */
+  listDir: (cfg: ApiConfig, id: string, path: string, cwd?: string) => {
+    const params = new URLSearchParams({ path });
+    if (cwd) params.set("cwd", cwd);
+    return request<ListDirResult>(
+      cfg,
+      `/v1/sandboxes/${id}/files/list?${params}`,
+      { method: "GET" },
+    );
+  },
+  /** v1.0.3: TCP-probe the sandbox's host port until the in-container
+   *  dev-server is listening or `timeoutMs` elapses. Used by the live-
+   *  edit save chain to gate the preview-iframe refresh on watchexec-
+   *  restart completion. `timeoutMs` is clamped server-side at
+   *  WAIT_PORT_LISTENING_MAX_TIMEOUT_MS (5 min). */
+  waitPortListening: (
+    cfg: ApiConfig,
+    id: string,
+    port: number,
+    timeoutMs: number,
+  ) =>
+    request<{ ready: boolean; elapsed_ms: number }>(
+      cfg,
+      `/v1/sandboxes/${id}/wait_port_listening`,
+      {
+        method: "POST",
+        body: JSON.stringify({ port, timeout_ms: timeoutMs }),
       },
     ),
 };
+
+/** v1.0.3: directory entry shape from `GET /files/list`. Matches the
+ *  server-side ListDirEntryJson — `type` is one of "file" / "dir" /
+ *  "symlink" / "other"; `target` is only present for symlinks. */
+export interface ListDirEntry {
+  name: string;
+  type: "file" | "dir" | "symlink" | "other";
+  size: number;
+  revision: string;
+  mode: string;
+  target?: string;
+}
+
+export interface ListDirResult {
+  path: string;
+  entries: ListDirEntry[];
+  /** True when readdir hit the LIST_DIR_MAX_ENTRIES cap. UI should
+   *  render a "drill in" affordance instead of a "load more". */
+  truncated: boolean;
+  /** Underlying entry count before the cap. Equal to `entries.length`
+   *  when `truncated === false`. */
+  total_entries: number;
+}
 
 /** Tiny shell-style argv splitter. Handles single+double quotes; empty
  *  quoted args (`sh -c ""`) emit an empty string. */

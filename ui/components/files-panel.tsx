@@ -39,12 +39,15 @@ export function FilesPanel({ config, sandboxId }: Props) {
     setReadBusy(true);
     setReadOut({ text: "reading…", kind: "info" });
     try {
-      const buf = await api.readFile(config, sandboxId, readPath);
+      // v1.0.3: readFile now returns {bytes, revision}. The legacy
+      // dev-console panel doesn't track revisions yet — the live-edit
+      // UI in files-tree.tsx + editor.tsx (D2+) is the real consumer.
+      const { bytes } = await api.readFile(config, sandboxId, readPath);
       let text: string;
       try {
-        text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+        text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
       } catch {
-        text = `(${buf.length} bytes binary)`;
+        text = `(${bytes.length} bytes binary)`;
       }
       setReadOut({ text: text || "(empty file)", kind: "ok" });
     } catch (e) {
