@@ -27,6 +27,12 @@ import { ApiError, api, publicUrl } from "@/lib/api";
 import { FileTree } from "@/components/file-tree";
 import { Editor, type OpenTab, type SaveStatus } from "@/components/editor";
 import { PreviewPane } from "@/components/preview-pane";
+import {
+  getUnsavedBuffer,
+  listUnsavedBuffersForSandbox,
+  putUnsavedBuffer,
+  removeUnsavedBuffer,
+} from "@/lib/unsaved-buffer";
 
 interface Props {
   config: ApiConfig;
@@ -137,21 +143,32 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
         // The agent's read path is a binary stream; decode as
         // UTF-8 with `fatal: false` so a stray non-UTF8 byte
         // doesn't blow up the editor.
-        const content = new TextDecoder("utf-8", { fatal: false }).decode(
+        const diskContent = new TextDecoder("utf-8", { fatal: false }).decode(
           bytes,
         );
+        // v1.0.3 D9: check IndexedDB for an unsaved buffer
+        // newer than what's on disk. If present AND different
+        // from disk content, restore it (the user's lost work).
+        // savedContent stays the disk snapshot so the dirty-dot
+        // shows + the buffer can still be saved through the
+        // normal path. On mismatch with the cached revision the
+        // user's next save will surface as REVISION_MISMATCH —
+        // the right outcome: it forces a conflict-banner
+        // resolution rather than silently overwriting.
+        const stash = await getUnsavedBuffer(sandboxId, absPath);
+        const restoredFromStash =
+          stash !== null && stash.content !== diskContent;
+        const initialContent = restoredFromStash ? stash.content : diskContent;
         setTabs((prev) => {
-          // Another openFile won the race — bail rather than
-          // appending a duplicate.
           if (prev.some((t) => t.path === absPath)) return prev;
           return [
             ...prev,
             {
               path: absPath,
-              content,
-              savedContent: content,
+              content: initialContent,
+              savedContent: diskContent,
               revision,
-              dirty: false,
+              dirty: restoredFromStash,
             },
           ];
         });
@@ -189,20 +206,33 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
     [activePath],
   );
 
-  const onChange = useCallback((path: string, content: string) => {
-    setTabs((prev) =>
-      prev.map((t) =>
-        t.path === path
-          ? // Compare against the SAVED snapshot so a user who
-            // manually reverts to the last-saved content sees the
-            // dirty-dot clear. Comparing against the previous
-            // in-memory content (the v6 shape) left dirty stuck
-            // on after undo.
-            { ...t, content, dirty: content !== t.savedContent }
-          : t,
-      ),
-    );
-  }, []);
+  const onChange = useCallback(
+    (path: string, content: string) => {
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.path === path
+            ? // Compare against the SAVED snapshot so a user who
+              // manually reverts to the last-saved content sees the
+              // dirty-dot clear. Comparing against the previous
+              // in-memory content (the v6 shape) left dirty stuck
+              // on after undo.
+              { ...t, content, dirty: content !== t.savedContent }
+            : t,
+        ),
+      );
+      // v1.0.3 D9: persist or clear the IndexedDB unsaved buffer
+      // so a browser reload restores the user's edits. Fire-and-
+      // forget — IndexedDB writes are async + best-effort.
+      const prevTab = tabsRef.current.find((t) => t.path === path);
+      if (!prevTab) return;
+      if (content === prevTab.savedContent) {
+        void removeUnsavedBuffer(sandboxId, path);
+      } else {
+        void putUnsavedBuffer(sandboxId, path, content);
+      }
+    },
+    [sandboxId],
+  );
 
   const onSave = useCallback(
     async (path: string) => {
@@ -239,6 +269,17 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
           ),
         );
         setStatus({ kind: "saved", path, at: Date.now() });
+        // v1.0.3 D9: clear the persisted unsaved buffer ONLY
+        // when the post-save in-memory content equals what we
+        // just wrote. If the user typed during the round trip,
+        // the buffer is still dirty and the latest content
+        // belongs in IndexedDB — re-persist instead.
+        const postTab = tabsRef.current.find((t) => t.path === path);
+        if (postTab && postTab.content === sentContent) {
+          void removeUnsavedBuffer(sandboxId, path);
+        } else if (postTab) {
+          void putUnsavedBuffer(sandboxId, path, postTab.content);
+        }
         // v1.0.3 save chain: writeFile succeeded → wait for the
         // in-container dev-server to come back up after watchexec
         // restarts the process → bump the preview iframe's
