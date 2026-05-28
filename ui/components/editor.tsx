@@ -48,12 +48,24 @@ export interface OpenTab {
 
 /** Status banner string the parent renders. `idle` = no message.
  *  `saving` = spinner is shown on the toolbar. `saved` = brief
- *  flash that fades out. `error` = persists until next save. */
+ *  flash that fades out. `error` = persists until next save.
+ *  `conflict` = v1.0.3 optimistic-concurrency mismatch; the
+ *  parent renders an actionable Reload / Overwrite banner above
+ *  the editor pane. */
 export type SaveStatus =
   | { kind: "idle" }
   | { kind: "saving"; path: string }
   | { kind: "saved"; path: string; at: number }
-  | { kind: "error"; path: string; message: string };
+  | { kind: "error"; path: string; message: string }
+  | {
+      kind: "conflict";
+      path: string;
+      /** The current on-disk revision the agent reports — the
+       *  client passes this back as the new `expected_revision`
+       *  when the user clicks Reload. Empty string when the file
+       *  no longer exists (someone deleted it underneath). */
+      actualRevision: string;
+    };
 
 interface Props {
   tabs: OpenTab[];
@@ -67,6 +79,14 @@ interface Props {
    *  Parent runs the write-chain (writeFile + waitPortListening
    *  + preview reload). */
   onSave: (path: string) => void | Promise<void>;
+  /** Resolve a v1.0.3 REVISION_MISMATCH conflict by re-reading
+   *  the file from the agent and replacing the in-memory buffer.
+   *  Surfaced on the conflict banner. */
+  onConflictReload: (path: string) => void | Promise<void>;
+  /** Resolve a v1.0.3 REVISION_MISMATCH conflict by force-
+   *  overwriting the on-disk content with the user's buffer.
+   *  Surfaced on the conflict banner. */
+  onConflictOverwrite: (path: string) => void | Promise<void>;
   status: SaveStatus;
   /** Autosave-on-blur grace period in ms. Defaults to 5000 per
    *  the plan; tests may pass smaller values. */
@@ -74,7 +94,15 @@ interface Props {
 }
 
 export function Editor(props: Props) {
-  const { tabs, activePath, onSelectTab, onSave, status } = props;
+  const {
+    tabs,
+    activePath,
+    onSelectTab,
+    onSave,
+    onConflictReload,
+    onConflictOverwrite,
+    status,
+  } = props;
   const activeTab = useMemo(
     () => tabs.find((t) => t.path === activePath) ?? null,
     [tabs, activePath],
@@ -129,14 +157,24 @@ export function Editor(props: Props) {
         onSave={onSave}
       />
       {activeTab ? (
-        <EditorPane
-          key={activeTab.path}
-          tab={activeTab}
-          onChange={props.onChange}
-          onSave={onSave}
-          blurAutosaveMs={props.blurAutosaveMs ?? 5_000}
-          status={status}
-        />
+        <>
+          {status.kind === "conflict" && status.path === activeTab.path && (
+            <ConflictBanner
+              path={activeTab.path}
+              actualRevision={status.actualRevision}
+              onReload={() => onConflictReload(activeTab.path)}
+              onOverwrite={() => onConflictOverwrite(activeTab.path)}
+            />
+          )}
+          <EditorPane
+            key={activeTab.path}
+            tab={activeTab}
+            onChange={props.onChange}
+            onSave={onSave}
+            blurAutosaveMs={props.blurAutosaveMs ?? 5_000}
+            status={status}
+          />
+        </>
       ) : (
         <div className="flex-1 flex items-center justify-center text-fg-muted text-sm">
           No file open. Click a file in the tree to start editing.
@@ -287,6 +325,11 @@ function StatusMessage({ status }: { status: SaveStatus }) {
       </span>
     );
   }
+  if (status.kind === "conflict") {
+    // Brief inline label — the user's actionable affordance is
+    // the banner above the editor pane, not the status bar.
+    return <span className="text-warn">Conflict</span>;
+  }
   return null;
 }
 
@@ -297,6 +340,45 @@ function isSavingFor(status: SaveStatus, path: string): boolean {
 function basename(path: string): string {
   const slash = path.lastIndexOf("/");
   return slash >= 0 ? path.slice(slash + 1) : path;
+}
+
+/** v1.0.3 D11 conflict banner — rendered above the editor pane
+ *  when a writeFile returned 409 REVISION_MISMATCH. The user
+ *  chooses between (a) Reload — discard local edits and re-read
+ *  the file (the live revision becomes the new precondition for
+ *  the next save), or (b) Overwrite — re-issue writeFile with
+ *  force=true, last-write-wins. A Diff affordance is out of
+ *  scope for v1.0.3 and tracked as a follow-up. */
+function ConflictBanner({
+  path,
+  actualRevision,
+  onReload,
+  onOverwrite,
+}: {
+  path: string;
+  actualRevision: string;
+  onReload: () => void | Promise<void>;
+  onOverwrite: () => void | Promise<void>;
+}) {
+  const detail =
+    actualRevision === ""
+      ? "The file was deleted on the agent. Reload will re-create it from your buffer; Overwrite will write your buffer back as a new file."
+      : `${basename(path)} was changed on the agent since you opened it. Reload to fetch the latest content (your edits are discarded), or Overwrite to last-write-wins.`;
+  return (
+    <div
+      role="alert"
+      className="flex flex-wrap items-center gap-2 border-b border-warn/40 bg-warn/10 px-3 py-1.5 text-[12px] text-fg"
+    >
+      <span className="font-medium text-warn">Conflict</span>
+      <span className="min-w-0 flex-1 truncate text-fg-muted">{detail}</span>
+      <Button size="sm" variant="secondary" onClick={() => void onReload()}>
+        Reload
+      </Button>
+      <Button size="sm" variant="danger" onClick={() => void onOverwrite()}>
+        Overwrite
+      </Button>
+    </div>
+  );
 }
 
 /** The CodeMirror host for a single tab. Lazily loads the

@@ -308,6 +308,105 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
           scheduleReload();
         })();
       } catch (e) {
+        // v1.0.3 D11: REVISION_MISMATCH gets the dedicated
+        // conflict-banner UX. Other errors stay on the generic
+        // 'Save failed' status indicator with the message
+        // surfaced in the title tooltip.
+        if (e instanceof ApiError && e.errorCode === "REVISION_MISMATCH") {
+          setStatus({
+            kind: "conflict",
+            path,
+            actualRevision: e.actualRevision ?? "",
+          });
+          return;
+        }
+        const message =
+          e instanceof ApiError
+            ? `${e.errorCode ?? e.status}: ${e.message}`
+            : String(e);
+        setStatus({ kind: "error", path, message });
+      }
+    },
+    [config, sandboxId, previewPort, scheduleReload],
+  );
+
+  /** D11: discard the local buffer and re-read the file from
+   *  the agent. The disk content becomes the new in-memory
+   *  buffer, the cached revision becomes the live one (so the
+   *  next save's precondition is correct), and dirty clears. */
+  const onConflictReload = useCallback(
+    async (path: string) => {
+      try {
+        const { bytes, revision } = await api.readFile(config, sandboxId, path);
+        const content = new TextDecoder("utf-8", { fatal: false }).decode(
+          bytes,
+        );
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.path === path
+              ? { ...t, content, savedContent: content, revision, dirty: false }
+              : t,
+          ),
+        );
+        void removeUnsavedBuffer(sandboxId, path);
+        setStatus({ kind: "idle" });
+      } catch (e) {
+        const message =
+          e instanceof ApiError
+            ? `${e.errorCode ?? e.status}: ${e.message}`
+            : String(e);
+        setStatus({ kind: "error", path, message });
+      }
+    },
+    [config, sandboxId],
+  );
+
+  /** D11: force-overwrite. Re-issue writeFile with `force=true`
+   *  (the documented escape hatch — see proto/proxy.proto's
+   *  `WriteFileParams.force`). The agent skips the precondition
+   *  check; whatever's on disk gets replaced with the buffer. */
+  const onConflictOverwrite = useCallback(
+    async (path: string) => {
+      const tab = tabsRef.current.find((t) => t.path === path);
+      if (!tab) return;
+      setStatus({ kind: "saving", path });
+      const sentContent = tab.content;
+      try {
+        const res = await api.writeFile(config, sandboxId, path, sentContent, {
+          force: true,
+        });
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.path === path
+              ? {
+                  ...t,
+                  revision: res.revision ?? t.revision,
+                  savedContent: sentContent,
+                  dirty: t.content !== sentContent,
+                }
+              : t,
+          ),
+        );
+        void removeUnsavedBuffer(sandboxId, path);
+        setStatus({ kind: "saved", path, at: Date.now() });
+        // Save chain — same shape as onSave's tail; force-
+        // overwrites land the same bytes the watchexec restart
+        // will pick up.
+        void (async () => {
+          try {
+            await api.waitPortListening(
+              config,
+              sandboxId,
+              previewPort,
+              WAIT_PORT_TIMEOUT_MS,
+            );
+          } catch {
+            /* swallowed per onSave's contract */
+          }
+          if (!mountedRef.current) return;
+          scheduleReload();
+        })();
+      } catch (e) {
         const message =
           e instanceof ApiError
             ? `${e.errorCode ?? e.status}: ${e.message}`
@@ -337,6 +436,8 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
           onCloseTab={closeTab}
           onChange={onChange}
           onSave={onSave}
+          onConflictReload={onConflictReload}
+          onConflictOverwrite={onConflictOverwrite}
         />
       </div>
       <div className="flex-1 min-w-0">
