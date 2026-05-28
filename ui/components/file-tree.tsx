@@ -18,7 +18,14 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronRight, ChevronDown, RefreshCw, File, Folder } from "lucide-react";
+import {
+  ChevronRight,
+  ChevronDown,
+  File,
+  FilePlus,
+  Folder,
+  RefreshCw,
+} from "lucide-react";
 
 import type { ApiConfig } from "@/lib/api";
 import { ApiError, api, type ListDirEntry } from "@/lib/api";
@@ -239,6 +246,45 @@ export function FileTree({
     [state.dirs, fetchDir],
   );
 
+  /** Create a new (or overwrite an empty) file at a user-typed
+   *  path relative to the tree root. Refreshes the listing and
+   *  opens the new file in the editor. Used by the "New file"
+   *  toolbar button.
+   *
+   *  The agent's `write_file` handler does `mkdir -p` on the
+   *  parent directory, so a path like `routes/api/users.py` is
+   *  fine; intermediate directories are created. */
+  const createFile = useCallback(async () => {
+    const input = window.prompt(
+      "New file (path relative to /workspace):",
+      "",
+    );
+    if (input == null) return;
+    const trimmed = input.trim();
+    if (!trimmed) return;
+    // Strip a leading slash so the path stays relative to rootPath;
+    // an absolute path the user typed (`/workspace/foo.py`) is
+    // honored verbatim.
+    const absPath = trimmed.startsWith("/")
+      ? trimmed
+      : `${rootPath}/${trimmed}`;
+    try {
+      await api.writeFile(config, sandboxId, absPath, "");
+      // Refresh so the new file appears in the tree, then hand
+      // off to the parent so the editor opens it.
+      setRefreshNonce((n) => n + 1);
+      onSelect?.(absPath);
+    } catch (e) {
+      const message =
+        e instanceof ApiError ? `${e.errorCode ?? e.status}: ${e.message}` : String(e);
+      // No banner UI yet — surface via console + browser alert.
+      // A future polish pass could route this through the
+      // editor's status bar.
+      // eslint-disable-next-line no-alert
+      window.alert(`Failed to create ${absPath}: ${message}`);
+    }
+  }, [config, sandboxId, rootPath, onSelect]);
+
   return (
     <div className="flex flex-col h-full text-[12px] font-mono">
       <TreeHeader
@@ -246,6 +292,7 @@ export function FileTree({
         showHidden={showHidden}
         onToggleHidden={() => setShowHidden((v) => !v)}
         onRefresh={() => setRefreshNonce((n) => n + 1)}
+        onNewFile={createFile}
       />
       <div className="flex-1 overflow-auto py-1">
         <DirChildren
@@ -267,11 +314,13 @@ function TreeHeader({
   showHidden,
   onToggleHidden,
   onRefresh,
+  onNewFile,
 }: {
   rootPath: string;
   showHidden: boolean;
   onToggleHidden: () => void;
   onRefresh: () => void;
+  onNewFile: () => void;
 }) {
   return (
     <div className="flex items-center gap-2 px-2 py-1.5 border-b border-border text-fg-muted">
@@ -279,6 +328,14 @@ function TreeHeader({
         {rootPath}
       </span>
       <span className="flex-1" />
+      <Button
+        size="icon"
+        variant="ghost"
+        title="New file (relative to /workspace; nested paths create parents)"
+        onClick={onNewFile}
+      >
+        <FilePlus size={12} />
+      </Button>
       <Button
         size="icon"
         variant="ghost"
