@@ -587,6 +587,29 @@ async fn drive_write_file<R, S>(
     R: ContainerRuntime,
     S: Stream<Item = Result<IoClientFrame, AgentError>> + Unpin + Send + 'static,
 {
+    // v1.0.3: the agent-side precondition check on
+    // `expected_revision` lands in the live-edit batch group B.
+    // Until then, reject any caller that asks for the precondition
+    // explicitly — the alternative (silently ignore the field and
+    // overwrite anyway) is exactly the fail-open backdoor the
+    // optimistic-concurrency feature is meant to close, and any
+    // gateway that ships the opt-in before group B would have
+    // believed its `expected_revision` was being honored. Empty
+    // `expected_revision` continues to mean "no precondition",
+    // matching the documented wire-compat with v1.0.1 / v1.0.2.
+    if !params.expected_revision.is_empty() && !params.force {
+        send_error(
+            &server_tx,
+            &stream_id,
+            "NOT_IMPLEMENTED",
+            "write_file expected_revision precondition not yet \
+             implemented; lands in PLAN_LIVE_EDIT group B. Pass \
+             force=true to bypass.",
+        )
+        .await;
+        return;
+    }
+
     let cwd = if params.cwd.is_empty() {
         None
     } else {
@@ -1144,6 +1167,119 @@ mod tests {
             }
             other => panic!("expected Error frame, got {other:?}"),
         }
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_file_with_expected_revision_fails_not_implemented() {
+        // v1.0.3 guard: until group B implements the agent-side
+        // revision precondition, any non-empty expected_revision
+        // must be rejected (rather than silently overwritten) so a
+        // gateway that ships the opt-in early cannot mistakenly
+        // believe its precondition was honored.
+        use open_sandbox_contracts::proxy::WriteFileParams;
+
+        let runtime = Arc::new(MockContainerRuntime::new());
+        let registry = Arc::new(ExecRegistry::new());
+        let (tx, rx, h) = spawn_session(runtime, registry, "s-rev");
+
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-rev".into(),
+            payload: Some(io_client_frame::Payload::Start(IoStart {
+                sandbox_id: "ignored".into(),
+                params: Some(open_sandbox_contracts::proxy::io_start::Params::WriteFile(
+                    WriteFileParams {
+                        path: "app.py".into(),
+                        cwd: "/home".into(),
+                        expected_revision: "1716800123:421".into(),
+                        force: false,
+                    },
+                )),
+            })),
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let frames = collect_until_exit(rx).await;
+        let last = frames.last().expect("at least one frame");
+        match last {
+            io_server_frame::Payload::Error(e) => {
+                assert_eq!(e.code, "NOT_IMPLEMENTED");
+                assert!(
+                    e.detail.contains("expected_revision"),
+                    "error detail should mention the precondition; got {:?}",
+                    e.detail
+                );
+            }
+            other => panic!("expected Error frame, got {other:?}"),
+        }
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_file_with_force_bypasses_revision_check() {
+        // The same future precondition is documented to be bypassable
+        // with force=true (for scripted bulk-writes). Verify the
+        // guard does NOT engage when force is set, so the write path
+        // remains reachable for callers that opt out explicitly.
+        use bytes::Bytes;
+        use open_sandbox_contracts::proxy::WriteFileParams;
+
+        let runtime = Arc::new(MockContainerRuntime::new());
+        let registry = Arc::new(ExecRegistry::new());
+        let (tx, rx, h) = spawn_session(runtime.clone(), registry, "s-force");
+
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-force".into(),
+            payload: Some(io_client_frame::Payload::Start(IoStart {
+                sandbox_id: "ignored".into(),
+                params: Some(open_sandbox_contracts::proxy::io_start::Params::WriteFile(
+                    WriteFileParams {
+                        path: "app.py".into(),
+                        cwd: "/home".into(),
+                        // force=true SHOULD bypass the precondition
+                        // even when a (stale) revision is supplied.
+                        expected_revision: "stale".into(),
+                        force: true,
+                    },
+                )),
+            })),
+        }))
+        .await
+        .unwrap();
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-force".into(),
+            payload: Some(io_client_frame::Payload::Stdin(b"print('x')\n".to_vec())),
+        }))
+        .await
+        .unwrap();
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-force".into(),
+            payload: Some(io_client_frame::Payload::Close(IoClose { stdin_eof: true })),
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let frames = collect_until_exit(rx).await;
+        let last = frames.last().expect("at least one frame");
+        assert!(
+            matches!(
+                last,
+                io_server_frame::Payload::Exited(IoExited {
+                    exit_code: 0,
+                    command_not_found: false
+                })
+            ),
+            "expected clean Exited frame on force write; got {last:?}"
+        );
+        // The mock runtime records the bytes that landed.
+        let writes = runtime.writes_received();
+        assert!(
+            writes.iter().any(|w| w.bytes == Bytes::from("print('x')\n")),
+            "expected bytes to be persisted via the runtime trait"
+        );
         h.await.unwrap();
     }
 
