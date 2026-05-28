@@ -1,4 +1,5 @@
 use open_sandbox_agent::container::ContainerConfig;
+use open_sandbox_contracts::constants::DEFAULT_SANDBOX_ENTRYPOINT;
 use open_sandbox_contracts::error::AgentError;
 
 use oci_spec::runtime::{
@@ -162,7 +163,12 @@ pub fn generate_full_spec(
 
     let process = ProcessBuilder::default()
         .terminal(false)
-        .args(vec!["sleep".to_string(), "infinity".to_string()])
+        .args(
+            DEFAULT_SANDBOX_ENTRYPOINT
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
         .env(env)
         .cwd("/".to_string())
         .capabilities(capabilities)
