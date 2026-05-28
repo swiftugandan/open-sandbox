@@ -171,9 +171,43 @@ Then open `http://127.0.0.1:8090` (or `http://<your-LAN-IP>:8090` from another d
 
 Features:
 - Sandbox list with status badges, **Pause / Resume / Delete** actions (lucide icons)
-- Three-tab right pane: **Exec** (xterm.js + streaming WS), **Files** (read/write), **Info** (raw JSON)
+- Four-tab right pane: **Exec** (xterm.js + streaming WS), **Edit** (v1.0.3 live-edit: lazy file tree + CodeMirror 6 tabbed editor + preview iframe with save-chain reload), **Files** (legacy unary read/write), **Info** (raw JSON)
 - React confirm dialogs (replaces `window.confirm`), settings drawer for the API key
 - Mobile-friendly: hamburger drawer ≤lg, every interactive component verified at 390×844
+
+#### Live edit (v1.0.3)
+
+Open the **Edit** tab on a running sandbox: three columns — file tree on the
+left (lazy one-level expansion, `node_modules` and `.git` hidden by default;
+toggle with `⇧⌘H`), CodeMirror 6 editor in the middle (per-file tabs;
+`⌘S` saves, 5s blur-autosave fires if you click away with unsaved changes),
+preview iframe on the right (cache-busted reload after every save, gated on
+the agent's `wait_port_listening` so the preview waits for `watchexec` to
+restart your dev-server before re-fetching).
+
+Optimistic-concurrency conflict UX is built in: if the file changed on the
+agent since you opened it (another `open-sandbox ssh` session, a `git pull`,
+etc), the save returns 409 and the editor shows a Reload / Overwrite banner.
+Unsaved edits survive a browser refresh via IndexedDB (per-`{sandboxId,
+path}`).
+
+Default preview port is `8080` — matching the platform-wide
+`DEFAULT_SANDBOX_EXPOSED_PORT`. Sandboxes that bind a different port (e.g.
+Next.js on `3000`) currently still preview correctly via the public URL,
+but the save-chain's `wait_port_listening` probes `8080` — to be plumbed
+through `Sandbox.exposed_port` in a v1.0.4 amendment
+(see `docs/reviews/FOLLOWUPS_v1.0.3.md` finding #21).
+
+**Dev-mode caveat — SameSite cookies.** When the UI runs on
+`localhost:8090` and the sandbox preview iframe loads
+`<id>.localtest.me:8080`, those are different origins on HTTP. Modern
+browsers (Chrome since 80 / Feb 2020) reject `SameSite=None` cookies
+without `Secure`, and the `Secure` localhost exception covers only
+`localhost`, not arbitrary `.localtest.me` hosts. Sandbox templates
+that use cookies for sessions will reset on every iframe reload in dev.
+Production HTTPS deployments are unaffected. A `--dev-https` flag on
+`dev-up.sh` that issues `*.localtest.me` certs via `mkcert` would close
+the gap — tracked as a deferred follow-up.
 
 `OPEN_SANDBOX_API_CORS_ORIGINS` accepts a comma-separated list (sole `*` = wildcard). Unset → no CORS layer (production default). Browser WS upgrades authenticate via `Sec-WebSocket-Protocol: open-sandbox.v1, bearer.<base64url(key)>` — see [`CONTRACTS.md § WebSocket auth`](CONTRACTS.md).
 

@@ -330,6 +330,72 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
     [config, sandboxId, previewPort, scheduleReload],
   );
 
+  // v1.0.3 D12: periodic mtime check on the active file while
+  // the tab is visible. Detects external edits (another ssh
+  // session, a git pull) BEFORE the user hits save and is
+  // confronted with the conflict banner. Runs only when the
+  // browser tab is visible (no point polling a hidden tab) and
+  // skips when the active tab is already dirty (the user will
+  // see the conflict on save anyway; pre-warning would just be
+  // noise).
+  //
+  // 30s cadence balances detection latency vs. agent load: each
+  // poll is one stat_revision exec inside the container, so a
+  // user with the editor open all day generates 2880 stats — a
+  // negligible load.
+  useEffect(() => {
+    if (!activePath) return;
+    const POLL_INTERVAL_MS = 30_000;
+    let timer: number | null = null;
+    const tick = async () => {
+      if (document.visibilityState !== "visible") return;
+      const tab = tabsRef.current.find((t) => t.path === activePath);
+      if (!tab || tab.dirty || tab.revision === null) return;
+      try {
+        // Best-effort: read the file (the only revision-
+        // exposing endpoint today). On 404 the file's gone; we
+        // surface that as the same REVISION_MISMATCH-style
+        // banner with an empty actualRevision. On match we
+        // do nothing — the editor's view is still fresh.
+        const { revision } = await api.readFile(
+          config,
+          sandboxId,
+          activePath,
+        );
+        if (!mountedRef.current) return;
+        if (revision !== null && revision !== tab.revision) {
+          setStatus({
+            kind: "conflict",
+            path: activePath,
+            actualRevision: revision,
+          });
+        }
+      } catch (e) {
+        if (e instanceof ApiError && e.errorCode === "FILE_NOT_FOUND") {
+          setStatus({
+            kind: "conflict",
+            path: activePath,
+            actualRevision: "",
+          });
+        }
+        // Other errors (transient network, sandbox restart):
+        // silent. The next save's error path will surface them.
+      }
+    };
+    const onVisibility = () => {
+      // Fire immediately on becoming visible so a long pause +
+      // tab-return picks up changes without waiting a full
+      // interval.
+      if (document.visibilityState === "visible") void tick();
+    };
+    timer = window.setInterval(() => void tick(), POLL_INTERVAL_MS);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      if (timer !== null) window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [activePath, config, sandboxId]);
+
   /** D11: discard the local buffer and re-read the file from
    *  the agent. The disk content becomes the new in-memory
    *  buffer, the cached revision becomes the live one (so the
@@ -419,7 +485,14 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
 
   return (
     <div className="flex h-full min-h-0">
-      <div className="w-[220px] shrink-0 border-r border-border bg-surface-1">
+      {/* v1.0.3 D16: below 768px we drop the tree + editor and
+       *  render only the preview iframe with a "view on desktop
+       *  to edit" hint. Editing on mobile is a deliberate non-goal
+       *  per the plan — every serious browser editor either
+       *  builds a native app or tells mobile users "this is a
+       *  desktop product". Two months of CM6 mobile bug whack-a-
+       *  mole is the wrong trade. */}
+      <div className="hidden md:block w-[220px] shrink-0 border-r border-border bg-surface-1">
         <FileTree
           config={config}
           sandboxId={sandboxId}
@@ -427,7 +500,7 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
           selectedPath={activePath ?? undefined}
         />
       </div>
-      <div className="flex-1 min-w-0 border-r border-border">
+      <div className="hidden md:block flex-1 min-w-0 border-r border-border">
         <Editor
           tabs={tabs}
           activePath={activePath}
@@ -440,14 +513,19 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
           onConflictOverwrite={onConflictOverwrite}
         />
       </div>
-      <div className="flex-1 min-w-0">
-        <PreviewPane
-          publicUrl={previewUrl}
-          status={sandbox.status}
-          reloadKey={reloadKey}
-          onManualReload={() => setReloadKey((k) => k + 1)}
-          port={previewPort}
-        />
+      <div className="flex-1 min-w-0 flex flex-col">
+        <div className="md:hidden border-b border-border bg-surface-1 px-3 py-2 text-[11.5px] text-fg-muted">
+          Preview only on mobile — view on desktop to edit files.
+        </div>
+        <div className="flex-1 min-h-0">
+          <PreviewPane
+            publicUrl={previewUrl}
+            status={sandbox.status}
+            reloadKey={reloadKey}
+            onManualReload={() => setReloadKey((k) => k + 1)}
+            port={previewPort}
+          />
+        </div>
       </div>
     </div>
   );
