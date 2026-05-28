@@ -100,6 +100,15 @@ export function Editor(props: Props) {
       if (target) {
         const tag = target.tagName;
         if (tag === "INPUT" || tag === "TEXTAREA") return;
+        // contenteditable surfaces OUTSIDE CodeMirror (a future
+        // rich-text comment box, an extension overlay, etc) —
+        // skip so we don't hijack a save the user meant for the
+        // text they're typing. The CodeMirror surface IS
+        // contenteditable; allow Cmd-S there by detecting the
+        // `.cm-editor` ancestor.
+        if (target.isContentEditable && !target.closest(".cm-editor")) {
+          return;
+        }
       }
       if (!activePath) return;
       e.preventDefault();
@@ -354,21 +363,18 @@ function EditorPane({
     };
   }, [langId]);
 
-  // Cmd/Ctrl-S binding. Memoized on the path so a parent re-
-  // render doesn't trash the keymap (plan §Memoization gotcha).
-  const saveKeymap = useMemo(
-    () =>
-      keymap.of([
-        {
-          key: "Mod-s",
-          run: () => {
-            void onSave(tab.path);
-            return true;
-          },
-        },
-      ]),
-    [tab.path, onSave],
-  );
+  // Cmd-S is bound at the DOCUMENT level (see `Editor`'s
+  // useEffect) so it fires regardless of focus target. A CM6
+  // `Mod-s` keymap here would double-fire when focus is inside
+  // the editor — both the document handler and the CM6 keymap
+  // would invoke `onSave` for one keystroke, racing two writes
+  // against the same revision token. So we deliberately do NOT
+  // bind Mod-s here.
+  //
+  // The empty keymap is kept as a memo so the dependency-array
+  // shape on `extensions` (below) is stable across iterations
+  // of this design.
+  const saveKeymap = useMemo(() => keymap.of([]), []);
 
   // Blur-autosave: when the editor loses focus AND the buffer is
   // dirty, fire onSave after `blurAutosaveMs`. Cancel on re-focus
