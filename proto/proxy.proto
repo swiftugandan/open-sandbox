@@ -251,8 +251,9 @@ enum ListDirEntryType {
 
 message ListDirEntry {
   string name = 1;
-  // Wire field name is `type`. Renamed in the Rust binding to
-  // `entry_type` because `type` is a Rust keyword.
+  // Wire field name is `type`. prost emits this as `r#type`
+  // (raw identifier) in the generated Rust binding because
+  // `type` is a Rust keyword; no rename attribute is configured.
   ListDirEntryType type = 2;
   // For files: byte count. For symlinks: target-string length.
   // For dirs / other: 0.
@@ -292,11 +293,17 @@ message WaitPortListeningResult {
 }
 
 // FileMeta carries the opaque revision token + size for a file.
-// Emitted as the first IoServerFrame of a ReadFile session (before
-// any Stdout chunks) AND as the ACK of a WriteFile session (the
-// revision of the just-written content). The UI uses revision to
-// gate optimistic writes; the wire encoding is opaque, but the
-// reference implementation uses `mtime_nanos:size`.
+// On a ReadFile session FileMeta is emitted BEFORE the first
+// Stdout chunk (so the UI captures the revision before consuming
+// bytes). On a WriteFile session FileMeta is emitted BEFORE the
+// terminal IoExited frame (carrying the revision of the
+// just-written content). FileMeta is a sidecar — it is NEVER a
+// session terminator; the "one IoExited or IoError per session"
+// invariant from v1.0.1 / v1.0.2 is preserved. v1.0.2 consumers
+// that block on IoExited keep working unchanged.
+//
+// The wire encoding of `revision` is opaque to clients; the
+// reference agent implementation uses `mtime_nanos:size`.
 message FileMeta {
   string revision = 1;
   uint64 size = 2;
