@@ -192,6 +192,78 @@ the wrong cause.
 **Recommendation:** cheap follow-up, do alongside the next `crates/api`
 refactor. Not urgent.
 
+## v12 polish-iteration deferred items (2026-05-28)
+
+These three surfaced in the v12 code-review pass on the live-edit
+polish batch (commits 7c4eb2f..HEAD; URL bar removal, Files tab
+removal, /workspace template realignment, hot-reload, entrypoint
+mkdir). Five of the eight findings were closed in the same iteration;
+these three need structural changes that didn't fit the polish scope.
+
+### V1 — Mobile (<768px) loses ad-hoc file IO
+
+The previous Files tab let any-viewport user read /etc/os-release,
+write /tmp/hello.txt, and inspect any absolute path. The Edit tab
+that replaced it gates the file tree + editor column behind
+`hidden md:block` (live-edit-panel.tsx:508, 546) so mobile sees the
+preview iframe only. Combined with FilesPanel's deletion, mobile
+users have zero in-UI file IO.
+
+**Options:**
+
+- **Mobile FileTree drawer.** Slide-over from the side; same tree
+  data, same delete/new-file affordances, just stacked instead of
+  side-by-side. Touches live-edit-panel.tsx layout + adds a small
+  drawer component.
+- **Mobile-only slimmed FilesPanel.** Bring back FilesPanel as a
+  `md:hidden` affordance — two text inputs over read/writeFile, no
+  tree. Cheapest, ugliest.
+- **Accept the limitation.** Document "use the desktop console or
+  the `open-sandbox` CLI for ad-hoc file IO on mobile" in a tooltip
+  or empty-state on the mobile preview pane.
+
+**Recommendation:** Mobile FileTree drawer is the structurally
+right fix. Defer until there's user demand — mobile via the dev
+console is the minority use case.
+
+### V2 — Preview iframe shows 502 for blank sandboxes
+
+PreviewPane (preview-pane.tsx:131) gates the iframe only on
+`isRunningStatus(status)`. A blank sandbox or one created with
+autorun=false transitions to running with `sleep infinity` as PID 1
+and nothing bound to :8080. The iframe then loads the public URL and
+the user sees a raw proxy 502. The old urlExpected lifecycle gate
+(removed via user request in 7208938) covered this case.
+
+**Options:**
+
+- **"Load preview" button.** Render an empty-state with a manual
+  load button until the user clicks it (or until exec fires
+  successfully). One-click cost, no lifecycle tracking.
+- **Cheap HEAD probe.** Fetch HEAD against the public URL on mount;
+  if 502, show empty-state; if 200, load iframe. One request per
+  preview pane open. Doesn't reintroduce the urlExpected map.
+- **Reintroduce urlExpected (rejected).** User explicitly removed
+  this in the same iteration as the URL bar; don't re-add it.
+
+**Recommendation:** HEAD-probe is cleanest — covers all cases
+(autorun, blank, exec-not-yet-fired) without re-coupling to exec
+lifecycle. Cost is one HEAD per sandbox-open. Defer until a user
+reports the 502.
+
+### V3 — nginx template sed without `g` flag
+
+`sed -i 's|/usr/share/nginx/html|/workspace|'` replaces only the
+first match per line in `/etc/nginx/conf.d/default.conf`. Today
+upstream `nginx:alpine`'s default.conf happens to have each `root`
+directive on its own line, so it works. If upstream ever ships two
+`root`s on one line, or if a user-customized default.conf does, the
+second silently keeps pointing at the original docroot.
+
+**Fix:** add the `g` flag (and likewise to the `listen` substitution
+for symmetry). One-character change; trivial. Hold until the next
+template touch so it doesn't fire its own review pass.
+
 ## Pointer
 
 The original code-review pass output is in the session log for
