@@ -249,6 +249,171 @@ fn is_target_dir_allowed(path: &str) -> bool {
         .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
 
+/// v1.0.3: list one level of a directory inside the container's
+/// mount namespace. Operates via std::fs after setns(2) — same
+/// pattern as read_file_in_ns. Hard-caps at LIST_DIR_MAX_ENTRIES
+/// per the v1.0.3 contract.
+///
+/// Returns a vector of `(DirEntry, /* sentinel: was_truncated */ bool)`
+/// where the bool slot is `true` only on the last returned entry
+/// when the underlying dir had more entries than the cap. Total
+/// count is the second return value. The agent crate wraps these
+/// into the trait's `DirListing`.
+pub async fn list_dir_in_ns(
+    target_pid: i32,
+    path: String,
+) -> Result<NsDirListing, AgentError> {
+    use open_sandbox_contracts::constants::LIST_DIR_MAX_ENTRIES;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    run_in_container_mount_ns(target_pid, move || {
+        let read_dir = std::fs::read_dir(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => AgentError::Runtime {
+                detail: format!("No such file: {path}"),
+            },
+            _ => AgentError::Runtime {
+                detail: format!("read_dir {path}: {e}"),
+            },
+        })?;
+
+        let mut entries: Vec<NsDirEntry> = Vec::new();
+        let mut total_entries: u64 = 0;
+        for raw in read_dir {
+            total_entries += 1;
+            let entry = match raw {
+                Ok(e) => e,
+                Err(_) => continue, // skip entries we can't read
+            };
+            if entries.len() >= LIST_DIR_MAX_ENTRIES {
+                // Continue counting to populate total_entries, but
+                // don't grow `entries` past the cap.
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Use symlink_metadata so symlinks don't follow.
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let file_type = meta.file_type();
+            let (entry_type, target) = if file_type.is_symlink() {
+                let target = std::fs::read_link(entry.path())
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (NsEntryType::Symlink, target)
+            } else if file_type.is_dir() {
+                (NsEntryType::Dir, String::new())
+            } else if file_type.is_file() {
+                (NsEntryType::File, String::new())
+            } else {
+                (NsEntryType::Other, String::new())
+            };
+
+            let size = if entry_type == NsEntryType::Dir {
+                0
+            } else {
+                meta.len()
+            };
+            let mtime = meta.mtime() as u64;
+            let revision = format!("{mtime}:{size}");
+            let mode = format!("{:04o}", meta.permissions().mode() & 0o7777);
+
+            entries.push(NsDirEntry {
+                name,
+                entry_type,
+                size,
+                revision,
+                mode,
+                target,
+            });
+        }
+        // Sort deterministically by name so the API returns stable
+        // ordering across calls (readdir order is filesystem-
+        // dependent).
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let truncated = total_entries as usize > entries.len();
+        Ok(NsDirListing {
+            path,
+            entries,
+            truncated,
+            total_entries,
+        })
+    })
+    .await
+}
+
+/// v1.0.3: stat a single path inside the container's mount
+/// namespace and return the agent's opaque revision token.
+/// Reference encoding: `<mtime_secs>:<size>`. Matches the agent-
+/// docker shell-exec'd `stat` output 1:1 so a sandbox migrated
+/// between runtimes mid-session retains revision continuity.
+pub async fn stat_revision_in_ns(
+    target_pid: i32,
+    path: String,
+) -> Result<NsFileRevision, AgentError> {
+    use std::os::unix::fs::MetadataExt;
+
+    run_in_container_mount_ns(target_pid, move || {
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => AgentError::Runtime {
+                detail: format!("No such file: {path}"),
+            },
+            _ => AgentError::Runtime {
+                detail: format!("stat {path}: {e}"),
+            },
+        })?;
+        let mtime = meta.mtime() as u64;
+        let size = if meta.is_dir() { 0 } else { meta.len() };
+        Ok(NsFileRevision {
+            revision: format!("{mtime}:{size}"),
+            size,
+        })
+    })
+    .await
+}
+
+/// Cross-crate transport for the ns-bound list_dir result. The
+/// agent-crate-side wrapper translates these into the
+/// `open_sandbox_agent::container::DirListing` shape; we don't
+/// import that type here to keep setns_ops independent of the
+/// agent crate's domain types.
+#[derive(Debug, Clone)]
+pub struct NsDirListing {
+    pub path: String,
+    pub entries: Vec<NsDirEntry>,
+    pub truncated: bool,
+    pub total_entries: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NsDirEntry {
+    pub name: String,
+    pub entry_type: NsEntryType,
+    pub size: u64,
+    pub revision: String,
+    pub mode: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NsEntryType {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+/// Cross-crate transport for stat_revision_in_ns. Same rationale
+/// as NsDirListing: keeps setns_ops free of agent-crate-side
+/// imports.
+#[derive(Debug, Clone)]
+pub struct NsFileRevision {
+    pub revision: String,
+    pub size: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

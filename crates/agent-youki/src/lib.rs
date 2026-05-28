@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use open_sandbox_agent::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState, DirListing,
-    ExecHandle, ExecStart, FileRevision,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState, DirEntry,
+    DirListing, EntryType, ExecHandle, ExecStart, FileRevision,
 };
 use open_sandbox_contracts::constants::DEFAULT_WRITE_CWD;
 use open_sandbox_contracts::error::AgentError;
@@ -499,31 +499,54 @@ impl ContainerRuntime for YoukiRuntime {
 
     async fn list_dir(
         &self,
-        _id: &ContainerId,
-        _path: &str,
-        _cwd: Option<&str>,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
     ) -> Result<DirListing, AgentError> {
-        // v1.0.3: real youki impl (setns(2) into the container's PID
-        // namespace + std::fs::read_dir + stat per entry) follows on
-        // a subsequent commit in PLAN_LIVE_EDIT group B. Until then,
-        // return a typed Runtime error rather than a silent empty
-        // listing.
-        Err(AgentError::Runtime {
-            detail: "list_dir not yet implemented for youki runtime".into(),
+        let resolved = resolve_path(path, cwd);
+        let target_pid = exec::container_pid(&id.0, &self.state_dir())?;
+        let ns_listing = setns_ops::list_dir_in_ns(target_pid, resolved).await?;
+        Ok(DirListing {
+            path: ns_listing.path,
+            entries: ns_listing
+                .entries
+                .into_iter()
+                .map(ns_dir_entry_to_agent)
+                .collect(),
+            truncated: ns_listing.truncated,
+            total_entries: ns_listing.total_entries,
         })
     }
 
     async fn stat_revision(
         &self,
-        _id: &ContainerId,
-        _path: &str,
-        _cwd: Option<&str>,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
     ) -> Result<FileRevision, AgentError> {
-        // v1.0.3: real youki impl follows on a subsequent commit in
-        // PLAN_LIVE_EDIT group B. Same error shape as list_dir above.
-        Err(AgentError::Runtime {
-            detail: "stat_revision not yet implemented for youki runtime".into(),
+        let resolved = resolve_path(path, cwd);
+        let target_pid = exec::container_pid(&id.0, &self.state_dir())?;
+        let ns_rev = setns_ops::stat_revision_in_ns(target_pid, resolved).await?;
+        Ok(FileRevision {
+            revision: ns_rev.revision,
+            size: ns_rev.size,
         })
+    }
+}
+
+fn ns_dir_entry_to_agent(entry: setns_ops::NsDirEntry) -> DirEntry {
+    DirEntry {
+        name: entry.name,
+        entry_type: match entry.entry_type {
+            setns_ops::NsEntryType::File => EntryType::File,
+            setns_ops::NsEntryType::Dir => EntryType::Dir,
+            setns_ops::NsEntryType::Symlink => EntryType::Symlink,
+            setns_ops::NsEntryType::Other => EntryType::Other,
+        },
+        size: entry.size,
+        revision: entry.revision,
+        mode: entry.mode,
+        target: entry.target,
     }
 }
 
@@ -573,7 +596,7 @@ mod tests {
         let info = runtime.create_and_start(config).await.unwrap();
 
         assert_eq!(info.sandbox_id, sandbox_id);
-        assert!(info.running);
+        assert!(matches!(info.state, ContainerState::Running));
         assert!(info.host_port > 0);
         assert!(!info.id.0.is_empty());
 
