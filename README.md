@@ -36,8 +36,9 @@ BYO devs ──install──► [Agent on their machine]               │
 
 - **Frozen wire shape:** `contracts/v1.0.0-frozen` (2026-05-23)
 - **Current contracts version on `main`:** `contracts/v1.0.2` — item #13 (`PullPolicy` + warm-startup optimization arc) shipped 2026-05-26; subsequent v1.0.2 additions: WebSocket subprotocol auth (browsers), opt-in CORS, fail-closed-on-empty API key, Pause/Unpause sandbox lifecycle. Items #1–#12 pending a separate session (see [`docs/plans/PLAN_CONTRACTS_v1.0.2.md`](docs/plans/PLAN_CONTRACTS_v1.0.2.md))
-- **Tag note:** the `contracts/v1.0.2` git tag points at the initial v1.0.2 commit (`0e68177`, pre-#13); tag movement deferred until #1–#12 ship
-- 154 unit tests green on `main` across contracts/agent/agent-docker/api/controller; 31 Linux youki tests green
+- **`contracts/v1.0.3` ready to merge** on branch `contracts/amendment-live-edit-v1.0.3` (2026-05-28): live-edit additions — `ListDirParams` / `WaitPortListeningParams` / `FileMeta` sidecar / write `expected_revision` precondition. Plus the matching agent runtime impls, gateway routes (`/files/list`, `/wait_port_listening`, `X-File-Revision` header, `REVISION_MISMATCH` → 409 with live revision in the body, `NOT_IMPLEMENTED` → 501), and the Next.js UI Edit tab (lazy file tree + CodeMirror 6 tabbed editor + preview iframe with debounced save-chain reload + IndexedDB unsaved-buffer persistence + 409 conflict banner + 30s on-visibility mtime check + mobile breakpoint). Closes the "Replit in a tab" item of the DX-magic roadmap. See [`docs/plans/PLAN_LIVE_EDIT_TASKS.md`](docs/plans/PLAN_LIVE_EDIT_TASKS.md) for the per-commit task graph and [`docs/reviews/FOLLOWUPS_v1.0.3.md`](docs/reviews/FOLLOWUPS_v1.0.3.md) for the closed + deferred findings log (9 `/code-review` passes during development)
+- **Tag note:** the `contracts/v1.0.2` git tag points at the initial v1.0.2 commit (`0e68177`, pre-#13); tag movement deferred until #1–#12 ship. `contracts/v1.0.3` + `contracts/v1.0.3-frozen` tag movement waits for the live-edit branch to merge to `main` AND a live-environment smoke pass
+- 289 unit tests green on the live-edit branch across contracts/agent/agent-docker/api/controller; 31+ Linux youki tests green; UI `pnpm tsc --noEmit` clean
 
 ## Repository layout
 
@@ -53,7 +54,7 @@ BYO devs ──install──► [Agent on their machine]               │
 | `crates/agent-youki/` | youki/libcontainer runtime impl (production) — includes a Linux dev-container compose so the agent builds + runs from a macOS host |
 | `crates/ws-client/` | Rust SDK for the WebSocket exec API |
 | `crates/cli/` | The `open-sandbox` binary — bundles all subcommands. Cargo features: `docker` (default), `youki` (Linux only) |
-| `ui/` | Next.js 16 dev console (React 19 + Tailwind v4 + xterm.js + lucide icons). Lists / creates / deletes sandboxes, streams exec, reads + writes files |
+| `ui/` | Next.js 16 dev console (React 19 + Tailwind v4 + xterm.js + lucide icons + CodeMirror 6 on v1.0.3). Lists / creates / deletes sandboxes, streams exec, reads + writes files. v1.0.3 adds a live-edit `Edit` tab: lazy file tree + tabbed editor + preview iframe with watchexec-gated reloads |
 | `ui/legacy/index.html` | Original single-file vanilla-HTML console — kept as the simplest possible reference client for the wire API |
 | `infra/` | Pulumi stack (TypeScript) and end-to-end shell scenarios |
 | `spikes/` | Time-boxed investigations with `RESULT.md` write-ups |
