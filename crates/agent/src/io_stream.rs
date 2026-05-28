@@ -618,8 +618,28 @@ async fn drive_list_dir<R>(
             let _ = server_tx.send(exited).await;
         }
         Err(e) => {
+            // Mirror drive_read_file's tighter "No such file" match —
+            // looser "No such" would mis-classify "No such container"
+            // and "No such image" (real bollard / runc phrases) as
+            // FILE_NOT_FOUND.
+            //
+            // Until the docker / youki list_dir impls land (later in
+            // PLAN_LIVE_EDIT group B), the runtime stubs return a
+            // Runtime error whose detail starts with
+            // "list_dir not yet implemented". Detect that here and
+            // surface it as NOT_IMPLEMENTED so a gateway / SDK doing
+            // capability feature-detection by error code can fall
+            // back, matching the symmetric drive_write_file
+            // precondition guard.
             let code = match &e {
-                AgentError::Runtime { detail } if detail.contains("No such") => "FILE_NOT_FOUND",
+                AgentError::Runtime { detail }
+                    if detail.starts_with("list_dir not yet implemented") =>
+                {
+                    "NOT_IMPLEMENTED"
+                }
+                AgentError::Runtime { detail } if detail.contains("No such file") => {
+                    "FILE_NOT_FOUND"
+                }
                 _ => "LIST_DIR_FAILED",
             };
             send_error(&server_tx, &stream_id, code, &e.to_string()).await;
@@ -699,13 +719,27 @@ async fn drive_wait_port_listening(
             break false;
         }
         let attempt_timeout = remaining.min(interval);
+        // Measure the actual wall-clock cost of this attempt so the
+        // post-failure sleep can be `interval - measured_attempt`
+        // rather than a fixed `interval`. Without this measurement
+        // the loop sleeps a full interval even on a fast refusal,
+        // making the effective cadence ~2× the documented 50ms
+        // budget under slow handshake / SYN_DROP conditions.
+        let attempt_start = Instant::now();
         match tokio::time::timeout(attempt_timeout, tokio::net::TcpStream::connect(&addr)).await {
             Ok(Ok(_stream)) => break true,
             Ok(Err(_connect_err)) => {
                 // Refused / not-listening: sleep the remainder of the
-                // probe interval and retry.
-                let elapsed_attempt = attempt_timeout.saturating_sub(remaining);
-                let sleep = interval.saturating_sub(elapsed_attempt);
+                // probe interval (or the deadline budget, whichever
+                // is smaller) and retry. Clamping by `remaining`
+                // bounds the total elapsed_ms to ~timeout_ms even
+                // on the final iteration before the deadline.
+                let elapsed_attempt = attempt_start.elapsed();
+                let remaining_after_attempt =
+                    deadline.saturating_duration_since(Instant::now());
+                let sleep = interval
+                    .saturating_sub(elapsed_attempt)
+                    .min(remaining_after_attempt);
                 if !sleep.is_zero() {
                     tokio::time::sleep(sleep).await;
                 }
@@ -718,8 +752,16 @@ async fn drive_wait_port_listening(
         }
     };
 
-    let elapsed_ms = u32::try_from(started.elapsed().as_millis())
-        .unwrap_or(u32::MAX);
+    // Clamp `elapsed_ms` to the caller's `timeout_ms` on the
+    // not-ready branch so callers can rely on
+    // `elapsed_ms <= timeout_ms` as an invariant when ready=false.
+    // The success path reports the true time-to-ready unchanged.
+    let raw_elapsed = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+    let elapsed_ms = if ready {
+        raw_elapsed
+    } else {
+        raw_elapsed.min(timeout_ms)
+    };
 
     let result_frame = IoServerFrame {
         stream_id: stream_id.clone(),
@@ -977,6 +1019,104 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     use crate::testutil::MockContainerRuntime;
+
+    /// Test-only runtime whose `list_dir` and `stat_revision` return
+    /// the exact "not yet implemented" detail string produced by the
+    /// agent-docker and agent-youki stubs. Used to pin
+    /// drive_list_dir's translation to the NOT_IMPLEMENTED error
+    /// code. Other trait methods delegate to MockContainerRuntime
+    /// defaults via deref-ish indirection (we just embed one).
+    struct NotYetImplementedRuntime;
+
+    impl ContainerRuntime for NotYetImplementedRuntime {
+        async fn create_and_start(
+            &self,
+            _config: crate::container::ContainerConfig,
+        ) -> Result<crate::container::ContainerInfo, AgentError> {
+            unimplemented!("not used by these tests")
+        }
+        async fn stop_and_remove(
+            &self,
+            _id: &ContainerId,
+            _timeout: Duration,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn pause(&self, _id: &ContainerId) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn unpause(&self, _id: &ContainerId) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn list_sandbox_containers(
+            &self,
+        ) -> Result<Vec<crate::container::ContainerInfo>, AgentError> {
+            Ok(Vec::new())
+        }
+        async fn start_exec(
+            &self,
+            _id: &ContainerId,
+            _start: crate::container::ExecStart,
+        ) -> Result<crate::container::ExecHandle, AgentError> {
+            unimplemented!("not used by these tests")
+        }
+        async fn signal_exec(
+            &self,
+            _id: &ContainerId,
+            _in_container_pid: i32,
+            _signum: i32,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn read_file(
+            &self,
+            _id: &ContainerId,
+            _path: &str,
+            _cwd: Option<&str>,
+        ) -> Result<bytes::Bytes, AgentError> {
+            unimplemented!("not used by these tests")
+        }
+        async fn write_file(
+            &self,
+            _id: &ContainerId,
+            _path: &str,
+            _cwd: Option<&str>,
+            _content: bytes::Bytes,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn write_files_targz(
+            &self,
+            _id: &ContainerId,
+            _cwd: Option<&str>,
+            _tarball: bytes::Bytes,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn list_dir(
+            &self,
+            _id: &ContainerId,
+            _path: &str,
+            _cwd: Option<&str>,
+        ) -> Result<crate::container::DirListing, AgentError> {
+            // Same detail string produced by the agent-docker and
+            // agent-youki stubs. drive_list_dir routes on this exact
+            // prefix.
+            Err(AgentError::Runtime {
+                detail: "list_dir not yet implemented for docker runtime".into(),
+            })
+        }
+        async fn stat_revision(
+            &self,
+            _id: &ContainerId,
+            _path: &str,
+            _cwd: Option<&str>,
+        ) -> Result<crate::container::FileRevision, AgentError> {
+            Err(AgentError::Runtime {
+                detail: "stat_revision not yet implemented for docker runtime".into(),
+            })
+        }
+    }
 
     /// Test-only `HostPortLookup` that returns a fixed port for any
     /// sandbox, or a `SandboxNotFound` error when constructed with
@@ -1614,6 +1754,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_dir_runtime_stub_surfaces_not_implemented() {
+        // Regression: until the real docker/youki list_dir impls
+        // land, the runtime stubs return
+        // AgentError::Runtime{detail="list_dir not yet implemented…"}.
+        // drive_list_dir MUST translate that to a typed
+        // NOT_IMPLEMENTED error code so a gateway/SDK feature-
+        // detecting list_dir support can fall back, matching the
+        // symmetric drive_write_file precondition guard.
+        use open_sandbox_contracts::proxy::ListDirParams as P;
+
+        let runtime = Arc::new(NotYetImplementedRuntime);
+        let registry = Arc::new(ExecRegistry::new());
+        let (tx, rx, h) = spawn_session(runtime, registry, "s-ls-noimpl");
+
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-ls-noimpl".into(),
+            payload: Some(io_client_frame::Payload::Start(IoStart {
+                sandbox_id: "ignored".into(),
+                params: Some(open_sandbox_contracts::proxy::io_start::Params::ListDir(P {
+                    path: "/workspace".into(),
+                    cwd: String::new(),
+                })),
+            })),
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let frames = collect_until_exit(rx).await;
+        let last = frames.last().expect("at least one frame");
+        match last {
+            io_server_frame::Payload::Error(e) => {
+                assert_eq!(
+                    e.code, "NOT_IMPLEMENTED",
+                    "expected NOT_IMPLEMENTED routing on stub runtime; got {e:?}"
+                );
+            }
+            other => panic!("expected Error frame, got {other:?}"),
+        }
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn list_dir_caps_at_5000_entries() {
         // Seed the mock with more entries than LIST_DIR_MAX_ENTRIES.
         // The mock's list_dir applies the cap server-side; assert
@@ -1776,9 +1959,21 @@ mod tests {
         match &frames[0] {
             io_server_frame::Payload::WaitPortListeningResult(r) => {
                 assert!(!r.ready, "expected ready=false; got {r:?}");
+                // Both bounds matter:
+                //  * elapsed_ms must reflect that we actually waited
+                //    (a fast-path false positive would be the bug).
+                //  * elapsed_ms must NOT exceed the caller-supplied
+                //    timeout — drive_wait_port_listening clamps the
+                //    not-ready branch to timeout_ms, so anything
+                //    larger here would indicate the clamp regressed.
                 assert!(
                     r.elapsed_ms >= 200,
                     "elapsed_ms should be at-or-above the timeout; got {}",
+                    r.elapsed_ms
+                );
+                assert!(
+                    r.elapsed_ms <= 250,
+                    "elapsed_ms must not exceed timeout_ms=250; got {}",
                     r.elapsed_ms
                 );
             }

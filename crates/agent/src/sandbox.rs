@@ -263,7 +263,10 @@ impl<R: ContainerRuntime> SandboxManager<R> {
     }
 }
 
-impl<R: ContainerRuntime> crate::container::HostPortLookup for SandboxManager<R> {
+impl<R> crate::container::HostPortLookup for SandboxManager<R>
+where
+    R: ContainerRuntime + Send + Sync + 'static,
+{
     fn host_port_for(&self, sandbox_id: &SandboxId) -> Result<u16, AgentError> {
         SandboxManager::host_port_for(self, sandbox_id)
     }

@@ -15,6 +15,15 @@ the contracts/v1.0.3 surface (commits `b80a0ca..` on
 | 4 | `proto/proxy.proto` comment on `ListDirEntry.type` lied about the prost rename. | `docs(contracts): clarify v1.0.3 FileMeta is a sidecar, not a terminator` |
 | 5 | `CONTRACTS.md` said FileMeta is emitted "in place of (or alongside) IoExited" — ambiguous, weakened the one-terminator invariant. | Same commit as #4. |
 
+## Closed in the second code-review pass
+
+| # | Finding | Closing commit |
+|---|---|---|
+| 6 | `drive_wait_port_listening` probe-loop math: `elapsed_attempt = attempt_timeout.saturating_sub(remaining)` was always 0, so the post-attempt sleep ignored the actual connect duration and effective cadence drifted to ~2× the documented 50ms under slow handshakes. The not-ready branch could also return `elapsed_ms > timeout_ms` by up to one probe interval. | `fix(agent): close code-review findings on B1-B7` |
+| 7 | `drive_list_dir` error mapper routed the docker / youki stub error to `LIST_DIR_FAILED` instead of `NOT_IMPLEMENTED`, breaking capability feature-detection symmetry with `drive_write_file`'s precondition guard. Also tightened the `FILE_NOT_FOUND` substring match from loose `"No such"` to `"No such file"` to match `drive_read_file` and avoid mis-classifying `"No such container"`. | Same commit. |
+| 8 | `crates/agent/Cargo.toml` `[dependencies] tokio` was missing the `net` feature even though `drive_wait_port_listening` calls `tokio::net::TcpStream::connect`. Workspace builds compiled by feature-unification leak only. | Same commit. |
+| 9 | `impl<R: ContainerRuntime> HostPortLookup for SandboxManager<R>` had no explicit `where R: Send + Sync + 'static` bound; relied transitively on `ContainerRuntime`'s supertrait. | Same commit. |
+
 ## Deferred design decisions (P4 — to revisit before groups B / C land)
 
 These are not blockers but want a deliberate call rather than letting the
