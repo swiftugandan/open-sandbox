@@ -1,15 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Edit3, FileText, Info, ListChecks, Terminal } from "lucide-react";
+import { Edit3, Info, ListChecks, Terminal } from "lucide-react";
 import type { ApiConfig, Sandbox } from "@/lib/api";
 import { ExecTerminal } from "@/components/exec-terminal";
-import { FilesPanel } from "@/components/files-panel";
 import { LiveEditPanel } from "@/components/live-edit-panel";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
 
-type Tab = "exec" | "edit" | "files" | "info";
+type Tab = "exec" | "edit" | "info";
 const TABS: {
   id: Tab;
   label: string;
@@ -18,7 +17,6 @@ const TABS: {
   { id: "exec", label: "Exec", icon: Terminal },
   // v1.0.3 live-edit: tree + CodeMirror tabbed editor + preview iframe.
   { id: "edit", label: "Edit", icon: Edit3 },
-  { id: "files", label: "Files", icon: FileText },
   { id: "info", label: "Info", icon: Info },
 ];
 
@@ -115,9 +113,8 @@ export function RightPane({
          * while inactive, which keeps the iframe live and
          * fires real network requests against the sandbox's
          * public URL on every save-chain reload — even when
-         * the user is on Exec/Files/Info. Once mounted we
-         * keep it mounted to preserve state between tab
-         * switches.
+         * the user is on Exec/Info. Once mounted we keep it
+         * mounted to preserve state between tab switches.
          */}
         <div className={cn("h-full", tab !== "edit" && "hidden")}>
           {editTabEverVisited && (
@@ -127,9 +124,6 @@ export function RightPane({
               sandbox={sandbox}
             />
           )}
-        </div>
-        <div className={cn("h-full", tab !== "files" && "hidden")}>
-          <FilesPanel config={config} sandboxId={sandbox.sandbox_id} />
         </div>
         <div
           className={cn(

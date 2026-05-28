@@ -116,8 +116,8 @@ export function Editor(props: Props) {
   // chord and pops the "Save Page As…" dialog.
   //
   // Skip when the user is typing in a plain HTML INPUT / TEXTAREA
-  // (the legacy FilesPanel, search boxes, etc); their containing
-  // app may want the chord. CodeMirror's editor surface IS
+  // (search boxes, the new-file row, etc); their containing app
+  // may want the chord. CodeMirror's editor surface IS
   // contenteditable but we deliberately DO NOT skip there — the
   // intent is to save the file even from inside the editor.
   useEffect(() => {
