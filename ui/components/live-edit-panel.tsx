@@ -20,7 +20,7 @@
  *  optimistic-concurrency writes use the freshest token.
  */
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { ApiConfig, Sandbox } from "@/lib/api";
 import { ApiError, api, publicUrl } from "@/lib/api";
@@ -70,12 +70,29 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
   // mashing so we don't trigger four wait_port_listening + iframe
   // reload pairs in a row. Per PLAN_LIVE_EDIT.md §Preview reload.
   const reloadDebounceRef = useRef<number | null>(null);
+  // Tracks whether this LiveEditPanel is still mounted, so the
+  // fire-and-forget save-chain IIFE doesn't `setState` after a
+  // sandbox switch (which remounts via the new `key` on the
+  // parent), nor after a route navigation.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (reloadDebounceRef.current !== null) {
+        window.clearTimeout(reloadDebounceRef.current);
+        reloadDebounceRef.current = null;
+      }
+    };
+  }, []);
   const scheduleReload = useCallback(() => {
+    if (!mountedRef.current) return;
     if (reloadDebounceRef.current !== null) {
       window.clearTimeout(reloadDebounceRef.current);
     }
     reloadDebounceRef.current = window.setTimeout(() => {
       reloadDebounceRef.current = null;
+      if (!mountedRef.current) return;
       setReloadKey((k) => k + 1);
     }, 200);
   }, []);
@@ -243,6 +260,10 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
             // preview will just be stale until the next save
             // or manual reload.
           }
+          // mountedRef short-circuits setReloadKey inside
+          // scheduleReload, so the IIFE completing after a
+          // sandbox switch is a clean no-op.
+          if (!mountedRef.current) return;
           scheduleReload();
         })();
       } catch (e) {
@@ -253,7 +274,7 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
         setStatus({ kind: "error", path, message });
       }
     },
-    [config, sandboxId],
+    [config, sandboxId, previewPort, scheduleReload],
   );
 
   return (

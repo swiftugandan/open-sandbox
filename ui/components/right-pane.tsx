@@ -60,6 +60,20 @@ export function RightPane({
   onOpenList,
 }: Props) {
   const [tab, setTab] = useState<Tab>("exec");
+  // v1.0.3 live-edit: once the user opens the Edit tab we keep
+  // LiveEditPanel mounted (so tab/dirty state survives switching
+  // away and back), but we skip mounting it until first visit.
+  // Without this, every save-chain iframe reload fires a network
+  // request against the sandbox's public URL even when the user
+  // is on a different tab. Reset on sandbox change so a fresh
+  // sandbox starts with no Edit-tab side-effects.
+  const [editTabEverVisited, setEditTabEverVisited] = useState(false);
+  useEffect(() => {
+    setEditTabEverVisited(false);
+  }, [sandbox?.sandbox_id]);
+  useEffect(() => {
+    if (tab === "edit") setEditTabEverVisited(true);
+  }, [tab]);
 
   if (!sandbox) {
     return (
@@ -116,8 +130,32 @@ export function RightPane({
             onUrlExpectedChange={onUrlExpectedChange}
           />
         </div>
+        {/*
+         * v1.0.3: key by sandbox_id so switching sandboxes
+         * fully remounts the panel. Without this, the tab list,
+         * dirty buffers, cached revisions, and reloadKey survive
+         * a sandbox switch — and the now-stale openFile/onSave
+         * closures fire writeFile against the wrong sandbox.
+         * Matches ExecTerminal's keying convention above.
+         *
+         * Lazy-mount: only mount LiveEditPanel after the user
+         * has visited the Edit tab at least once. The legacy
+         * `className="hidden"` toggle keeps the panel rendered
+         * while inactive, which keeps the iframe live and
+         * fires real network requests against the sandbox's
+         * public URL on every save-chain reload — even when
+         * the user is on Exec/Files/Info. Once mounted we
+         * keep it mounted to preserve state between tab
+         * switches.
+         */}
         <div className={cn("h-full", tab !== "edit" && "hidden")}>
-          <LiveEditPanel config={config} sandbox={sandbox} />
+          {editTabEverVisited && (
+            <LiveEditPanel
+              key={sandbox.sandbox_id}
+              config={config}
+              sandbox={sandbox}
+            />
+          )}
         </div>
         <div className={cn("h-full", tab !== "files" && "hidden")}>
           <FilesPanel config={config} sandboxId={sandbox.sandbox_id} />

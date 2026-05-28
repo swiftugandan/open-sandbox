@@ -35,6 +35,17 @@ the contracts/v1.0.3 surface (commits `b80a0ca..` on
 | 14 | `drive_write_file` returned early on REVISION_MISMATCH / NOT_IMPLEMENTED / write-error without draining pipelined `client_frames`, leaving Stdin frames queued on the demux and head-of-line-blocking other multiplexed sessions on the same tunnel. | Same commit. |
 | 15 | `stat_revision_in_ns` (youki) used `symlink_metadata` while agent-docker's `stat -c "%Y %s"` follows symlinks by default. A symlink path returned different revisions across runtimes, breaking the cross-runtime continuity claim. Aligned youki to use `std::fs::metadata` (follows symlinks). | Same commit. |
 
+## Closed in the seventh + eighth code-review pass (UI)
+
+| # | Finding | Closing commit |
+|---|---|---|
+| 24 | `LiveEditPanel.onSave` deps included `tabs`, so its identity changed on every keystroke. That identity flowed into the Editor's `saveKeymap` / `blurExtension` memos, which changed `extensions` reference, which forced @uiw/react-codemirror to tear down and recreate the EditorView on every character typed — destroying cursor / scroll / undo state per keystroke. | `fix(ui): close v7 code-review findings on live-edit integration` |
+| 25 | CM6 `Mod-s` keymap + document-level Cmd-S handler both fired for one keystroke when focus was inside the editor → concurrent double-save against the same revision token. | Same commit. |
+| 26 | `LiveEditPanel` was not keyed by `sandbox_id` in `right-pane.tsx`, so switching sandboxes left tabs / dirty buffers / cached revisions / reloadKey from the previous sandbox in place. Subsequent saves wrote a sandbox-A path into sandbox B with a sandbox-A revision token. | `fix(ui): close v8 code-review findings on preview pane` |
+| 27 | `LiveEditPanel` (and therefore the preview `<iframe>`) was always mounted under `className="hidden"` even when the user was on Exec/Files/Info — every save-chain reloadKey bump fired a real network request against the sandbox's public URL invisibly. Added a one-shot `editTabEverVisited` gate so the panel only mounts after first visit. | Same commit. |
+| 28 | `scheduleReload` setTimeout and the fire-and-forget `waitPortListening` IIFE in `onSave` could `setState` on an unmounted component (sandbox switch, route nav). Added `mountedRef` guard + cleanup useEffect. | Same commit. |
+| 29 | `onSave` useCallback was missing `previewPort` and `scheduleReload` in its dep array — stale capture if the previewPort prop ever changed. | Same commit. |
+
 ## Closed in the fourth code-review pass
 
 | # | Finding | Closing commit |
@@ -52,6 +63,8 @@ the contracts/v1.0.3 surface (commits `b80a0ca..` on
 | 18 | `WaitPortListeningResult.elapsed_ms` is clamped to the server-clamped `timeout_ms`, not the caller's original value. A caller asking for 600s gets `elapsed_ms <= 300_000` with no signal that the platform cap was hit. | Either document the clamp behavior in CONTRACTS.md as part of the v1.0.3 surface, or add a sentinel `clamped: bool` field on the result. |
 | 19 | `mtime`-second granularity opens a sub-1s TOCTOU window for optimistic writes (writer A reads at second T, writer B writes between A's read and A's write at second T, A's expected_revision still matches). | Either bump revision encoding to `<mtime_nanos>:<size>` (a wire-format change but additive to the opaque-string contract) or add a `<size>:<inode>` component. v1.1+. |
 | 20 | Cross-runtime divergence in `total_entries` semantics: agent-docker counts only parseable ls lines; agent-youki counts every readdir entry. | Tighten the trait contract in CONTRACTS.md to "every entry the runtime saw, including ones it couldn't fully describe" and align both impls. |
+| 21 | `LiveEditPanel.previewPort` defaults to 8080 — sandboxes created with a custom `exposed_port` (e.g. `3000` for Next.js, `5173` for Vite) get a broken save chain: wait_port_listening probes 8080 unconditionally, times out after 3s on every save, and the iframe reload races the real watchexec restart on the actual port. | Contracts change: add `exposed_port: u32` to `SandboxInfo` (`crates/api/src/service.rs`) + the TS `Sandbox` interface (`ui/lib/api.ts`). Plumb through `right-pane.tsx → LiveEditPanel`. Defer to a v1.0.4 amendment alongside the other deferred contract changes. |
+| 22 | Preview iframe re-creates on every save (via `key={reloadKey}` for cross-origin-reload correctness), destroying scroll position / form inputs / client-side router state in the previewed app. Plan-documented behavior, but worth measuring against a Next.js / Vite app to see if a same-origin path (where `iframe.contentWindow.location.reload()` IS callable) is worth special-casing. | Polish / measurement, not correctness. |
 
 ## Deferred design decisions (P4 — to revisit before groups B / C land)
 
