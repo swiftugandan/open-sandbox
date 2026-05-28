@@ -238,8 +238,19 @@ export const api = {
       { headers: { Authorization: `Bearer ${cfg.key}` } },
     );
     if (!r.ok) {
-      const t = await r.text();
-      throw new ApiError(t || r.statusText, r.status);
+      // readFile streams an octet-stream body on success but the
+      // gateway emits a JSON `{error, error_code, …}` on failure —
+      // mirror the centralized `request()` helper's parse path so
+      // callers can branch on `err.errorCode === "FILE_NOT_FOUND"`
+      // and friends instead of string-matching the message.
+      const text = await r.text();
+      try {
+        const j = JSON.parse(text);
+        throw new ApiError(j.error ?? text, r.status, j.error_code);
+      } catch (e) {
+        if (e instanceof ApiError) throw e;
+        throw new ApiError(text || r.statusText, r.status);
+      }
     }
     return {
       bytes: new Uint8Array(await r.arrayBuffer()),
