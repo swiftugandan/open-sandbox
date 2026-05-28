@@ -326,9 +326,10 @@ function StatusMessage({ status }: { status: SaveStatus }) {
     );
   }
   if (status.kind === "conflict") {
-    // Brief inline label — the user's actionable affordance is
-    // the banner above the editor pane, not the status bar.
-    return <span className="text-warn">Conflict</span>;
+    // No inline label — the ConflictBanner above the editor is
+    // the single source of conflict messaging; a duplicate
+    // toolbar string just adds visual noise.
+    return null;
   }
   return null;
 }

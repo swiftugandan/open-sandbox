@@ -35,6 +35,23 @@ the contracts/v1.0.3 surface (commits `b80a0ca..` on
 | 14 | `drive_write_file` returned early on REVISION_MISMATCH / NOT_IMPLEMENTED / write-error without draining pipelined `client_frames`, leaving Stdin frames queued on the demux and head-of-line-blocking other multiplexed sessions on the same tunnel. | Same commit. |
 | 15 | `stat_revision_in_ns` (youki) used `symlink_metadata` while agent-docker's `stat -c "%Y %s"` follows symlinks by default. A symlink path returned different revisions across runtimes, breaking the cross-runtime continuity claim. Aligned youki to use `std::fs::metadata` (follows symlinks). | Same commit. |
 
+## Closed in the ninth code-review pass (Group D polish)
+
+| # | Finding | Closing commit |
+|---|---|---|
+| 30 | `LiveEditPanel`'s D12 visibility re-stat fired a spurious REVISION_MISMATCH conflict when the agent runtime transitioned from non-revision-supporting (returning `null`) to revision-supporting (returning a real token) mid-session. Capability change is not a file mutation. Now silently adopts the new revision as the new baseline. | `fix(ui): close v9 code-review findings on Group D polish` |
+| 31 | Duplicate "Conflict" label in StatusBar AND ConflictBanner. Removed the StatusMessage inline string — the banner above the editor is the single source. | Same commit. |
+| 32 | `listUnsavedBuffersForSandbox` was imported but unused (the restore-prompt UI didn't ship in D9). Removed the dead import. | Same commit. |
+
+## Deferred follow-ups (v1.0.4 or polish)
+
+| # | Finding | Plan |
+|---|---|---|
+| 33 | `openDb` in unsaved-buffer.ts caches the resolved Promise even on failure — one bad open (private-window toggle, quota) disables IndexedDB persistence for the rest of the tab's lifetime. | Null the cache on error so the next call re-attempts; alternatively invalidate on `visibilitychange`. |
+| 34 | `putUnsavedBuffer` fires unthrottled on every keystroke — full file content per keypress. For a 1 MB file at 10 keystrokes/sec, ~10 MB/s of IDB transaction overhead. | Add a 200–300 ms per-path debounce. 300 ms of lost work on a crash is still within the acceptable v1.0.3 crash-safety bound. |
+| 35 | D12 periodic re-stat fetches the full file body via `api.readFile` just to read the X-File-Revision header. For a 10 MB asset, ~10 MB/30s of wasted bandwidth. | Introduce a dedicated `GET /v1/sandboxes/{id}/files/stat?path=…` endpoint that returns the FileMeta header with no body (and matching `api.statRevision` client helper). v1.0.4 wire addition. |
+| 36 | Stash-restore UX gives misleading conflict-banner copy when BOTH the stashed buffer AND disk content have moved since the last save. The banner says "the file was changed on the agent since you opened it" but the stash is also older than disk. | Compare stash mtime to disk revision freshness on restore; if stash is also stale, surface a third banner state ("local + remote both changed; reload to discard local, overwrite to last-write-wins"). |
+
 ## Closed in the seventh + eighth code-review pass (UI)
 
 | # | Finding | Closing commit |

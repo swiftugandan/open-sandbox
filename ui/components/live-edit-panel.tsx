@@ -29,7 +29,6 @@ import { Editor, type OpenTab, type SaveStatus } from "@/components/editor";
 import { PreviewPane } from "@/components/preview-pane";
 import {
   getUnsavedBuffer,
-  listUnsavedBuffersForSandbox,
   putUnsavedBuffer,
   removeUnsavedBuffer,
 } from "@/lib/unsaved-buffer";
@@ -363,6 +362,20 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
           activePath,
         );
         if (!mountedRef.current) return;
+        // Spurious-conflict guard: if the tab opened against a
+        // runtime that didn't support stat_revision (tab.revision
+        // === null) and the agent has since started returning
+        // real revisions, that capability change is NOT a file
+        // mutation. Silently adopt the new revision as the
+        // baseline instead of firing the conflict banner.
+        if (tab.revision === null && revision !== null) {
+          setTabs((prev) =>
+            prev.map((t) =>
+              t.path === activePath ? { ...t, revision } : t,
+            ),
+          );
+          return;
+        }
         if (revision !== null && revision !== tab.revision) {
           setStatus({
             kind: "conflict",
