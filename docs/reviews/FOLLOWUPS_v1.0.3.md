@@ -35,6 +35,14 @@ the contracts/v1.0.3 surface (commits `b80a0ca..` on
 | 14 | `drive_write_file` returned early on REVISION_MISMATCH / NOT_IMPLEMENTED / write-error without draining pipelined `client_frames`, leaving Stdin frames queued on the demux and head-of-line-blocking other multiplexed sessions on the same tunnel. | Same commit. |
 | 15 | `stat_revision_in_ns` (youki) used `symlink_metadata` while agent-docker's `stat -c "%Y %s"` follows symlinks by default. A symlink path returned different revisions across runtimes, breaking the cross-runtime continuity claim. Aligned youki to use `std::fs::metadata` (follows symlinks). | Same commit. |
 
+## Closed in the fourth code-review pass
+
+| # | Finding | Closing commit |
+|---|---|---|
+| 21 | CORS `expose_headers` only listed `content-type`. The v1.0.3 work introduced `X-File-Revision` as the primary channel for the UI to capture the revision token, but a browser running on a different origin had the header stripped before JS could read it — silently disabling the optimistic-concurrency loop. | `fix(api): close v4 code-review findings on Group C` |
+| 22 | `drive_write_file` skipped `drain_remaining_client_frames` on the pre-existing PAYLOAD_TOO_LARGE / INVALID_REQUEST early-returns; only the v1.0.3-added precondition paths had the drain. A pipelining client tripping the cap would HoL-block other multiplexed sessions on the same agent tunnel. Same fix in `drive_write_files_targz`. | Same commit. |
+| 23 | `ws_read_file::pump` maintained a raw-string IoError translation table (FILE_NOT_FOUND / SANDBOX_GONE / `_` → IoStreamFailed) parallel to the centralized `handlers::map_io_error`. Routed every dispatch through `map_io_error_pub` so the WS endpoint inherits REVISION_MISMATCH → 4409 / NOT_IMPLEMENTED → 4501 mapping. Added explicit arms to `close_for_api_error` for both v1.0.3 ApiError variants, removing the wildcard's silent downgrade. | Same commit. |
+
 ## Deferred to a v1.0.3 follow-up (or v1.1)
 
 | # | Finding | Plan |

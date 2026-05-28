@@ -52,7 +52,16 @@ fn dev_cors_layer() -> Option<CorsLayer> {
             HeaderName::from_static("content-type"),
             HeaderName::from_static("x-cwd"),
         ])
-        .expose_headers([HeaderName::from_static("content-type")]);
+        .expose_headers([
+            HeaderName::from_static("content-type"),
+            // v1.0.3: the live-edit UI reads the file revision token
+            // from `X-File-Revision` to seed write_file's
+            // expected_revision precondition. Without this entry the
+            // browser strips the header before JS can read it,
+            // silently disabling the entire optimistic-concurrency
+            // loop the v1.0.3 surface is built around.
+            HeaderName::from_static("x-file-revision"),
+        ]);
     // Wildcard is only honored when `*` is the sole entry — silent
     // escalation when an operator writes `'*, https://foo'` (a docs-
     // style mixed value) would broaden the allowlist beyond intent.

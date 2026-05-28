@@ -250,17 +250,15 @@ async fn pump(
                 return;
             }
             Some(io_server_frame::Payload::Error(err)) => {
-                let api_err = match err.code.as_str() {
-                    "FILE_NOT_FOUND" => ApiError::FileNotFound {
-                        resolved_path: err.detail.clone(),
-                    },
-                    "SANDBOX_GONE" => ApiError::SandboxGone {
-                        sandbox_id: err.detail.clone(),
-                    },
-                    _ => ApiError::IoStreamFailed {
-                        detail: format!("{}: {}", err.code, err.detail),
-                    },
-                };
+                // v1.0.3: route through the centralized
+                // `handlers::map_io_error` so REVISION_MISMATCH / NOT_
+                // IMPLEMENTED (and any future code added to
+                // IoErrorCode) map to the same ApiError variants the
+                // unary REST surface uses. The previous raw-string
+                // switch had drifted from map_io_error and would
+                // have silently bucketed v1.0.3 codes as
+                // IoStreamFailed on the WS endpoint.
+                let api_err = crate::handlers::map_io_error_pub(&err);
                 let (code, reason) = close_for_api_error(&api_err);
                 send_close_via(&mut socket, code, &reason).await;
                 return;
@@ -283,12 +281,27 @@ async fn pump(
 }
 
 fn close_for_api_error(e: &ApiError) -> (u16, String) {
+    // v1.0.3: explicit arms for every v1.0.3 ApiError variant so a
+    // future code path that ever pipes a write-side error through
+    // this WS close mapping surfaces a structured close frame
+    // instead of falling through to a generic 4500. Mirrors the
+    // exhaustive-match discipline in
+    // contracts/src/error.rs::error_code (no wildcard).
     match e {
         ApiError::FileNotFound { resolved_path } => {
             (4404, format!("FILE_NOT_FOUND: {resolved_path}"))
         }
         ApiError::SandboxGone { sandbox_id } => (4404, format!("SANDBOX_GONE: {sandbox_id}")),
         ApiError::ProxyUnavailable { .. } => (4503, e.to_string()),
+        // 4409 carries the live revision token in the reason so an
+        // SDK consuming the close frame can refetch + retry
+        // without a separate stat call — matches the JSON 409 body
+        // shape on the unary REST surface.
+        ApiError::RevisionMismatch { actual_revision } => {
+            (4409, format!("REVISION_MISMATCH: {actual_revision}"))
+        }
+        // 4501 mirrors HTTP 501 Not Implemented for the unary path.
+        ApiError::NotImplemented { detail } => (4501, format!("NOT_IMPLEMENTED: {detail}")),
         _ => (4500, e.to_string()),
     }
 }

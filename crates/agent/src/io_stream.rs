@@ -940,6 +940,7 @@ async fn drive_write_file<R, S>(
                         ),
                     )
                     .await;
+                    drain_remaining_client_frames(&mut client_frames).await;
                     return;
                 }
                 content.extend_from_slice(&bytes);
@@ -953,6 +954,7 @@ async fn drive_write_file<R, S>(
                     "only Stdin and Close frames are valid in write_file mode",
                 )
                 .await;
+                drain_remaining_client_frames(&mut client_frames).await;
                 return;
             }
         }
@@ -1038,6 +1040,7 @@ async fn drive_write_files_targz<R, S>(
                         ),
                     )
                     .await;
+                    drain_remaining_client_frames(&mut client_frames).await;
                     return;
                 }
                 tarball.extend_from_slice(&bytes);
@@ -1051,6 +1054,7 @@ async fn drive_write_files_targz<R, S>(
                     "only Stdin and Close frames are valid in write_files_targz mode",
                 )
                 .await;
+                drain_remaining_client_frames(&mut client_frames).await;
                 return;
             }
         }

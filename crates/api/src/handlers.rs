@@ -854,6 +854,13 @@ async fn wait_port_via_io_stream<S: SandboxService>(
     })
 }
 
+/// v1.0.3: re-exported under `map_io_error_pub` for crate-siblings
+/// (ws_read_file) so the WS streaming endpoint and the unary REST
+/// endpoint share a single IoError → ApiError translation table.
+pub(crate) fn map_io_error_pub(err: &open_sandbox_contracts::proxy::IoError) -> ApiError {
+    map_io_error(err)
+}
+
 fn map_io_error(err: &open_sandbox_contracts::proxy::IoError) -> ApiError {
     // v1.0.2 cascade: parse via IoErrorCode so the SANDBOX_NOT_FOUND →
     // SandboxGone alias normalization lives in contracts instead of
