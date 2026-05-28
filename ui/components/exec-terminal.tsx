@@ -34,17 +34,12 @@ interface Props {
   // auto-fire from a template prefill has to wait until the parent's
   // poll observes status="running".
   sandboxStatus: SandboxStatus;
-  /** Notify the parent when this sandbox has (probably) a process
-   *  listening on :8080. Called true on a Started frame, false on
-   *  Exited / Error / WS close. Drives the RightPane's URL bar. */
-  onUrlExpectedChange: (id: string, on: boolean) => void;
 }
 
 export function ExecTerminal({
   config,
   sandboxId,
   sandboxStatus,
-  onUrlExpectedChange,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<{
@@ -200,7 +195,6 @@ export function ExecTerminal({
           term.writeln(
             `\x1b[38;5;245mstarted exec_id=${s.execId} pid=${s.inContainerPid}\x1b[0m`,
           );
-          onUrlExpectedChange(sandboxId, true);
           break;
         }
         case Kind.Stdout:
@@ -218,13 +212,11 @@ export function ExecTerminal({
           term.writeln(
             `\r\n\x1b[${col}mexited ${e.exitCode}${cnf}\x1b[0m`,
           );
-          onUrlExpectedChange(sandboxId, false);
           break;
         }
         case Kind.Error: {
           const e = decodeIoError(body);
           term.writeln(`\r\n\x1b[31m[${e.code}] ${e.detail}\x1b[0m`);
-          onUrlExpectedChange(sandboxId, false);
           break;
         }
         default:
@@ -241,15 +233,11 @@ export function ExecTerminal({
       }
       wsRef.current = null;
       setState("closed");
-      // The agent SIGTERMs the in-container process when the WS
-      // closes (spike-01 + ADR-006), so a closed session means
-      // nothing's listening anymore — drop the URL.
-      onUrlExpectedChange(sandboxId, false);
     };
     ws.onerror = () => {
       setState("closed");
     };
-  }, [cmd, config.base, config.key, sandboxId, onUrlExpectedChange]);
+  }, [cmd, config.base, config.key, sandboxId]);
 
   // Autorun gate. When a template-driven create set autorun=true, we
   // can't fire immediately — the agent registers the sandbox only

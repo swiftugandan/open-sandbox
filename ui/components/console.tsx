@@ -29,24 +29,6 @@ export function Console() {
   const [config, setConfig, storageError] = useConfig();
   const [sandboxes, setSandboxes] = useState<Sandbox[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  // Best-effort "is something likely bound to :8080?" tracking.
-  // Populated by ExecTerminal's WS lifecycle (Started → add, Exited /
-  // Error / Close → remove). Drives whether RightPane shows the
-  // public URL or a placeholder — without this, we'd advertise a URL
-  // that 502s for blank sandboxes and during the seconds-long window
-  // between create and the in-container process actually binding the
-  // port.
-  const [urlExpected, setUrlExpected] = useState<Set<string>>(new Set());
-  const markUrlExpected = useCallback((id: string, on: boolean) => {
-    setUrlExpected((prev) => {
-      const has = prev.has(id);
-      if (on === has) return prev;
-      const next = new Set(prev);
-      if (on) next.add(id);
-      else next.delete(id);
-      return next;
-    });
-  }, []);
   const [connState, setConnState] = useState<
     "connected" | "connecting" | "error"
   >("connecting");
@@ -128,8 +110,6 @@ export function Console() {
             config={config}
             sandbox={selected}
             hasAnySandboxes={sandboxes.length > 0}
-            urlExpected={selected ? urlExpected.has(selected.sandbox_id) : false}
-            onUrlExpectedChange={markUrlExpected}
             onOpenList={isMobile ? () => setDrawerOpen(true) : undefined}
           />
         </section>

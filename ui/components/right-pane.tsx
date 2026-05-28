@@ -1,18 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import {
-  Check,
-  Copy,
-  Edit3,
-  ExternalLink,
-  FileText,
-  Info,
-  ListChecks,
-  Terminal,
-} from "lucide-react";
-import type { ApiConfig, Sandbox, SandboxStatus } from "@/lib/api";
-import { isRunningStatus, publicUrl } from "@/lib/api";
+import { Edit3, FileText, Info, ListChecks, Terminal } from "lucide-react";
+import type { ApiConfig, Sandbox } from "@/lib/api";
 import { ExecTerminal } from "@/components/exec-terminal";
 import { FilesPanel } from "@/components/files-panel";
 import { LiveEditPanel } from "@/components/live-edit-panel";
@@ -26,8 +16,7 @@ const TABS: {
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
   { id: "exec", label: "Exec", icon: Terminal },
-  // v1.0.3 live-edit: tree + CodeMirror tabbed editor. Preview
-  // iframe lands here too once D13 ships.
+  // v1.0.3 live-edit: tree + CodeMirror tabbed editor + preview iframe.
   { id: "edit", label: "Edit", icon: Edit3 },
   { id: "files", label: "Files", icon: FileText },
   { id: "info", label: "Info", icon: Info },
@@ -40,13 +29,6 @@ interface Props {
    *  anywhere, "Select a sandbox" is a lie — there's nothing to
    *  select. Swap to a "pick a template" pointer in that case. */
   hasAnySandboxes: boolean;
-  /** Best-effort signal: did ExecTerminal observe a Started frame
-   *  without a subsequent Exited? Drives the URL bar — false means
-   *  hide the URL (nothing's bound to :8080). */
-  urlExpected: boolean;
-  /** Plumbed down to ExecTerminal so its WS lifecycle can update the
-   *  Console-level urlExpected map. */
-  onUrlExpectedChange: (id: string, on: boolean) => void;
   /** Provided on mobile: lets the empty/active panes reopen the sandbox list drawer. */
   onOpenList?: () => void;
 }
@@ -55,8 +37,6 @@ export function RightPane({
   config,
   sandbox,
   hasAnySandboxes,
-  urlExpected,
-  onUrlExpectedChange,
   onOpenList,
 }: Props) {
   const [tab, setTab] = useState<Tab>("exec");
@@ -93,25 +73,8 @@ export function RightPane({
     );
   }
 
-  const url = publicUrl(config.base, sandbox.subdomain);
-  const urlVisible = isRunningStatus(sandbox.status) && urlExpected;
-
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      {/* v1.0.3: the URL bar is redundant on the Edit tab — the
-       *  preview pane already renders the public URL with an
-       *  open-in-tab affordance + a copy button. Hide it there
-       *  so the Edit tab gets the full vertical space for the
-       *  three-column layout. Other tabs (Exec / Files / Info)
-       *  still surface the URL since they have no other
-       *  on-screen reference to it. */}
-      {tab !== "edit" && (
-        <SandboxUrlBar
-          url={url}
-          visible={urlVisible}
-          status={sandbox.status}
-        />
-      )}
       <nav className="flex shrink-0 items-stretch overflow-x-auto border-b border-border bg-surface">
         {TABS.map(({ id, label, icon: Icon }) => (
           <button
@@ -136,7 +99,6 @@ export function RightPane({
             config={config}
             sandboxId={sandbox.sandbox_id}
             sandboxStatus={sandbox.status}
-            onUrlExpectedChange={onUrlExpectedChange}
           />
         </div>
         {/*
@@ -180,114 +142,6 @@ export function RightPane({
           </pre>
         </div>
       </div>
-    </div>
-  );
-}
-
-function SandboxUrlBar({
-  url,
-  visible,
-  status,
-}: {
-  url: string;
-  visible: boolean;
-  status: SandboxStatus;
-}) {
-  // When the URL would 502, show context instead. Three cases worth
-  // distinguishing: not yet running (still booting), running but
-  // nothing observed bound to :8080 (blank sandbox, exited process,
-  // or just hasn't been started yet), and the happy path.
-  if (!visible) {
-    const message = !isRunningStatus(status)
-      ? `URL appears once the sandbox is running (status: ${status})`
-      : "Start a process on :8080 in the Exec tab to get a public URL";
-    return (
-      <div className="flex shrink-0 items-center gap-1.5 border-b border-border bg-surface px-3 py-1.5">
-        <span className="shrink-0 text-[10.5px] uppercase tracking-wider text-fg-muted">
-          URL
-        </span>
-        <span className="min-w-0 flex-1 truncate text-[11.5px] italic text-fg-muted">
-          {message}
-        </span>
-      </div>
-    );
-  }
-  return <SandboxUrlBarLive url={url} />;
-}
-
-function SandboxUrlBarLive({ url }: { url: string }) {
-  const [copied, setCopied] = useState(false);
-  // Auto-clear the "copied" indicator after a short window so the
-  // button doesn't read as "copied" indefinitely after the user moves
-  // on; cleanup cancels the timer if they click again first.
-  useEffect(() => {
-    if (!copied) return;
-    const t = window.setTimeout(() => setCopied(false), 1500);
-    return () => window.clearTimeout(t);
-  }, [copied]);
-
-  const onCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopied(true);
-    } catch {
-      // clipboard.writeText rejects when the page isn't focused / in
-      // an insecure context; fall back to a selection-based copy via
-      // a hidden textarea so the user still gets *something*.
-      const ta = document.createElement("textarea");
-      ta.value = url;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      try {
-        document.execCommand("copy");
-        setCopied(true);
-      } catch {
-        /* nothing left to try */
-      }
-      document.body.removeChild(ta);
-    }
-  };
-
-  return (
-    <div className="flex shrink-0 items-center gap-1.5 border-b border-border bg-surface px-3 py-1.5">
-      <span className="shrink-0 text-[10.5px] uppercase tracking-wider text-fg-muted">
-        URL
-      </span>
-      <a
-        href={url}
-        target="_blank"
-        rel="noreferrer noopener"
-        className="group flex min-w-0 flex-1 items-center gap-1 truncate font-mono text-[11.5px] text-fg-muted transition-colors hover:text-accent"
-        title={`Open ${url} in a new tab`}
-      >
-        <span className="truncate">{url}</span>
-        <ExternalLink className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
-      </a>
-      <button
-        type="button"
-        onClick={onCopy}
-        title={copied ? "Copied!" : "Copy URL"}
-        className={cn(
-          "flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] transition-colors",
-          copied
-            ? "text-ok"
-            : "text-fg-muted hover:bg-surface-2 hover:text-fg",
-        )}
-      >
-        {copied ? (
-          <>
-            <Check className="size-3.5" />
-            <span>copied</span>
-          </>
-        ) : (
-          <>
-            <Copy className="size-3.5" />
-            <span className="hidden sm:inline">copy</span>
-          </>
-        )}
-      </button>
     </div>
   );
 }
