@@ -152,6 +152,13 @@ message IoStart {
     // `timeout_ms` elapses. Used by the UI save-chain to gate
     // the preview-iframe refresh on watchexec-restart completion.
     WaitPortListeningParams wait_port_listening = 7;
+    // v1.0.3: delete a file or directory. `recursive=false`
+    // refuses to delete directories (matches `rm` semantics);
+    // `recursive=true` deletes everything under `path` (matches
+    // `rm -rf`). Missing path is a no-op (Ok) rather than an
+    // error so the UI's delete-then-refresh sequence stays
+    // idempotent under concurrent external `rm`.
+    DeleteFileParams delete_file = 8;
   }
 }
 
@@ -307,4 +314,16 @@ message WaitPortListeningResult {
 message FileMeta {
   string revision = 1;
   uint64 size = 2;
+}
+
+// DeleteFileParams: remove a file or directory. Matches `rm` /
+// `rm -r` semantics on the wire: `recursive=false` errors on a
+// directory; `recursive=true` removes everything under `path`.
+// Missing path resolves to Ok (idempotent — the UI may racing
+// with an external `rm` and we don't want spurious 404s
+// during a tree refresh).
+message DeleteFileParams {
+  string path = 1;
+  string cwd = 2;
+  bool recursive = 3;
 }

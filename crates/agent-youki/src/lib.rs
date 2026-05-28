@@ -542,6 +542,18 @@ impl ContainerRuntime for YoukiRuntime {
         let target_pid = exec::container_pid(&id.0, &self.state_dir())?;
         setns_ops::wait_port_listening_in_ns(target_pid, port, timeout).await
     }
+
+    async fn delete_file(
+        &self,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+        recursive: bool,
+    ) -> Result<(), AgentError> {
+        let resolved = resolve_path(path, cwd);
+        let target_pid = exec::container_pid(&id.0, &self.state_dir())?;
+        setns_ops::delete_in_ns(target_pid, resolved, recursive).await
+    }
 }
 
 fn ns_dir_entry_to_agent(entry: setns_ops::NsDirEntry) -> DirEntry {

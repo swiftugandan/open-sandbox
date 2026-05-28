@@ -425,6 +425,63 @@ pub struct NsFileRevision {
     pub size: u64,
 }
 
+/// v1.0.3: delete a file or directory inside the container's
+/// mount namespace. Matches `rm` / `rm -r` semantics: missing
+/// path resolves to Ok (idempotent), `recursive=false` errors
+/// on a non-empty directory.
+pub async fn delete_in_ns(
+    target_pid: i32,
+    path: String,
+    recursive: bool,
+) -> Result<(), AgentError> {
+    run_in_container_mount_ns(target_pid, move || {
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Idempotent: missing path = success. The UI's
+                // delete+refresh sequence stays correct under
+                // concurrent external `rm`.
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(AgentError::Runtime {
+                    detail: format!("stat {path}: {e}"),
+                });
+            }
+        };
+        if meta.is_dir() {
+            if recursive {
+                std::fs::remove_dir_all(&path).map_err(|e| AgentError::Runtime {
+                    detail: format!("remove_dir_all {path}: {e}"),
+                })?;
+            } else {
+                // Try a plain remove_dir first — succeeds on
+                // empty dirs and matches `rm` (without -r) on
+                // empty-dir behavior. On non-empty, std::fs
+                // returns DirectoryNotEmpty which we surface as
+                // a recognizable error.
+                std::fs::remove_dir(&path).map_err(|e| AgentError::Runtime {
+                    detail: match e.kind() {
+                        std::io::ErrorKind::DirectoryNotEmpty => {
+                            format!("rm: cannot remove '{path}': Directory not empty")
+                        }
+                        _ => format!("remove_dir {path}: {e}"),
+                    },
+                })?;
+            }
+        } else {
+            // Files (including symlinks): use remove_file. On a
+            // symlink this removes the LINK, not the target —
+            // correct behavior.
+            std::fs::remove_file(&path).map_err(|e| AgentError::Runtime {
+                detail: format!("remove_file {path}: {e}"),
+            })?;
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// v1.0.3: probe TCP-listening status from inside the container's
 /// NETWORK namespace.
 ///

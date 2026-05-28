@@ -25,12 +25,14 @@ import {
   FilePlus,
   Folder,
   RefreshCw,
+  Trash2,
 } from "lucide-react";
 
 import type { ApiConfig } from "@/lib/api";
 import { ApiError, api, type ListDirEntry } from "@/lib/api";
 import { isHiddenByDefault } from "@/lib/tree-defaults";
 import { Button } from "@/components/ui/button";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/cn";
 
@@ -247,6 +249,8 @@ export function FileTree({
     [state.dirs, fetchDir],
   );
 
+  const confirm = useConfirm();
+
   // v1.0.3 D2.5: inline "new file" affordance. `newFileRow` is
   // the open input state (null when closed). The flow runs
   // entirely inside the FileTree component — no native
@@ -284,6 +288,94 @@ export function FileTree({
     [config, sandboxId, rootPath, onSelect],
   );
 
+  /** Confirm + delete a file or directory. Re-uses the dev
+   *  console's React `ConfirmDialog` rather than a native
+   *  browser confirm. Refreshes the tree on success. */
+  const onDelete = useCallback(
+    async (absPath: string, isDir: boolean) => {
+      const basename = absPath.slice(absPath.lastIndexOf("/") + 1);
+      const ok = await confirm({
+        title: isDir ? "Delete directory?" : "Delete file?",
+        description: (
+          <>
+            <span className="font-mono">{basename}</span>
+            {isDir
+              ? " and all its contents will be deleted from the sandbox."
+              : " will be deleted from the sandbox."}
+          </>
+        ),
+        confirmLabel: "Delete",
+        variant: "danger",
+      });
+      if (!ok) return;
+      try {
+        // The caller may have passed isDir=false on a row the
+        // server in fact reports as a directory (e.g. a symlink
+        // to a dir, or stale tree state). We pass `recursive:
+        // isDir` so the dir-path is auto-recursive; for non-
+        // directories the agent treats `recursive=true` the
+        // same as `rm -rf` on a leaf (no-op flag — `rm -rf foo`
+        // works on files too).
+        await api.deleteFile(config, sandboxId, absPath, { recursive: isDir });
+        setRefreshNonce((n) => n + 1);
+      } catch (e) {
+        // v1.0.3: 409 DIRECTORY_NOT_EMPTY is the typed-conflict
+        // case the agent emits when the user clicked "delete"
+        // on something the tree thought was a file but the
+        // server resolved as a populated dir (e.g. a stale
+        // listing). Re-prompt with the recursive option.
+        if (
+          e instanceof ApiError &&
+          e.errorCode === "DIRECTORY_NOT_EMPTY"
+        ) {
+          const recur = await confirm({
+            title: "Directory not empty",
+            description: (
+              <>
+                <span className="font-mono">{basename}</span>
+                {" is a directory and has contents. Delete it and everything inside?"}
+              </>
+            ),
+            confirmLabel: "Delete recursively",
+            variant: "danger",
+          });
+          if (recur) {
+            try {
+              await api.deleteFile(config, sandboxId, absPath, {
+                recursive: true,
+              });
+              setRefreshNonce((n) => n + 1);
+            } catch (e2) {
+              const message =
+                e2 instanceof ApiError
+                  ? `${e2.errorCode ?? e2.status}: ${e2.message}`
+                  : String(e2);
+              await confirm({
+                title: "Delete failed",
+                description: message,
+                confirmLabel: "OK",
+              });
+            }
+          }
+          return;
+        }
+        // Re-confirm dialog with the error message — keeps the
+        // user inside the modal flow instead of a separate
+        // toast they might miss.
+        const message =
+          e instanceof ApiError
+            ? `${e.errorCode ?? e.status}: ${e.message}`
+            : String(e);
+        await confirm({
+          title: "Delete failed",
+          description: message,
+          confirmLabel: "OK",
+        });
+      }
+    },
+    [confirm, config, sandboxId],
+  );
+
   return (
     <div className="flex flex-col h-full text-[12px] font-mono">
       <TreeHeader
@@ -316,6 +408,7 @@ export function FileTree({
           showHidden={showHidden}
           onToggleExpand={toggleExpand}
           onSelect={onSelect}
+          onDelete={onDelete}
           selectedPath={selectedPath}
           depth={0}
         />
@@ -435,6 +528,7 @@ interface DirChildrenProps {
   showHidden: boolean;
   onToggleExpand: (path: string) => void;
   onSelect?: (absPath: string) => void;
+  onDelete: (absPath: string, isDir: boolean) => void | Promise<void>;
   selectedPath?: string;
   depth: number;
 }
@@ -482,6 +576,7 @@ function DirChildren(props: DirChildrenProps) {
           showHidden={showHidden}
           onToggleExpand={props.onToggleExpand}
           onSelect={props.onSelect}
+          onDelete={props.onDelete}
           selectedPath={props.selectedPath}
           depth={depth}
         />
@@ -505,6 +600,7 @@ function TreeRow({
   showHidden,
   onToggleExpand,
   onSelect,
+  onDelete,
   selectedPath,
   depth,
 }: {
@@ -514,6 +610,7 @@ function TreeRow({
   showHidden: boolean;
   onToggleExpand: (path: string) => void;
   onSelect?: (absPath: string) => void;
+  onDelete: (absPath: string, isDir: boolean) => void | Promise<void>;
   selectedPath?: string;
   depth: number;
 }) {
@@ -537,37 +634,62 @@ function TreeRow({
 
   return (
     <li>
-      <button
-        type="button"
-        onClick={onClick}
-        title={abs}
+      <div
         className={cn(
-          "w-full flex items-center gap-1 px-2 py-0.5 text-left",
+          "group flex items-center gap-1 pr-1",
           "hover:bg-surface-2",
           isSelected && "bg-surface-2 text-fg",
           !isSelected && "text-fg-muted",
         )}
-        style={{ paddingLeft: 8 + indent }}
       >
-        {isDir ? (
-          isExpanded ? (
-            <ChevronDown size={12} className="shrink-0" />
+        <button
+          type="button"
+          onClick={onClick}
+          title={abs}
+          className="min-w-0 flex-1 flex items-center gap-1 py-0.5 text-left"
+          style={{ paddingLeft: 8 + indent }}
+        >
+          {isDir ? (
+            isExpanded ? (
+              <ChevronDown size={12} className="shrink-0" />
+            ) : (
+              <ChevronRight size={12} className="shrink-0" />
+            )
           ) : (
-            <ChevronRight size={12} className="shrink-0" />
-          )
-        ) : (
-          <span className="w-3 shrink-0" />
-        )}
-        {isDir ? (
-          <Folder size={12} className="shrink-0" />
-        ) : (
-          <File size={12} className="shrink-0" />
-        )}
-        <span className="truncate">{entry.name}</span>
-        {entry.type === "symlink" && entry.target && (
-          <span className="text-fg-muted/60 ml-1">→ {entry.target}</span>
-        )}
-      </button>
+            <span className="w-3 shrink-0" />
+          )}
+          {isDir ? (
+            <Folder size={12} className="shrink-0" />
+          ) : (
+            <File size={12} className="shrink-0" />
+          )}
+          <span className="truncate">{entry.name}</span>
+          {entry.type === "symlink" && entry.target && (
+            <span className="text-fg-muted/60 ml-1">→ {entry.target}</span>
+          )}
+        </button>
+        <button
+          type="button"
+          // The trash button only appears on row hover (or
+          // keyboard focus) so the tree stays visually quiet.
+          // stopPropagation so the parent row's onClick (which
+          // would open the file in the editor) doesn't fire.
+          onClick={(e) => {
+            e.stopPropagation();
+            void onDelete(abs, isDir);
+          }}
+          title={isDir ? `Delete directory ${entry.name}` : `Delete ${entry.name}`}
+          aria-label={isDir ? `Delete directory ${entry.name}` : `Delete file ${entry.name}`}
+          className={cn(
+            "shrink-0 p-1 opacity-0 transition-opacity",
+            "group-hover:opacity-60 hover:!opacity-100 focus-visible:opacity-100",
+            "text-fg-muted hover:text-err focus-visible:text-err",
+            "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-err/40 rounded",
+          )}
+        >
+          <Trash2 size={11} />
+        </button>
+      </div>
       {isExpanded && (
         <DirChildren
           path={abs}
@@ -575,6 +697,7 @@ function TreeRow({
           showHidden={showHidden}
           onToggleExpand={onToggleExpand}
           onSelect={onSelect}
+          onDelete={onDelete}
           selectedPath={selectedPath}
           depth={depth + 1}
         />

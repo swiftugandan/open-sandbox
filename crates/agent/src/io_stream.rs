@@ -153,6 +153,9 @@ pub async fn drive_io_session<R, S>(
             )
             .await;
         }
+        Some(io_start::Params::DeleteFile(params)) => {
+            drive_delete_file(runtime, stream_id, container_id, params, server_tx).await;
+        }
         None => {
             send_error(
                 &server_tx,
@@ -681,6 +684,66 @@ async fn drive_list_dir<R>(
                 _ => "LIST_DIR_FAILED",
             };
             send_error(&server_tx, &stream_id, code, &e.to_string()).await;
+        }
+    }
+}
+
+/// v1.0.3: drive a single-file or recursive directory delete.
+///
+/// Mirrors `drive_write_file`'s session shape: collect the params,
+/// run the runtime call, emit IoExited on success or IoError on
+/// failure. Missing path resolves to Ok (idempotent under
+/// concurrent external `rm`).
+async fn drive_delete_file<R>(
+    runtime: Arc<R>,
+    stream_id: String,
+    container_id: ContainerId,
+    params: open_sandbox_contracts::proxy::DeleteFileParams,
+    server_tx: mpsc::Sender<IoServerFrame>,
+) where
+    R: ContainerRuntime,
+{
+    let cwd = if params.cwd.is_empty() {
+        None
+    } else {
+        Some(params.cwd.as_str())
+    };
+    info!(
+        stream_id = %stream_id,
+        path = %params.path,
+        cwd = ?cwd,
+        recursive = params.recursive,
+        "io_session.start op=delete_file"
+    );
+    match runtime
+        .delete_file(&container_id, &params.path, cwd, params.recursive)
+        .await
+    {
+        Ok(()) => {
+            let exited = IoServerFrame {
+                stream_id: stream_id.clone(),
+                payload: Some(io_server_frame::Payload::Exited(IoExited {
+                    exit_code: 0,
+                    command_not_found: false,
+                })),
+            };
+            let _ = server_tx.send(exited).await;
+        }
+        Err(e) => {
+            // `rm` on a non-empty directory without -r returns
+            // exit 1 + "Directory not empty" / "is a directory".
+            // Surface as a typed code so the gateway can map to
+            // 409 Conflict (the UI can then offer "delete
+            // recursively").
+            let detail = e.to_string();
+            let code = if detail.contains("is a directory")
+                || detail.contains("Directory not empty")
+            {
+                "DIRECTORY_NOT_EMPTY"
+            } else {
+                "DELETE_FAILED"
+            };
+            send_error(&server_tx, &stream_id, code, &detail).await;
         }
     }
 }
@@ -1233,6 +1296,17 @@ mod tests {
             Err(AgentError::Runtime {
                 detail: "wait_port_listening not yet implemented for docker runtime"
                     .into(),
+            })
+        }
+        async fn delete_file(
+            &self,
+            _id: &ContainerId,
+            _path: &str,
+            _cwd: Option<&str>,
+            _recursive: bool,
+        ) -> Result<(), AgentError> {
+            Err(AgentError::Runtime {
+                detail: "delete_file not yet implemented for docker runtime".into(),
             })
         }
     }

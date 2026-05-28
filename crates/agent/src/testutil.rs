@@ -365,6 +365,44 @@ impl ContainerRuntime for MockContainerRuntime {
             .contains(&port);
         Ok(listening)
     }
+
+    async fn delete_file(
+        &self,
+        _id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+        recursive: bool,
+    ) -> Result<(), AgentError> {
+        let resolved = resolve_path(path, cwd);
+        let mut files = self.files.lock().unwrap();
+        // Match `rm` semantics: leaf delete → remove the entry;
+        // prefix delete (recursive) → strip every entry under
+        // `resolved/`; missing → Ok (idempotent).
+        if files.remove(&resolved).is_some() {
+            return Ok(());
+        }
+        let prefix = format!("{}/", resolved.trim_end_matches('/'));
+        let children: Vec<String> = files
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        if children.is_empty() {
+            // Either truly missing OR an empty dir (the mock
+            // doesn't track empty dirs separately). Idempotent
+            // Ok matches the documented behavior.
+            return Ok(());
+        }
+        if !recursive {
+            return Err(AgentError::Runtime {
+                detail: format!("rm: cannot remove '{resolved}': Directory not empty"),
+            });
+        }
+        for k in children {
+            files.remove(&k);
+        }
+        Ok(())
+    }
 }
 
 fn resolve_path(path: &str, cwd: Option<&str>) -> String {
@@ -563,6 +601,18 @@ impl ContainerRuntime for FailingContainerRuntime {
             detail: "mock runtime failure".into(),
         })
     }
+
+    async fn delete_file(
+        &self,
+        _id: &ContainerId,
+        _path: &str,
+        _cwd: Option<&str>,
+        _recursive: bool,
+    ) -> Result<(), AgentError> {
+        Err(AgentError::Runtime {
+            detail: "mock runtime failure".into(),
+        })
+    }
 }
 
 /// v1.0.2 (iter11): runtime mock whose `create_and_start` sleeps for
@@ -688,6 +738,16 @@ impl ContainerRuntime for SlowContainerRuntime {
         _timeout: Duration,
     ) -> Result<bool, AgentError> {
         Ok(false)
+    }
+
+    async fn delete_file(
+        &self,
+        _id: &ContainerId,
+        _path: &str,
+        _cwd: Option<&str>,
+        _recursive: bool,
+    ) -> Result<(), AgentError> {
+        Ok(())
     }
 }
 

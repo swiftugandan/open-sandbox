@@ -47,6 +47,11 @@ pub enum IoErrorCode {
     // 409 Conflict / 501 Not Implemented respectively.
     RevisionMismatch,
     NotImplemented,
+    // v1.0.3: emitted by the agent on a non-recursive delete of
+    // a non-empty directory. The gateway maps to 409 Conflict
+    // (same shape as RevisionMismatch — "precondition for the
+    // operation isn't met").
+    DirectoryNotEmpty,
     /// Catch-all for codes the contract doesn't know about. Senders
     /// should still avoid emitting unknown codes; receivers tolerate
     /// them so a downstream crate that runs v1.0.1 forward-compat keeps
@@ -70,6 +75,7 @@ impl IoErrorCode {
             Self::StreamIdReused => "STREAM_ID_REUSED",
             Self::RevisionMismatch => "REVISION_MISMATCH",
             Self::NotImplemented => "NOT_IMPLEMENTED",
+            Self::DirectoryNotEmpty => "DIRECTORY_NOT_EMPTY",
             Self::Other(s) => s.as_str(),
         }
     }
@@ -100,6 +106,7 @@ impl From<&str> for IoErrorCode {
             "STREAM_ID_REUSED" => Self::StreamIdReused,
             "REVISION_MISMATCH" => Self::RevisionMismatch,
             "NOT_IMPLEMENTED" => Self::NotImplemented,
+            "DIRECTORY_NOT_EMPTY" => Self::DirectoryNotEmpty,
             other => Self::Other(other.to_string()),
         }
     }

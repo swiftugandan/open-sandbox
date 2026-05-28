@@ -1021,6 +1021,72 @@ done
         parse_portable_list_output(&stdout, &resolved)
     }
 
+    async fn delete_file(
+        &self,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+        recursive: bool,
+    ) -> Result<(), AgentError> {
+        let resolved = resolve_path(path, cwd);
+        // `rm -rf` swallows non-existent paths (idempotent); `rm
+        // -f` for the non-recursive case also swallows missing.
+        // `rm -rf` would happily remove directories even when the
+        // caller passed recursive=false — so we use `rm -f`
+        // (matches the documented "errors on directories without
+        // recursive") and `rm -rf` for recursive.
+        let argv = if recursive {
+            vec![
+                "rm".into(),
+                "-rf".into(),
+                "--".into(),
+                resolved.clone(),
+            ]
+        } else {
+            vec!["rm".into(), "-f".into(), "--".into(), resolved.clone()]
+        };
+        let handle = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: argv,
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        drop(handle.stdin);
+        // Drain both pipes; rm's success is silent, errors land
+        // on stderr (`rm: cannot remove 'foo': Is a directory`).
+        let mut stdout_rx = handle.stdout;
+        let mut stderr_rx = handle.stderr;
+        let stderr_task = async {
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(chunk) = stderr_rx.recv().await {
+                if buf.len() < 4096 {
+                    buf.extend_from_slice(&chunk);
+                }
+            }
+            buf
+        };
+        let stdout_task = async { while stdout_rx.recv().await.is_some() {} };
+        let (_, stderr) = tokio::join!(stdout_task, stderr_task);
+        let info = handle.exited.await.map_err(|_| AgentError::Runtime {
+            detail: "delete_file exec terminated without exit info".into(),
+        })?;
+        if info.exit_code == 0 {
+            return Ok(());
+        }
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        Err(AgentError::Runtime {
+            detail: format!(
+                "rm exit={} stderr={}",
+                info.exit_code,
+                stderr_text.trim()
+            ),
+        })
+    }
+
     async fn wait_port_listening(
         &self,
         id: &ContainerId,

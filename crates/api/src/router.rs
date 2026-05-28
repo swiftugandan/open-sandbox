@@ -162,6 +162,15 @@ pub fn build_router<S: SandboxService>(state: Arc<ApiState<S>>) -> Router {
             "/v1/sandboxes/{id}/files/list",
             get(handlers::list_dir::<S>),
         )
+        // v1.0.3: delete a file or directory.
+        //   DELETE /v1/sandboxes/{id}/files?path=&cwd=&recursive=
+        // Returns 204 No Content on success (idempotent — a
+        // missing path resolves to Ok). `recursive=true`
+        // matches `rm -rf`; default false errors on directories.
+        .route(
+            "/v1/sandboxes/{id}/files",
+            delete(handlers::delete_file::<S>),
+        )
         // v1.0.3: TCP-probe the sandbox's host port until the
         // in-container dev-server is listening or timeout_ms
         // elapses. Gates the UI's preview-iframe refresh on

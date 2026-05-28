@@ -102,6 +102,14 @@ pub enum ApiError {
     #[error("not implemented: {detail}")]
     NotImplemented { detail: String },
 
+    /// v1.0.3: non-recursive delete of a non-empty directory.
+    /// Maps to HTTP 409 Conflict — the UI typically re-prompts
+    /// with a "delete recursively?" affordance. `detail` carries
+    /// the agent's `rm`-style stderr so the operator can see the
+    /// specific path / failure mode in logs.
+    #[error("directory not empty: {detail}")]
+    DirectoryNotEmpty { detail: String },
+
     #[error("internal error: {detail}")]
     Internal { detail: String },
 }
@@ -126,6 +134,7 @@ impl ApiError {
             ApiError::InvalidState { .. } => "INVALID_STATE",
             ApiError::RevisionMismatch { .. } => "REVISION_MISMATCH",
             ApiError::NotImplemented { .. } => "NOT_IMPLEMENTED",
+            ApiError::DirectoryNotEmpty { .. } => "DIRECTORY_NOT_EMPTY",
             ApiError::Internal { .. } => "INTERNAL_ERROR",
         }
     }

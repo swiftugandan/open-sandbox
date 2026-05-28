@@ -302,6 +302,14 @@ fn close_for_api_error(e: &ApiError) -> (u16, String) {
         }
         // 4501 mirrors HTTP 501 Not Implemented for the unary path.
         ApiError::NotImplemented { detail } => (4501, format!("NOT_IMPLEMENTED: {detail}")),
+        // 4409 for the directory-not-empty conflict. Today this
+        // surfaces only on the delete_file path which uses the
+        // unary REST handler, not the WS read endpoint — but the
+        // explicit arm closes the exhaustive-match discipline
+        // for any future WS-borne write/delete op.
+        ApiError::DirectoryNotEmpty { detail } => {
+            (4409, format!("DIRECTORY_NOT_EMPTY: {detail}"))
+        }
         _ => (4500, e.to_string()),
     }
 }

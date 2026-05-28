@@ -150,6 +150,20 @@ pub struct ListDirResultJson {
     pub total_entries: u64,
 }
 
+/// v1.0.3: query shape for `DELETE /v1/sandboxes/{id}/files?path=&cwd=&recursive=`.
+/// Matches `rm` / `rm -r` semantics on the wire — missing path
+/// is Ok (idempotent), `recursive=false` errors on a non-empty
+/// directory.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteFileQuery {
+    pub path: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub recursive: bool,
+}
+
 /// v1.0.3: request body for `POST /v1/sandboxes/{id}/wait_port_listening`.
 /// `port` is the in-container port the caller observed (informational
 /// — the agent resolves to its host-side port via SandboxManager).

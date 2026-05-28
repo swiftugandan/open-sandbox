@@ -299,6 +299,25 @@ export const api = {
       { method: "GET" },
     );
   },
+  /** v1.0.3: delete a file or directory. `recursive=true` matches
+   *  `rm -rf`; the default false errors on a non-empty directory.
+   *  Missing path resolves to 204 (idempotent — concurrent
+   *  external `rm` won't surface as a 404 during a refresh). */
+  deleteFile: (
+    cfg: ApiConfig,
+    id: string,
+    path: string,
+    opts: { recursive?: boolean; cwd?: string } = {},
+  ) => {
+    const params = new URLSearchParams({ path });
+    if (opts.cwd) params.set("cwd", opts.cwd);
+    if (opts.recursive) params.set("recursive", "true");
+    return request<void>(
+      cfg,
+      `/v1/sandboxes/${id}/files?${params}`,
+      { method: "DELETE" },
+    );
+  },
   /** v1.0.3: TCP-probe the sandbox's host port until the in-container
    *  dev-server is listening or `timeoutMs` elapses. Used by the live-
    *  edit save chain to gate the preview-iframe refresh on watchexec-

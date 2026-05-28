@@ -11,15 +11,16 @@ use tokio::sync::mpsc;
 
 use open_sandbox_contracts::error::ApiError;
 use open_sandbox_contracts::proxy::{
-    IoClientFrame, IoStart, ListDirParams, ReadFileParams, WaitPortListeningParams,
-    WriteFileParams, WriteFilesTargzParams, io_client_frame, io_server_frame, io_start,
+    DeleteFileParams, IoClientFrame, IoStart, ListDirParams, ReadFileParams,
+    WaitPortListeningParams, WriteFileParams, WriteFilesTargzParams, io_client_frame,
+    io_server_frame, io_start,
 };
 use open_sandbox_contracts::types::SandboxId;
 
 use crate::service::{
-    CreateRequest, ListDirEntryJson, ListDirQuery, ListDirResultJson, ReadFileQuery,
-    SandboxService, WaitPortListeningRequest, WaitPortListeningResultJson, WriteFileRequest,
-    WriteFilesResult,
+    CreateRequest, DeleteFileQuery, ListDirEntryJson, ListDirQuery, ListDirResultJson,
+    ReadFileQuery, SandboxService, WaitPortListeningRequest, WaitPortListeningResultJson,
+    WriteFileRequest, WriteFilesResult,
 };
 use crate::state::ApiState;
 
@@ -508,6 +509,47 @@ pub async fn list_dir<S: SandboxService>(
     }
 }
 
+pub async fn delete_file<S: SandboxService>(
+    State(state): State<Arc<ApiState<S>>>,
+    Path(id): Path<String>,
+    Query(query): Query<DeleteFileQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = check_rest_auth(&headers, &state) {
+        return r;
+    }
+    let sandbox_id = match parse_sandbox_id(&id) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    if query.path.is_empty() {
+        return invalid_request("path query parameter is required");
+    }
+    if let Err(msg) = validate_sandbox_path(&query.path) {
+        return invalid_request(msg);
+    }
+
+    let result = unary_via_io_stream(
+        &state,
+        &sandbox_id,
+        IoStart {
+            sandbox_id: sandbox_id.to_string(),
+            params: Some(io_start::Params::DeleteFile(DeleteFileParams {
+                path: query.path,
+                cwd: query.cwd.unwrap_or_default(),
+                recursive: query.recursive,
+            })),
+        },
+        None,
+    )
+    .await;
+
+    match result {
+        Ok(_) => (StatusCode::NO_CONTENT, ()).into_response(),
+        Err(e) => api_error_response(e),
+    }
+}
+
 pub async fn wait_port_listening<S: SandboxService>(
     State(state): State<Arc<ApiState<S>>>,
     Path(id): Path<String>,
@@ -884,6 +926,12 @@ fn map_io_error(err: &open_sandbox_contracts::proxy::IoError) -> ApiError {
         IoErrorCode::NotImplemented => ApiError::NotImplemented {
             detail: err.detail.clone(),
         },
+        // v1.0.3: non-recursive delete of a populated directory.
+        // Maps to 409 Conflict; UI re-prompts with "delete
+        // recursively?".
+        IoErrorCode::DirectoryNotEmpty => ApiError::DirectoryNotEmpty {
+            detail: err.detail.clone(),
+        },
         other => ApiError::IoStreamFailed {
             detail: format!("{other}: {}", err.detail),
         },
@@ -941,6 +989,10 @@ fn api_error_response(err: ApiError) -> Response {
         // can't fulfill yet. 501 (not 500) so SDKs can feature-
         // detect and fall back without retrying.
         ApiError::NotImplemented { .. } => (StatusCode::NOT_IMPLEMENTED, err.to_string()),
+        // v1.0.3: non-recursive delete on a populated dir. 409
+        // matches RevisionMismatch's "precondition not met"
+        // shape so SDKs can handle them under one branch.
+        ApiError::DirectoryNotEmpty { .. } => (StatusCode::CONFLICT, err.to_string()),
         ApiError::Internal { .. } => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };

@@ -224,6 +224,21 @@ pub trait ContainerRuntime: Send + Sync {
         cwd: Option<&str>,
     ) -> impl Future<Output = Result<FileRevision, AgentError>> + Send;
 
+    /// v1.0.3: delete a file or directory inside the container.
+    /// Matches `rm` / `rm -r` semantics:
+    /// - `recursive=false`: error on a non-empty directory.
+    /// - `recursive=true`: remove everything under `path`.
+    /// - missing path: Ok(()) (idempotent — the UI's delete +
+    ///   refresh sequence stays correct under concurrent
+    ///   external `rm`).
+    fn delete_file(
+        &self,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+        recursive: bool,
+    ) -> impl Future<Output = Result<(), AgentError>> + Send;
+
     /// v1.0.3: poll TCP-listening status from inside the
     /// container's network namespace.
     ///
