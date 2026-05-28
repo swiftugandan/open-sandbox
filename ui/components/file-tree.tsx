@@ -85,16 +85,34 @@ function sortEntries(es: ListDirEntry[]): ListDirEntry[] {
 export function FileTree({
   config,
   sandboxId,
-  rootPath = DEFAULT_TREE_ROOT,
+  rootPath: rawRootPath = DEFAULT_TREE_ROOT,
   onSelect,
   selectedPath,
 }: Props) {
+  // Defensive: callers occasionally pass paths with trailing slashes
+  // (copy-pasted from a UI breadcrumb, etc). Normalize once at the
+  // boundary so the rest of the component doesn't have to special-
+  // case `"/workspace/" === "/workspace"` and the `abs` composition
+  // can't produce `//src` double-slashes.
+  const rootPath = useMemo(
+    () =>
+      rawRootPath.length > 1 && rawRootPath.endsWith("/")
+        ? rawRootPath.replace(/\/+$/, "")
+        : rawRootPath,
+    [rawRootPath],
+  );
   const [state, setState] = useState<ExpandState>(emptyExpandState);
   const [showHidden, setShowHidden] = useState(false);
   // The root path is always conceptually "expanded" so the user sees
   // its children on first paint. We don't add it to `expanded` (which
   // tracks user-toggled state); we just always render its children.
   const [refreshNonce, setRefreshNonce] = useState(0);
+  // Generation token incremented on every (sandboxId, rootPath,
+  // refreshNonce) change. Any in-flight listDir captures the
+  // generation in scope at the time it was dispatched and only writes
+  // its result back when the generation is still current. Closes the
+  // sandbox-switch race the v5 code-review pass flagged.
+  const generationRef = useRef(0);
 
   /** Stable mutator that overlays a partial DirState. */
   const updateDir = useCallback(
@@ -121,12 +139,21 @@ export function FileTree({
     [],
   );
 
-  /** Issue a listDir for `path` and merge the result. */
+  /** Issue a listDir for `path` and merge the result.
+   *
+   *  Captures the current `generationRef` value at dispatch time.
+   *  When the response arrives the result is only committed to
+   *  state if the generation is still current — otherwise it
+   *  belongs to a sandbox we've already switched away from (or a
+   *  root the user has navigated past) and writing it would
+   *  paint stale tree contents over the live view. */
   const fetchDir = useCallback(
     async (path: string) => {
+      const myGeneration = generationRef.current;
       updateDir(path, { loading: true, error: undefined });
       try {
         const res = await api.listDir(config, sandboxId, path);
+        if (generationRef.current !== myGeneration) return;
         updateDir(path, {
           loaded: true,
           loading: false,
@@ -136,6 +163,7 @@ export function FileTree({
           error: undefined,
         });
       } catch (e) {
+        if (generationRef.current !== myGeneration) return;
         const detail =
           e instanceof ApiError ? `${e.errorCode ?? e.status}: ${e.message}` : String(e);
         updateDir(path, { loading: false, error: detail });
@@ -144,8 +172,11 @@ export function FileTree({
     [config, sandboxId, updateDir],
   );
 
-  // Root always loads on mount + when sandbox/root changes.
+  // Root always loads on mount + when sandbox/root changes. Bumping
+  // the generation here causes any in-flight fetchDir from the
+  // previous identity to drop its result on arrival.
   useEffect(() => {
+    generationRef.current += 1;
     setState(emptyExpandState());
     fetchDir(rootPath);
   }, [rootPath, sandboxId, refreshNonce, fetchDir]);
@@ -154,16 +185,32 @@ export function FileTree({
   // visibility. Bound at the document level so the focus target
   // doesn't matter; the editor swallows other shortcuts but this
   // global toggle survives.
+  //
+  // Skip when the user is typing in an input / textarea /
+  // contenteditable surface — they almost certainly meant the chord
+  // for whatever editor they're in (CodeMirror, a search box, etc).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (
-        (e.metaKey || e.ctrlKey) &&
-        e.shiftKey &&
-        e.key.toLowerCase() === "h"
+        !(e.metaKey || e.ctrlKey) ||
+        !e.shiftKey ||
+        e.key.toLowerCase() !== "h"
       ) {
-        e.preventDefault();
-        setShowHidden((v) => !v);
+        return;
       }
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          target.isContentEditable
+        ) {
+          return;
+        }
+      }
+      e.preventDefault();
+      setShowHidden((v) => !v);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -285,8 +332,17 @@ function DirChildren(props: DirChildrenProps) {
   if (dir.loading && !dir.loaded) {
     return <div className="px-2 text-fg-muted">loading…</div>;
   }
+  // Hidden-dir filter also matches symlinks — pnpm and yarn
+  // workspaces routinely symlink `node_modules`, and a bare
+  // `e.type === 'dir'` check would let those slip through and
+  // defeat the whole default-hidden affordance.
   const visible = dir.entries.filter((e) =>
-    showHidden ? true : !(e.type === "dir" && isHiddenByDefault(e.name)),
+    showHidden
+      ? true
+      : !(
+          (e.type === "dir" || e.type === "symlink") &&
+          isHiddenByDefault(e.name)
+        ),
   );
   if (visible.length === 0 && dir.totalEntries === 0) {
     return <div className="px-2 text-fg-muted italic">(empty)</div>;
