@@ -969,26 +969,44 @@ impl ContainerRuntime for DockerRuntime {
         cwd: Option<&str>,
     ) -> Result<DirListing, AgentError> {
         let resolved = resolve_path(path, cwd);
-        // POSIX-portable + busybox-friendly listing format:
-        //   ls -lAn --time-style=+%s -q -- <path>
-        // Yields one line per entry:
-        //   <mode> <links> <uid> <gid> <size> <mtime> <name>[ -> <target>]
-        // -n keeps uid/gid numeric (avoids locale dependence).
-        // -A lists dotfiles except . and ..
-        // --time-style=+%s pins mtime to integer epoch seconds.
-        // -q replaces non-printable name bytes with ?, which is
-        // lossy but the only way to keep the parse single-line.
-        // Names with literal newlines are extremely rare in
-        // workspaces; if it ever matters we'll switch to find -print0.
+        // Portable across GNU coreutils AND busybox (Alpine,
+        // scratch-derived images). The previous shape used
+        // `ls -lAn --time-style=+%s` which busybox `ls` rejects
+        // with "unrecognized option: time-style" — see
+        // FOLLOWUPS_v1.0.3.md #16. The shell loop below
+        // sidesteps it by walking children directly + stat'ing
+        // each. Output per line:
+        //   OSB:<name>|<File type>|<size>|<mtime>|<mode>|<target>
+        // The `OSB:` prefix lets us skip stderr-races on stdout
+        // (we redirect stderr to /dev/null inside the loop but
+        // belt-and-suspenders). `|` separator: filenames
+        // containing `|` will have their target column
+        // corrupted; an acceptable tradeoff for source-tree
+        // workflows. Filenames with newlines will appear as two
+        // entries; also rare enough to leave.
+        //
+        // `for f in * .[!.]* ..?*` is the POSIX-portable
+        // dotfile-inclusive glob (excludes . and ..). When a
+        // glob has no matches it expands to the literal pattern
+        // — the `[ -e ] || [ -L ]` guard rejects those.
+        const LIST_DIR_SCRIPT: &str = r#"
+cd "$1" 2>/dev/null || exit 0
+for f in * .[!.]* ..?*; do
+  [ -e "$f" ] || [ -L "$f" ] || continue
+  t=""
+  if [ -L "$f" ]; then t="$(readlink "$f" 2>/dev/null || true)"; fi
+  m="$(stat -c '%F|%s|%Y|%a' "$f" 2>/dev/null || true)"
+  printf 'OSB:%s|%s|%s\n' "$f" "$m" "$t"
+done
+"#;
         let stdout = exec_collect_stdout(
             self,
             id,
             vec![
-                "ls".into(),
-                "-lAn".into(),
-                "--time-style=+%s".into(),
-                "-q".into(),
-                "--".into(),
+                "sh".into(),
+                "-c".into(),
+                LIST_DIR_SCRIPT.into(),
+                "os-list-dir".into(),
                 resolved.clone(),
             ],
         )
@@ -1000,7 +1018,7 @@ impl ContainerRuntime for DockerRuntime {
             ListExecError::Other(detail) => AgentError::Runtime { detail },
         })?;
 
-        parse_ls_lan_output(&stdout, &resolved)
+        parse_portable_list_output(&stdout, &resolved)
     }
 
     async fn stat_revision(
@@ -1248,15 +1266,97 @@ async fn exec_collect_stdout(
     }
 }
 
-/// Parse the output of `ls -lAn --time-style=+%s -q -- <path>` into
-/// a `DirListing`. Hard-caps at `LIST_DIR_MAX_ENTRIES` and sets
-/// `truncated=true` / `total_entries=N` per the v1.0.3 contract.
+/// Parse the output of the portable shell-loop list_dir script.
 ///
-/// Format (POSIX + busybox compatible):
+/// Each entry line has the shape:
+///   `OSB:<name>|<File-type>|<size>|<mtime>|<mode>|<target>`
 ///
-///   `<mode> <links> <uid> <gid> <size> <mtime_secs> <name>[ -> <target>]`
-///
-/// The leading "total <blocks>" line (when present) is skipped.
+/// The `OSB:` prefix lets us discard stderr-races on stdout. The
+/// `<File-type>` column is the `stat -c '%F'` description — one of
+/// "regular file" / "regular empty file" / "directory" / "symbolic
+/// link" / "character special file" / "block special file" /
+/// "fifo" / "socket". We collapse the long tail to `EntryType::Other`.
+/// `<mode>` is `stat -c '%a'` which both GNU and busybox emit as
+/// 3- or 4-digit octal; we left-pad to 4 chars so the wire shape
+/// matches the youki impl's `{:04o}`.
+fn parse_portable_list_output(stdout: &[u8], dir_path: &str) -> Result<DirListing, AgentError> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut entries: Vec<DirEntry> = Vec::new();
+    let mut total_entries: u64 = 0;
+
+    for raw_line in text.lines() {
+        let line = match raw_line.strip_prefix("OSB:") {
+            Some(s) => s,
+            // Non-entry stdout (warning, banner, stray noise) —
+            // skip rather than fail the listing.
+            None => continue,
+        };
+        // splitn(6, '|'): name | type | size | mtime | mode | target.
+        // Filenames containing '|' will see only the first column
+        // captured cleanly — the documented tradeoff.
+        let mut cols = line.splitn(6, '|');
+        let name = match cols.next() {
+            Some(n) if !n.is_empty() => n,
+            _ => continue,
+        };
+        let file_type_str = cols.next().unwrap_or("");
+        let size_str = cols.next().unwrap_or("0");
+        let mtime_str = cols.next().unwrap_or("0");
+        let mode_str = cols.next().unwrap_or("");
+        let target = cols.next().unwrap_or("");
+
+        let entry_type = match file_type_str {
+            "regular file" | "regular empty file" => EntryType::File,
+            "directory" => EntryType::Dir,
+            "symbolic link" => EntryType::Symlink,
+            _ => EntryType::Other,
+        };
+        let size: u64 = size_str.parse().unwrap_or(0);
+        let mtime: u64 = mtime_str.parse().unwrap_or(0);
+        // stat -c '%a' produces 3 or 4 octal digits depending on
+        // whether high-nibble (setuid/setgid/sticky) bits are set.
+        // Normalize to 4 chars so cross-runtime mode strings match
+        // youki's `format!("{:04o}", perms & 0o7777)`.
+        let mode = if mode_str.is_empty() {
+            String::new()
+        } else if mode_str.len() < 4 {
+            format!("{mode_str:0>4}")
+        } else {
+            mode_str.to_string()
+        };
+
+        total_entries += 1;
+        if entries.len() < LIST_DIR_MAX_ENTRIES {
+            entries.push(DirEntry {
+                name: name.to_string(),
+                entry_type,
+                size,
+                revision: format!("{mtime}:{size}"),
+                mode,
+                target: if entry_type == EntryType::Symlink {
+                    target.to_string()
+                } else {
+                    String::new()
+                },
+            });
+        }
+    }
+
+    let truncated = total_entries as usize > entries.len();
+    Ok(DirListing {
+        path: dir_path.to_string(),
+        entries,
+        truncated,
+        total_entries,
+    })
+}
+
+/// Legacy `ls -lAn --time-style=+%s -q -- <path>` parser. Kept for
+/// the parser_tests module + a possible future GNU-only fast path
+/// (the shell-loop above is ~2× slower than a single ls call on
+/// large directories). Today nothing calls it; flagged `#[allow]`
+/// so cargo doesn't warn.
+#[allow(dead_code)]
 fn parse_ls_lan_output(stdout: &[u8], dir_path: &str) -> Result<DirListing, AgentError> {
     let text = String::from_utf8_lossy(stdout);
     let mut all_entries: Vec<DirEntry> = Vec::new();
@@ -1293,6 +1393,7 @@ fn parse_ls_lan_output(stdout: &[u8], dir_path: &str) -> Result<DirListing, Agen
 }
 
 /// Parse a single `ls -lAn` line. Returns None on malformed input.
+#[allow(dead_code)]
 fn parse_ls_entry_line(line: &str) -> Option<DirEntry> {
     // Real-world `ls -lAn` output right-justifies numeric columns
     // (links, uid, gid, size) — runs of spaces appear between them
@@ -1379,7 +1480,10 @@ fn parse_ls_entry_line(line: &str) -> Option<DirEntry> {
 /// "-rwsr-xr-t" to a 4-character octal mode string. The first
 /// digit captures setuid (4), setgid (2), and sticky (1) bits; the
 /// trailing three digits are the per-class rwx triplets. Returns
-/// None on malformed input.
+/// None on malformed input. Used by the legacy ls-based parser
+/// kept for parser_tests; the live path uses `stat -c '%a'` which
+/// emits the octal directly.
+#[allow(dead_code)]
 fn mode_string_to_octal(mode_str: &str) -> Option<String> {
     if mode_str.len() < 10 {
         return None;
@@ -1407,6 +1511,7 @@ fn mode_string_to_octal(mode_str: &str) -> Option<String> {
     Some(format!("{high}{owner}{group}{other}"))
 }
 
+#[allow(dead_code)]
 fn mode_triplet(bytes: &[u8]) -> Option<u8> {
     if bytes.len() < 3 {
         return None;
@@ -1840,6 +1945,76 @@ mod parser_tests {
             let e = parse_ls_entry_line(&line).expect("parses");
             assert_eq!(e.entry_type, EntryType::Other, "for prefix {prefix:?}");
         }
+    }
+
+    #[test]
+    fn parse_portable_list_output_basic() {
+        let stdout = b"\
+OSB:README.md|regular file|421|1716800200|644|
+OSB:src|directory|0|1716800123|755|
+OSB:logs|symbolic link|16|1716800100|777|/var/log
+OSB:empty.txt|regular empty file|0|1716800000|644|
+OSB:socket|socket|0|1716800000|755|
+";
+        let l = parse_portable_list_output(stdout, "/workspace").unwrap();
+        assert_eq!(l.entries.len(), 5);
+        assert_eq!(l.total_entries, 5);
+        assert!(!l.truncated);
+        assert_eq!(l.entries[0].name, "README.md");
+        assert_eq!(l.entries[0].entry_type, EntryType::File);
+        assert_eq!(l.entries[0].size, 421);
+        assert_eq!(l.entries[0].revision, "1716800200:421");
+        assert_eq!(l.entries[0].mode, "0644");
+        assert_eq!(l.entries[0].target, "");
+
+        assert_eq!(l.entries[1].entry_type, EntryType::Dir);
+        assert_eq!(l.entries[1].mode, "0755");
+
+        assert_eq!(l.entries[2].entry_type, EntryType::Symlink);
+        assert_eq!(l.entries[2].target, "/var/log");
+
+        // "regular empty file" is a stat -c '%F' synonym for an
+        // empty regular file — must still classify as File.
+        assert_eq!(l.entries[3].entry_type, EntryType::File);
+
+        // FIFO / socket / device → Other.
+        assert_eq!(l.entries[4].entry_type, EntryType::Other);
+    }
+
+    #[test]
+    fn parse_portable_list_output_handles_4_digit_mode() {
+        // stat -c '%a' on a setuid binary emits "4755" (no extra
+        // padding needed). Verify we don't pre-pad those.
+        let stdout = b"OSB:passwd|regular file|54080|1716800200|4755|\n";
+        let l = parse_portable_list_output(stdout, "/usr/bin").unwrap();
+        assert_eq!(l.entries[0].mode, "4755");
+    }
+
+    #[test]
+    fn parse_portable_list_output_skips_non_osb_prefix_lines() {
+        // Stderr races / banners get filtered.
+        let stdout = b"\
+sh: line 2: cd: /missing: No such file or directory
+OSB:file.txt|regular file|10|1716800000|644|
+";
+        let l = parse_portable_list_output(stdout, "/workspace").unwrap();
+        assert_eq!(l.entries.len(), 1);
+        assert_eq!(l.entries[0].name, "file.txt");
+    }
+
+    #[test]
+    fn parse_portable_list_output_caps_at_5000_entries() {
+        let mut output = String::new();
+        let overflow = LIST_DIR_MAX_ENTRIES + 5;
+        for i in 0..overflow {
+            output.push_str(&format!(
+                "OSB:f{i:05}.txt|regular file|7|1716800200|644|\n"
+            ));
+        }
+        let l = parse_portable_list_output(output.as_bytes(), "/big").unwrap();
+        assert_eq!(l.entries.len(), LIST_DIR_MAX_ENTRIES);
+        assert_eq!(l.total_entries as usize, overflow);
+        assert!(l.truncated);
     }
 
     #[test]
