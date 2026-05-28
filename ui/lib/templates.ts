@@ -3,8 +3,20 @@
 // URL serve something useful — so "Create → Run → click URL" works on
 // first try instead of dead-ending at an idle container.
 //
+// **/workspace convention.** Every template seeds files into
+// `/workspace` and serves from there. That folder is the Edit tab's
+// default tree root (see `DEFAULT_TREE_ROOT` in
+// `ui/components/file-tree.tsx`), so the source the user is editing
+// is also the source the public URL is serving. None of these base
+// images ship `/workspace`, so each command starts with
+// `mkdir -p /workspace`.
+//
 // The `execCommand` is the literal string the exec terminal would
 // expect (shell-style; parsed by `parseCommand` in ui/lib/api.ts).
+// `parseCommand` only understands quote pairs (no backslash escapes),
+// so multi-line / embedded-quote payloads are written via `printf`
+// with shell-escaped `\"` rather than heredocs.
+//
 // `exposedPort` documents what the in-container process listens on;
 // the API today only honors a non-zero value here for routing, so
 // templates whose port differs from the platform default (8080)
@@ -27,44 +39,56 @@ export const TEMPLATES: readonly Template[] = [
     id: "static-site",
     label: "Static site",
     image: "python:3.12-alpine",
+    // Seed /workspace/index.html, then serve /workspace on :8080.
+    // python -m http.server uses cwd as the doc root.
     execCommand:
-      'sh -c "cd /tmp && echo \'<h1>hello from open-sandbox</h1>\' > index.html && python3 -m http.server 8080"',
+      'sh -c "mkdir -p /workspace && cd /workspace && echo \'<h1>hello from open-sandbox — edit /workspace/index.html</h1>\' > index.html && python3 -m http.server 8080"',
     exposedPort: 8080,
-    description: "python http.server on :8080 — visit the URL, see hello.",
+    description:
+      "python http.server serving /workspace on :8080. Edit /workspace/index.html.",
   },
   {
     id: "node",
     label: "Node",
     image: "node:20-alpine",
+    // Outer single quotes so parseCommand passes the inner `"…"`
+    // payload to sh as one token. printf writes a two-line server.js
+    // into /workspace via `\"` shell-escapes (parseCommand sees them
+    // as literal text since they live inside single quotes; sh then
+    // interprets them).
     execCommand:
-      "node -e \"require('http').createServer((q,r)=>r.end('hi from node')).listen(8080)\"",
+      `sh -c 'mkdir -p /workspace && cd /workspace && printf "%s\\n" "const http = require(\\"http\\");" "http.createServer((q, r) => r.end(\\"hi from node — edit /workspace/server.js\\")).listen(8080);" > server.js && node server.js'`,
     exposedPort: 8080,
-    description: "One-line Node HTTP server on :8080.",
+    description:
+      "Node HTTP server reading /workspace/server.js on :8080. Edit and re-run.",
   },
   {
     id: "nginx",
     label: "Nginx",
     image: "nginx:alpine",
-    // nginx:alpine listens on :80 by default; rewrite to :8080 so the
-    // proxy's default exposed-port wiring picks it up without the
-    // create form having to configure exposed_port=80.
+    // nginx:alpine listens on :80 and serves /usr/share/nginx/html
+    // by default. Two sed rewrites make it listen on :8080 (so the
+    // proxy's default port wiring catches it) and serve /workspace
+    // (so the Edit tab and the public URL stay aligned).
     execCommand:
-      "sh -c \"sed -i 's/listen       80;/listen       8080;/' /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'\"",
+      "sh -c \"mkdir -p /workspace && echo '<h1>hello from nginx — edit /workspace/index.html</h1>' > /workspace/index.html && sed -i 's|listen       80;|listen       8080;|; s|/usr/share/nginx/html|/workspace|' /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'\"",
     exposedPort: 8080,
-    description: "Stock nginx welcome page on :8080.",
+    description:
+      "nginx serving /workspace on :8080. Edit /workspace/index.html.",
   },
   {
     id: "python-flask",
     label: "Flask",
     image: "python:3.12-alpine",
-    // Outer single quotes so the dev-console's parseCommand (which has
-    // no backslash-escape support) doesn't have to unwind nested
-    // quotes. Inside, the python script uses double quotes and the
-    // shell's own `\"` escape — sh interprets that, not us.
+    // Same `printf "..." "..."` shape as the node template: outer
+    // single quotes for parseCommand, inner `\"` escapes consumed by
+    // sh. Writes /workspace/app.py, then pip-installs Flask and runs
+    // the script.
     execCommand:
-      `sh -c 'pip install --quiet flask && python3 -c "from flask import Flask; a=Flask(__name__); a.route(\\"/\\")(lambda: \\"hi from flask\\"); a.run(host=\\"0.0.0.0\\", port=8080)"'`,
+      `sh -c 'mkdir -p /workspace && cd /workspace && printf "%s\\n" "from flask import Flask" "a = Flask(__name__)" "@a.route(\\"/\\")" "def hi(): return \\"hi from flask — edit /workspace/app.py\\"" "a.run(host=\\"0.0.0.0\\", port=8080)" > app.py && pip install --quiet flask && python3 app.py'`,
     exposedPort: 8080,
-    description: "pip install flask, serve one route on :8080.",
+    description:
+      "Flask app reading /workspace/app.py on :8080. Edit and re-run.",
   },
   {
     id: "shell",
