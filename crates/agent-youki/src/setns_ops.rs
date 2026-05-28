@@ -506,7 +506,18 @@ pub async fn wait_port_listening_in_ns(
                         return;
                     }
                 };
-                let attempt_timeout = (timeout - started.elapsed()).min(interval);
+                // `Duration - Duration` panics on underflow. The
+                // guard at the top of the loop checks `elapsed >=
+                // timeout` but there's a small window between
+                // that check and this subtraction where
+                // `elapsed` can advance past `timeout` under
+                // scheduler pressure or very small timeouts.
+                // Use `checked_sub` and treat zero as the
+                // deadline-elapsed sentinel.
+                let attempt_timeout = match timeout.checked_sub(started.elapsed()) {
+                    Some(d) if !d.is_zero() => d.min(interval),
+                    _ => break,
+                };
                 if std::net::TcpStream::connect_timeout(&socket_addr, attempt_timeout).is_ok() {
                     ready = true;
                     break;

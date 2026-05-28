@@ -1061,24 +1061,42 @@ done
             .await?;
         let mut handle = handle;
         drop(handle.stdin);
-        // Drain stdout and check for the OSB:READY sentinel rather
-        // than relying solely on exit code — if the container's
-        // image lacks nc the exec fails with 127 and we want to
-        // surface a typed error so the caller can fall back.
-        let mut stdout: Vec<u8> = Vec::new();
-        while let Some(chunk) = handle.stdout.recv().await {
-            stdout.extend_from_slice(&chunk);
-            if stdout.len() > 1024 {
-                break;
+        // Drain stdout AND stderr concurrently. Serial drain
+        // (stdout-then-stderr) risks a child stall: if the
+        // script's `sh` emits to stderr (e.g., `sleep: not found`
+        // on a stripped image) while stdout is idle, the stderr
+        // pipe can fill and block the child — at which point it
+        // never gets to write the OSB:READY/TIMEOUT sentinel.
+        // Caps stay (cheap defense in depth; the sentinels are
+        // ~10 bytes), but they're per-stream so an oversize
+        // stderr from one stream can't preempt the other.
+        let mut stdout_rx = handle.stdout;
+        let mut stderr_rx = handle.stderr;
+        let stdout_task = async {
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(chunk) = stdout_rx.recv().await {
+                if buf.len().saturating_add(chunk.len()) > 4096 {
+                    // Don't break — keep draining so the child
+                    // doesn't stall on a full pipe. Just stop
+                    // remembering bytes past the cap; sentinel
+                    // landed earlier than this anyway.
+                    continue;
+                }
+                buf.extend_from_slice(&chunk);
             }
-        }
-        let mut stderr: Vec<u8> = Vec::new();
-        while let Some(chunk) = handle.stderr.recv().await {
-            stderr.extend_from_slice(&chunk);
-            if stderr.len() > 4096 {
-                break;
+            buf
+        };
+        let stderr_task = async {
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(chunk) = stderr_rx.recv().await {
+                if buf.len().saturating_add(chunk.len()) > 4096 {
+                    continue;
+                }
+                buf.extend_from_slice(&chunk);
             }
-        }
+            buf
+        };
+        let (stdout, stderr) = tokio::join!(stdout_task, stderr_task);
         let info = handle.exited.await.map_err(|_| AgentError::Runtime {
             detail: "wait_port_listening probe terminated without exit info".into(),
         })?;
@@ -1090,11 +1108,24 @@ done
             return Ok(false);
         }
         // Exec failed before the script could print either
-        // sentinel — most likely `nc` is missing from the image,
-        // or the exit code was non-zero before any sentinel
-        // landed.
+        // sentinel. `command_not_found` is the typed signal from
+        // start_exec when the EXEC itself couldn't be spawned
+        // (image lacks `sh`); a substring search for `not found`
+        // on stderr is too broad — any `sh: foo: not found` from
+        // an unrelated command in the script would mis-route the
+        // error. Prefer the typed signal; surface the raw exit
+        // code + stderr otherwise so the operator has the actual
+        // failure mode in the message.
         let stderr_text = String::from_utf8_lossy(&stderr);
-        if info.command_not_found || stderr_text.contains("not found") {
+        if info.command_not_found {
+            return Err(AgentError::Runtime {
+                detail: "wait_port_listening requires `sh` and `nc` in the container image".into(),
+            });
+        }
+        // Heuristic: if stderr explicitly mentions `nc`, the
+        // image has sh+sleep but lacks nc — common on scratch /
+        // distroless images that nonetheless have busybox sh.
+        if stderr_text.contains("nc:") || stderr_text.contains("nc not found") {
             return Err(AgentError::Runtime {
                 detail: "wait_port_listening requires `nc` in the container image".into(),
             });
