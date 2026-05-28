@@ -24,10 +24,11 @@ import {
 import { Save, X, Circle, Loader2 } from "lucide-react";
 import type { Extension } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
+import CodeMirror from "@uiw/react-codemirror";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
-import { languageIdFor, loadLanguage, type LanguageId } from "@/lib/lang";
+import { languageIdFor, loadLanguage } from "@/lib/lang";
 
 /** One open file. Identified by its absolute path inside the
  *  sandbox; the path also keys the IndexedDB unsaved buffer the
@@ -73,29 +74,59 @@ interface Props {
 }
 
 export function Editor(props: Props) {
-  const { tabs, activePath, onSelectTab } = props;
+  const { tabs, activePath, onSelectTab, onSave, status } = props;
   const activeTab = useMemo(
     () => tabs.find((t) => t.path === activePath) ?? null,
     [tabs, activePath],
   );
+
+  // Cmd/Ctrl-S: bound at the document level so the keystroke saves
+  // the active tab regardless of whether focus is inside the
+  // CodeMirror view, on a tab button, or on the file tree. CM6's
+  // own keymap binding only fires when the editor itself has
+  // focus — without this handler the browser intercepts the
+  // chord and pops the "Save Page As…" dialog.
+  //
+  // Skip when the user is typing in a plain HTML INPUT / TEXTAREA
+  // (the legacy FilesPanel, search boxes, etc); their containing
+  // app may want the chord. CodeMirror's editor surface IS
+  // contenteditable but we deliberately DO NOT skip there — the
+  // intent is to save the file even from inside the editor.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return;
+      if (e.key.toLowerCase() !== "s") return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA") return;
+      }
+      if (!activePath) return;
+      e.preventDefault();
+      void onSave(activePath);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [activePath, onSave]);
 
   return (
     <div className="flex flex-col h-full bg-bg text-fg">
       <TabStrip
         tabs={tabs}
         activePath={activePath}
-        status={props.status}
+        status={status}
         onSelectTab={onSelectTab}
         onCloseTab={props.onCloseTab}
-        onSave={props.onSave}
+        onSave={onSave}
       />
       {activeTab ? (
         <EditorPane
           key={activeTab.path}
           tab={activeTab}
           onChange={props.onChange}
-          onSave={props.onSave}
+          onSave={onSave}
           blurAutosaveMs={props.blurAutosaveMs ?? 5_000}
+          status={status}
         />
       ) : (
         <div className="flex-1 flex items-center justify-center text-fg-muted text-sm">
@@ -217,21 +248,23 @@ function StatusBar({
 }
 
 function StatusMessage({ status }: { status: SaveStatus }) {
-  const [tick, setTick] = useState(0);
-  // Re-render every second while a "saved" message is showing so
-  // the fade-out is purely declarative — the message disappears
-  // once we're past the 1500ms window.
+  // Re-renders the StatusMessage once at the end of the
+  // saved-flash window so the message fades out without an
+  // interval running forever. Bumping `expired` to true is a
+  // single setTimeout — no polling, no leak.
+  const [expired, setExpired] = useState(false);
   useEffect(() => {
+    setExpired(false);
     if (status.kind !== "saved") return;
-    const t = window.setInterval(() => setTick((n) => n + 1), 250);
-    return () => window.clearInterval(t);
-  }, [status.kind]);
+    const remaining = Math.max(0, 1500 - (Date.now() - status.at));
+    const t = window.setTimeout(() => setExpired(true), remaining);
+    return () => window.clearTimeout(t);
+  }, [status]);
   if (status.kind === "saving") {
     return <span>Saving {basename(status.path)}…</span>;
   }
   if (status.kind === "saved") {
-    const age = Date.now() - status.at;
-    if (age > 1500) return null;
+    if (expired) return null;
     return (
       <span className="text-ok" aria-live="polite">
         Saved
@@ -245,9 +278,6 @@ function StatusMessage({ status }: { status: SaveStatus }) {
       </span>
     );
   }
-  // Touch `tick` so the linter doesn't complain about it being
-  // unused; the re-render side-effect IS the point.
-  void tick;
   return null;
 }
 
@@ -268,11 +298,13 @@ function EditorPane({
   onChange,
   onSave,
   blurAutosaveMs,
+  status,
 }: {
   tab: OpenTab;
   onChange: (path: string, content: string) => void;
   onSave: (path: string) => void | Promise<void>;
   blurAutosaveMs: number;
+  status: SaveStatus;
 }) {
   const langId = useMemo(() => languageIdFor(tab.path), [tab.path]);
   const [langExt, setLangExt] = useState<Extension[]>([]);
@@ -283,6 +315,17 @@ function EditorPane({
   useEffect(() => {
     dirtyRef.current = tab.dirty;
   }, [tab.dirty]);
+
+  // Track whether a save is currently in flight for THIS tab.
+  // Without this guard, a pending blur-autosave timer can fire a
+  // second `onSave(path)` while the first call is still pending —
+  // racing two concurrent writeFile against the agent with the
+  // same revision token. See the v6 code-review pass for the
+  // detailed scenario.
+  const inFlightRef = useRef(false);
+  useEffect(() => {
+    inFlightRef.current = status.kind === "saving" && status.path === tab.path;
+  }, [status, tab.path]);
 
   // Lazy-load the language extension. Restarts on path/langId
   // change (the parent's <EditorPane key={path}> remount also
@@ -297,7 +340,12 @@ function EditorPane({
       (ext) => {
         if (!cancelled) setLangExt(ext);
       },
-      () => {
+      (err) => {
+        // Surface the chunk-load failure to devtools so a CDN /
+        // network issue is debuggable. The editor continues to
+        // work as a plain-text editor; not worth a user-visible
+        // banner.
+        console.error(`failed to load CodeMirror language ${langId}:`, err);
         if (!cancelled) setLangExt([]);
       },
     );
@@ -334,7 +382,12 @@ function EditorPane({
             window.clearTimeout(blurTimerRef.current);
           }
           blurTimerRef.current = window.setTimeout(() => {
-            if (dirtyRef.current) {
+            // Skip when a manual save is already in flight for
+            // this tab — the user's Cmd-S is already running and
+            // firing a second concurrent writeFile would race two
+            // optimistic-concurrency preconditions against the
+            // same revision token.
+            if (dirtyRef.current && !inFlightRef.current) {
               void onSave(tab.path);
             }
           }, blurAutosaveMs);
@@ -360,16 +413,6 @@ function EditorPane({
     [langExt, saveKeymap, blurExtension],
   );
 
-  // Lazy-import `@uiw/react-codemirror` so the editor chunk isn't
-  // in the initial bundle when no file is open.
-  const CodeMirror = useLazyCodeMirror();
-  if (!CodeMirror) {
-    return (
-      <div className="flex-1 flex items-center justify-center text-fg-muted text-sm">
-        Loading editor…
-      </div>
-    );
-  }
   return (
     <div className="flex-1 overflow-hidden">
       <CodeMirror
@@ -381,31 +424,4 @@ function EditorPane({
       />
     </div>
   );
-}
-
-// ─── Lazy import helper ────────────────────────────────────────
-
-import type { ReactCodeMirrorRef, ReactCodeMirrorProps } from "@uiw/react-codemirror";
-
-type CM6Component = React.ForwardRefExoticComponent<
-  ReactCodeMirrorProps & React.RefAttributes<ReactCodeMirrorRef>
->;
-
-let cachedCodeMirror: CM6Component | null = null;
-
-function useLazyCodeMirror(): CM6Component | null {
-  const [mod, setMod] = useState<CM6Component | null>(cachedCodeMirror);
-  useEffect(() => {
-    if (cachedCodeMirror) return;
-    let cancelled = false;
-    import("@uiw/react-codemirror").then((m) => {
-      if (cancelled) return;
-      cachedCodeMirror = m.default;
-      setMod(m.default);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  return mod;
 }
