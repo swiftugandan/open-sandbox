@@ -530,6 +530,29 @@ async fn drive_read_file<R>(
 
     match runtime.read_file(&container_id, &params.path, cwd).await {
         Ok(bytes) => {
+            // v1.0.3: emit FileMeta BEFORE the first Stdout chunk so
+            // the UI can capture the revision before consuming any
+            // file bytes. The stat_revision call is best-effort —
+            // when the runtime hasn't wired stat_revision yet (e.g.
+            // the docker / youki stubs during the rollout) we still
+            // serve the read content, just without the revision
+            // sidecar. The wire shape preserves the v1.0.2
+            // invariant: a v1.0.2 client that ignores FileMeta still
+            // observes Stdout chunks + IoExited unchanged.
+            if let Ok(rev) = runtime.stat_revision(&container_id, &params.path, cwd).await {
+                let meta_frame = IoServerFrame {
+                    stream_id: stream_id.clone(),
+                    payload: Some(io_server_frame::Payload::FileMeta(
+                        open_sandbox_contracts::proxy::FileMeta {
+                            revision: rev.revision,
+                            size: rev.size,
+                        },
+                    )),
+                };
+                if server_tx.send(meta_frame).await.is_err() {
+                    return;
+                }
+            }
             // Chunk into stdout frames.
             for chunk in bytes.chunks(READ_FILE_CHUNK_BYTES) {
                 let frame = IoServerFrame {
@@ -813,29 +836,6 @@ async fn drive_write_file<R, S>(
     R: ContainerRuntime,
     S: Stream<Item = Result<IoClientFrame, AgentError>> + Unpin + Send + 'static,
 {
-    // v1.0.3: the agent-side precondition check on
-    // `expected_revision` lands in the live-edit batch group B.
-    // Until then, reject any caller that asks for the precondition
-    // explicitly — the alternative (silently ignore the field and
-    // overwrite anyway) is exactly the fail-open backdoor the
-    // optimistic-concurrency feature is meant to close, and any
-    // gateway that ships the opt-in before group B would have
-    // believed its `expected_revision` was being honored. Empty
-    // `expected_revision` continues to mean "no precondition",
-    // matching the documented wire-compat with v1.0.1 / v1.0.2.
-    if !params.expected_revision.is_empty() && !params.force {
-        send_error(
-            &server_tx,
-            &stream_id,
-            "NOT_IMPLEMENTED",
-            "write_file expected_revision precondition not yet \
-             implemented; lands in PLAN_LIVE_EDIT group B. Pass \
-             force=true to bypass.",
-        )
-        .await;
-        return;
-    }
-
     let cwd = if params.cwd.is_empty() {
         None
     } else {
@@ -845,8 +845,75 @@ async fn drive_write_file<R, S>(
         stream_id = %stream_id,
         path = %params.path,
         cwd = ?cwd,
+        expected_revision = %params.expected_revision,
+        force = params.force,
         "io_session.start op=write_file"
     );
+
+    // v1.0.3 precondition check (B11). When the caller supplies a
+    // non-empty `expected_revision` AND `force` is false, stat the
+    // file first and compare. Empty `expected_revision` keeps the
+    // v1.0.1 / v1.0.2 "no precondition" wire-compat. `force=true`
+    // is the escape hatch for scripted bulk writes that
+    // intentionally last-write-wins; we log a warning when both
+    // fields are set so a defensive caller's mistake is visible.
+    if !params.expected_revision.is_empty() && !params.force {
+        match runtime.stat_revision(&container_id, &params.path, cwd).await {
+            Ok(rev) if rev.revision == params.expected_revision => {
+                // Match — fall through to read the content.
+            }
+            Ok(rev) => {
+                // Stale revision. Surface as an IoError with the
+                // actual revision in the detail so the gateway can
+                // bubble up a `409 Conflict` with the live token.
+                send_error(
+                    &server_tx,
+                    &stream_id,
+                    "REVISION_MISMATCH",
+                    &rev.revision,
+                )
+                .await;
+                return;
+            }
+            Err(AgentError::Runtime { detail })
+                if detail.starts_with("stat_revision not yet implemented") =>
+            {
+                send_error(
+                    &server_tx,
+                    &stream_id,
+                    "NOT_IMPLEMENTED",
+                    "write_file expected_revision precondition requires a \
+                     runtime that supports stat_revision; not yet \
+                     implemented for this backend. Pass force=true to \
+                     bypass.",
+                )
+                .await;
+                return;
+            }
+            Err(AgentError::Runtime { detail }) if detail.contains("No such file") => {
+                // Precondition specified on a path that doesn't
+                // exist — treat as a mismatch with a sentinel
+                // "absent" actual revision so the gateway maps to
+                // 409 in the same way as a stale revision.
+                send_error(&server_tx, &stream_id, "REVISION_MISMATCH", "").await;
+                return;
+            }
+            Err(e) => {
+                send_error(&server_tx, &stream_id, "WRITE_FAILED", &e.to_string()).await;
+                return;
+            }
+        }
+    } else if !params.expected_revision.is_empty() && params.force {
+        // Both fields set is allowed (the proto-comment escape
+        // hatch), but log a warning so a defensive gateway's
+        // mistake is visible in agent logs even when no
+        // wire-signal distinguishes the regime.
+        warn!(
+            stream_id = %stream_id,
+            expected_revision = %params.expected_revision,
+            "write_file force=true bypasses non-empty expected_revision"
+        );
+    }
 
     // Collect stdin chunks until Close{stdin_eof}, EOF, or non-Stdin frame.
     // Comp-3 B5: cap at MAX_WRITE_BYTES so a client can't OOM the agent.
@@ -893,6 +960,26 @@ async fn drive_write_file<R, S>(
         .await
     {
         Ok(()) => {
+            // v1.0.3: emit FileMeta carrying the just-written
+            // revision so the caller can update its cached token
+            // without an extra read round-trip. Best-effort —
+            // a runtime that can't stat (e.g. the docker / youki
+            // stubs during rollout) still closes the session
+            // cleanly with IoExited, preserving v1.0.2 wire compat.
+            if let Ok(rev) = runtime.stat_revision(&container_id, &params.path, cwd).await {
+                let meta_frame = IoServerFrame {
+                    stream_id: stream_id.clone(),
+                    payload: Some(io_server_frame::Payload::FileMeta(
+                        open_sandbox_contracts::proxy::FileMeta {
+                            revision: rev.revision,
+                            size: rev.size,
+                        },
+                    )),
+                };
+                if server_tx.send(meta_frame).await.is_err() {
+                    return;
+                }
+            }
             let exited = IoServerFrame {
                 stream_id: stream_id.clone(),
                 payload: Some(io_server_frame::Payload::Exited(IoExited {
@@ -1494,6 +1581,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_emits_file_meta_before_first_stdout_chunk() {
+        // v1.0.3: FileMeta MUST be the first server payload on a
+        // ReadFile session (before any Stdout chunks) so the UI can
+        // capture the revision before consuming bytes. This pins
+        // both the presence of the sidecar AND the ordering
+        // invariant — a regression that emits FileMeta AFTER bytes
+        // would defeat the optimistic-concurrency contract.
+        let runtime =
+            Arc::new(MockContainerRuntime::new().with_file("/home/app.py", "print('hi')\n"));
+        let registry = Arc::new(ExecRegistry::new());
+        let (tx, rx, h) = spawn_session(runtime, registry, "s-rf-meta");
+
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-rf-meta".into(),
+            payload: Some(io_client_frame::Payload::Start(IoStart {
+                sandbox_id: "ignored".into(),
+                params: Some(open_sandbox_contracts::proxy::io_start::Params::ReadFile(
+                    ReadFileParams {
+                        path: "app.py".into(),
+                        cwd: "/home".into(),
+                    },
+                )),
+            })),
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let frames = collect_until_exit(rx).await;
+        match &frames[0] {
+            io_server_frame::Payload::FileMeta(m) => {
+                // Mock encodes revision as `mock:<size>`.
+                assert_eq!(m.size, 12);
+                assert!(
+                    !m.revision.is_empty(),
+                    "revision must be non-empty; got {:?}",
+                    m.revision
+                );
+            }
+            other => panic!(
+                "FileMeta must be the first frame on a ReadFile session; got {other:?}"
+            ),
+        }
+        // Stdout frame(s) must follow FileMeta.
+        assert!(matches!(
+            &frames[1],
+            io_server_frame::Payload::Stdout(_)
+        ));
+        // Reconstruct the bytes to verify the read content is unchanged.
+        let joined: Vec<u8> = frames
+            .iter()
+            .filter_map(|p| match p {
+                io_server_frame::Payload::Stdout(b) => Some(b.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(joined, b"print('hi')\n");
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn read_file_missing_emits_resolved_path_in_error() {
         let runtime = Arc::new(MockContainerRuntime::new());
         let registry = Arc::new(ExecRegistry::new());
@@ -1531,27 +1680,156 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_file_with_expected_revision_fails_not_implemented() {
-        // v1.0.3 guard: until group B implements the agent-side
-        // revision precondition, any non-empty expected_revision
-        // must be rejected (rather than silently overwritten) so a
-        // gateway that ships the opt-in early cannot mistakenly
-        // believe its precondition was honored.
+    async fn write_file_with_stale_revision_emits_revision_mismatch() {
+        // B11 (replaces the earlier NOT_IMPLEMENTED guard): when the
+        // caller supplies a non-empty expected_revision that doesn't
+        // match the file's current revision, the agent must surface
+        // a typed REVISION_MISMATCH error carrying the live token
+        // in the detail field. The gateway maps this to 409 Conflict.
         use open_sandbox_contracts::proxy::WriteFileParams;
 
-        let runtime = Arc::new(MockContainerRuntime::new());
+        // Mock encodes revision as `mock:<size>`. Pre-seed app.py
+        // with 7 bytes; the live revision will be "mock:7".
+        let runtime = Arc::new(
+            MockContainerRuntime::new().with_file("/home/app.py", "live!\nx"),
+        );
         let registry = Arc::new(ExecRegistry::new());
-        let (tx, rx, h) = spawn_session(runtime, registry, "s-rev");
+        let (tx, rx, h) = spawn_session(runtime, registry, "s-rev-stale");
 
         tx.send(Ok(IoClientFrame {
-            stream_id: "s-rev".into(),
+            stream_id: "s-rev-stale".into(),
             payload: Some(io_client_frame::Payload::Start(IoStart {
                 sandbox_id: "ignored".into(),
                 params: Some(open_sandbox_contracts::proxy::io_start::Params::WriteFile(
                     WriteFileParams {
                         path: "app.py".into(),
                         cwd: "/home".into(),
-                        expected_revision: "1716800123:421".into(),
+                        // Stale token (different size). Real revision
+                        // on disk is "mock:7".
+                        expected_revision: "mock:99".into(),
+                        force: false,
+                    },
+                )),
+            })),
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let frames = collect_until_exit(rx).await;
+        let last = frames.last().expect("at least one frame");
+        match last {
+            io_server_frame::Payload::Error(e) => {
+                assert_eq!(e.code, "REVISION_MISMATCH");
+                assert_eq!(
+                    e.detail, "mock:7",
+                    "detail must carry the live revision; got {:?}",
+                    e.detail
+                );
+            }
+            other => panic!("expected Error frame, got {other:?}"),
+        }
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_file_with_matching_revision_emits_file_meta_then_exited() {
+        // B11 happy path: caller supplies the actual current
+        // revision; agent writes through and emits FileMeta
+        // carrying the NEW revision, followed by IoExited.
+        use bytes::Bytes;
+        use open_sandbox_contracts::proxy::WriteFileParams;
+
+        let runtime = Arc::new(
+            MockContainerRuntime::new().with_file("/home/app.py", "live!\nx"),
+        );
+        let registry = Arc::new(ExecRegistry::new());
+        let (tx, rx, h) = spawn_session(runtime.clone(), registry, "s-rev-ok");
+
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-rev-ok".into(),
+            payload: Some(io_client_frame::Payload::Start(IoStart {
+                sandbox_id: "ignored".into(),
+                params: Some(open_sandbox_contracts::proxy::io_start::Params::WriteFile(
+                    WriteFileParams {
+                        path: "app.py".into(),
+                        cwd: "/home".into(),
+                        // Matches the seeded 7-byte content
+                        // ("mock:<bytes.len()>"). Mock revision shape
+                        // is documented in MockContainerRuntime.
+                        expected_revision: "mock:7".into(),
+                        force: false,
+                    },
+                )),
+            })),
+        }))
+        .await
+        .unwrap();
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-rev-ok".into(),
+            // 11-byte payload — the post-write revision will be
+            // "mock:11".
+            payload: Some(io_client_frame::Payload::Stdin(b"print('x')\n".to_vec())),
+        }))
+        .await
+        .unwrap();
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-rev-ok".into(),
+            payload: Some(io_client_frame::Payload::Close(IoClose { stdin_eof: true })),
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let frames = collect_until_exit(rx).await;
+        // Expect [FileMeta, Exited] — FileMeta carries the
+        // just-written revision so the caller can update its cached
+        // token without a follow-up read.
+        match &frames[0] {
+            io_server_frame::Payload::FileMeta(m) => {
+                assert_eq!(m.revision, "mock:11");
+                assert_eq!(m.size, 11);
+            }
+            other => panic!("expected FileMeta first, got {other:?}"),
+        }
+        assert!(matches!(
+            &frames[1],
+            io_server_frame::Payload::Exited(IoExited {
+                exit_code: 0,
+                command_not_found: false
+            })
+        ));
+        let writes = runtime.writes_received();
+        assert!(
+            writes.iter().any(|w| w.bytes == Bytes::from("print('x')\n")),
+            "expected bytes to be persisted via the runtime trait"
+        );
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_file_with_revision_on_unimplemented_runtime_emits_not_implemented() {
+        // B11 capability gating: a runtime whose stat_revision
+        // returns the "not yet implemented" stub error must surface
+        // NOT_IMPLEMENTED to the caller (so the SDK can fall back
+        // to force=true or wait for the rollout). Without this, a
+        // gateway shipping the opt-in early would silently bypass
+        // the precondition and lose conflict detection.
+        use open_sandbox_contracts::proxy::WriteFileParams;
+
+        let runtime = Arc::new(NotYetImplementedRuntime);
+        let registry = Arc::new(ExecRegistry::new());
+        let (tx, rx, h) = spawn_session(runtime, registry, "s-rev-noimpl");
+
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-rev-noimpl".into(),
+            payload: Some(io_client_frame::Payload::Start(IoStart {
+                sandbox_id: "ignored".into(),
+                params: Some(open_sandbox_contracts::proxy::io_start::Params::WriteFile(
+                    WriteFileParams {
+                        path: "app.py".into(),
+                        cwd: "/home".into(),
+                        expected_revision: "mock:7".into(),
                         force: false,
                     },
                 )),
@@ -1567,8 +1845,8 @@ mod tests {
             io_server_frame::Payload::Error(e) => {
                 assert_eq!(e.code, "NOT_IMPLEMENTED");
                 assert!(
-                    e.detail.contains("expected_revision"),
-                    "error detail should mention the precondition; got {:?}",
+                    e.detail.contains("stat_revision") || e.detail.contains("force=true"),
+                    "error detail should mention the missing capability or escape hatch; got {:?}",
                     e.detail
                 );
             }
