@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use open_sandbox_agent::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState, ExecHandle,
-    ExecStart,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState, DirListing,
+    ExecHandle, ExecStart, FileRevision,
 };
 use open_sandbox_contracts::constants::DEFAULT_WRITE_CWD;
 use open_sandbox_contracts::error::AgentError;
@@ -495,6 +495,35 @@ impl ContainerRuntime for YoukiRuntime {
         let target = cwd.unwrap_or(DEFAULT_WRITE_CWD).to_string();
         let target_pid = exec::container_pid(&id.0, &self.state_dir())?;
         setns_ops::extract_targz_in_ns(target_pid, target, tarball).await
+    }
+
+    async fn list_dir(
+        &self,
+        _id: &ContainerId,
+        _path: &str,
+        _cwd: Option<&str>,
+    ) -> Result<DirListing, AgentError> {
+        // v1.0.3: real youki impl (setns(2) into the container's PID
+        // namespace + std::fs::read_dir + stat per entry) follows on
+        // a subsequent commit in PLAN_LIVE_EDIT group B. Until then,
+        // return a typed Runtime error rather than a silent empty
+        // listing.
+        Err(AgentError::Runtime {
+            detail: "list_dir not yet implemented for youki runtime".into(),
+        })
+    }
+
+    async fn stat_revision(
+        &self,
+        _id: &ContainerId,
+        _path: &str,
+        _cwd: Option<&str>,
+    ) -> Result<FileRevision, AgentError> {
+        // v1.0.3: real youki impl follows on a subsequent commit in
+        // PLAN_LIVE_EDIT group B. Same error shape as list_dir above.
+        Err(AgentError::Runtime {
+            detail: "stat_revision not yet implemented for youki runtime".into(),
+        })
     }
 }
 

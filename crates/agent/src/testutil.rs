@@ -11,8 +11,9 @@ use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
 
 use crate::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState,
-    EXEC_CHANNEL_CAPACITY, ExecExitInfo, ExecHandle, ExecStart, detect_command_not_found,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState, DirEntry,
+    DirListing, EXEC_CHANNEL_CAPACITY, EntryType, ExecExitInfo, ExecHandle, ExecStart,
+    FileRevision, detect_command_not_found,
 };
 use crate::tunnel::{ForwardRequest, ForwardResponse, HttpClient};
 
@@ -242,6 +243,97 @@ impl ContainerRuntime for MockContainerRuntime {
         });
         Ok(())
     }
+
+    async fn list_dir(
+        &self,
+        _id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+    ) -> Result<DirListing, AgentError> {
+        // Treat the pre-seeded `files` map as a flat filesystem where
+        // resolved paths share the parent directory whose contents we
+        // are listing. Direct children of `resolved` only — children
+        // of subdirectories appear as a virtual `Dir` entry whose
+        // name is the next path segment.
+        use open_sandbox_contracts::constants::LIST_DIR_MAX_ENTRIES;
+
+        let resolved = resolve_path(path, cwd);
+        let prefix = if resolved == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", resolved.trim_end_matches('/'))
+        };
+        let files = self.files.lock().unwrap();
+        let mut seen_dirs: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut leaves: Vec<DirEntry> = Vec::new();
+        for (p, bytes) in files.iter() {
+            let Some(rest) = p.strip_prefix(&prefix) else {
+                continue;
+            };
+            // Split off the first segment after the prefix.
+            match rest.split_once('/') {
+                Some((dir_name, _rest)) if !dir_name.is_empty() => {
+                    seen_dirs.insert(dir_name.to_string());
+                }
+                None => {
+                    leaves.push(DirEntry {
+                        name: rest.to_string(),
+                        entry_type: EntryType::File,
+                        size: bytes.len() as u64,
+                        // Mock revision = bytes-length-only; real
+                        // runtimes use `mtime_nanos:size`.
+                        revision: format!("mock:{}", bytes.len()),
+                        mode: "0644".to_string(),
+                        target: String::new(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        let mut entries: Vec<DirEntry> = seen_dirs
+            .into_iter()
+            .map(|name| DirEntry {
+                name,
+                entry_type: EntryType::Dir,
+                size: 0,
+                revision: "mock-dir:0".to_string(),
+                mode: "0755".to_string(),
+                target: String::new(),
+            })
+            .collect();
+        entries.append(&mut leaves);
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let total_entries = entries.len() as u64;
+        let truncated = entries.len() > LIST_DIR_MAX_ENTRIES;
+        if truncated {
+            entries.truncate(LIST_DIR_MAX_ENTRIES);
+        }
+        Ok(DirListing {
+            path: resolved,
+            entries,
+            truncated,
+            total_entries,
+        })
+    }
+
+    async fn stat_revision(
+        &self,
+        _id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+    ) -> Result<FileRevision, AgentError> {
+        let resolved = resolve_path(path, cwd);
+        let files = self.files.lock().unwrap();
+        let bytes = files.get(&resolved).ok_or_else(|| AgentError::Runtime {
+            detail: format!("No such file: {resolved}"),
+        })?;
+        Ok(FileRevision {
+            revision: format!("mock:{}", bytes.len()),
+            size: bytes.len() as u64,
+        })
+    }
 }
 
 fn resolve_path(path: &str, cwd: Option<&str>) -> String {
@@ -407,6 +499,28 @@ impl ContainerRuntime for FailingContainerRuntime {
             detail: "mock runtime failure".into(),
         })
     }
+
+    async fn list_dir(
+        &self,
+        _id: &ContainerId,
+        _path: &str,
+        _cwd: Option<&str>,
+    ) -> Result<DirListing, AgentError> {
+        Err(AgentError::Runtime {
+            detail: "mock runtime failure".into(),
+        })
+    }
+
+    async fn stat_revision(
+        &self,
+        _id: &ContainerId,
+        _path: &str,
+        _cwd: Option<&str>,
+    ) -> Result<FileRevision, AgentError> {
+        Err(AgentError::Runtime {
+            detail: "mock runtime failure".into(),
+        })
+    }
 }
 
 /// v1.0.2 (iter11): runtime mock whose `create_and_start` sleeps for
@@ -497,6 +611,32 @@ impl ContainerRuntime for SlowContainerRuntime {
         _tarball: Bytes,
     ) -> Result<(), AgentError> {
         Ok(())
+    }
+
+    async fn list_dir(
+        &self,
+        _id: &ContainerId,
+        path: &str,
+        _cwd: Option<&str>,
+    ) -> Result<DirListing, AgentError> {
+        Ok(DirListing {
+            path: path.to_string(),
+            entries: Vec::new(),
+            truncated: false,
+            total_entries: 0,
+        })
+    }
+
+    async fn stat_revision(
+        &self,
+        _id: &ContainerId,
+        _path: &str,
+        _cwd: Option<&str>,
+    ) -> Result<FileRevision, AgentError> {
+        Ok(FileRevision {
+            revision: "slow:0".to_string(),
+            size: 0,
+        })
     }
 }
 

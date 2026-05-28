@@ -91,6 +91,14 @@ pub const ERROR_CODE_HEADER: &str = "x-os-error-code";
 // know to paginate.
 pub const LIST_SANDBOXES_MAX: usize = 1000;
 
+// v1.0.3: maximum entries returned from a single ListDirParams session.
+// The agent caps server-side; the response's `truncated` flag tells the
+// UI to render a "drill in" affordance instead of attempting to display
+// an unbounded directory. Picked to comfortably exceed real source-tree
+// directories while staying well under a number that would OOM the
+// gateway's per-frame JSON marshalling.
+pub const LIST_DIR_MAX_ENTRIES: usize = 5000;
+
 // =====  WebSocket subprotocol auth (browser clients) =====
 //
 // Browser `WebSocket` constructors cannot attach an `Authorization`

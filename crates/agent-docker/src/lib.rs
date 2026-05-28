@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use open_sandbox_agent::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState,
-    EXEC_CHANNEL_CAPACITY, ExecExitInfo, ExecHandle, ExecStart, consume_inpid_marker,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState, DirListing,
+    EXEC_CHANNEL_CAPACITY, ExecExitInfo, ExecHandle, ExecStart, FileRevision, consume_inpid_marker,
     detect_command_not_found, wrap_command_with_inpid_marker,
 };
 use open_sandbox_contracts::constants::DEFAULT_WRITE_CWD;
@@ -959,6 +959,35 @@ impl ContainerRuntime for DockerRuntime {
         }
 
         Ok(())
+    }
+
+    async fn list_dir(
+        &self,
+        _id: &ContainerId,
+        _path: &str,
+        _cwd: Option<&str>,
+    ) -> Result<DirListing, AgentError> {
+        // v1.0.3: real docker-runtime impl follows on a subsequent
+        // commit in PLAN_LIVE_EDIT group B. Until then, return a
+        // typed Runtime error rather than a silent empty listing so
+        // any caller racing the rollout sees a clean failure.
+        Err(AgentError::Runtime {
+            detail: "list_dir not yet implemented for docker runtime".into(),
+        })
+    }
+
+    async fn stat_revision(
+        &self,
+        _id: &ContainerId,
+        _path: &str,
+        _cwd: Option<&str>,
+    ) -> Result<FileRevision, AgentError> {
+        // v1.0.3: real docker-runtime impl follows on a subsequent
+        // commit in PLAN_LIVE_EDIT group B. Same error shape as
+        // list_dir above.
+        Err(AgentError::Runtime {
+            detail: "stat_revision not yet implemented for docker runtime".into(),
+        })
     }
 
     async fn write_files_targz(

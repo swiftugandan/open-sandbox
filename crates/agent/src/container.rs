@@ -194,6 +194,85 @@ pub trait ContainerRuntime: Send + Sync {
         cwd: Option<&str>,
         tarball: Bytes,
     ) -> impl Future<Output = Result<(), AgentError>> + Send;
+
+    /// v1.0.3: list one level of a directory inside the container.
+    /// Resolves relative paths the same way `read_file` /
+    /// `write_file` do (via `cwd`, defaulting to
+    /// `DEFAULT_WRITE_CWD`).
+    ///
+    /// Implementations MUST hard-cap the returned entry vec at
+    /// `LIST_DIR_MAX_ENTRIES` and set `truncated=true` /
+    /// `total_entries=N` when the underlying directory holds more.
+    /// A runaway `node_modules` listing must not OOM the agent or
+    /// the gateway.
+    fn list_dir(
+        &self,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+    ) -> impl Future<Output = Result<DirListing, AgentError>> + Send;
+
+    /// v1.0.3: stat a single path and return the agent's opaque
+    /// revision token. Used by `read_file` / `write_file` callers
+    /// to surface the revision sidecar without having to re-read
+    /// the file content. The reference revision encoding is
+    /// `mtime_nanos:size`.
+    fn stat_revision(
+        &self,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
+    ) -> impl Future<Output = Result<FileRevision, AgentError>> + Send;
+}
+
+/// v1.0.3: a single entry in a [`DirListing`].
+///
+/// `target` is only populated for symlinks; for every other kind
+/// it is the empty string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub entry_type: EntryType,
+    pub size: u64,
+    pub revision: String,
+    pub mode: String,
+    pub target: String,
+}
+
+/// v1.0.3: collapsed kernel-level file-type enum the runtime
+/// returns. FIFO / socket / device nodes collapse to `Other` so
+/// callers don't enumerate the long tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryType {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+/// v1.0.3: result shape returned by [`ContainerRuntime::list_dir`].
+///
+/// `truncated == true` indicates the runtime hit
+/// `LIST_DIR_MAX_ENTRIES` and stopped collecting; `total_entries`
+/// reports how many entries the runtime saw before the cap.
+#[derive(Debug, Clone)]
+pub struct DirListing {
+    pub path: String,
+    pub entries: Vec<DirEntry>,
+    pub truncated: bool,
+    pub total_entries: u64,
+}
+
+/// v1.0.3: opaque-revision sidecar returned by
+/// [`ContainerRuntime::stat_revision`] and embedded in
+/// [`DirEntry::revision`]. `size` is the byte count for files;
+/// for directories it is 0; for symlinks it is the target-string
+/// length. Encoded on the wire as `<revision-token>:<size>`-style
+/// per the reference implementation; treated as opaque by clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRevision {
+    pub revision: String,
+    pub size: u64,
 }
 
 /// Wrap a user command so the in-container process emits its own
