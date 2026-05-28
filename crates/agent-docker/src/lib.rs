@@ -1045,27 +1045,41 @@ done
         } else {
             vec!["rm".into(), "-f".into(), "--".into(), resolved.clone()]
         };
+        // Force C locale so `rm`'s stderr is the canonical English
+        // phrasing the agent's drive_delete_file classifier
+        // sniffs for ("is a directory" / "Directory not empty").
+        // Without this an image with LANG=fr_FR.UTF-8 would emit
+        // "Le dossier n'est pas vide" and the classifier would
+        // miss → gateway 500 instead of 409 → UI recursive
+        // re-prompt unreachable.
+        let mut env = HashMap::new();
+        env.insert("LC_ALL".to_string(), "C".to_string());
+        env.insert("LANG".to_string(), "C".to_string());
         let handle = self
             .start_exec(
                 id,
                 ExecStart {
                     command: argv,
                     cwd: String::new(),
-                    env: HashMap::new(),
+                    env,
                 },
             )
             .await?;
         drop(handle.stdin);
         // Drain both pipes; rm's success is silent, errors land
         // on stderr (`rm: cannot remove 'foo': Is a directory`).
+        // 4096-byte stderr cap via saturating_add — the previous
+        // `buf.len() < 4096` check let a single oversize chunk
+        // through unbounded.
         let mut stdout_rx = handle.stdout;
         let mut stderr_rx = handle.stderr;
         let stderr_task = async {
             let mut buf: Vec<u8> = Vec::new();
             while let Some(chunk) = stderr_rx.recv().await {
-                if buf.len() < 4096 {
-                    buf.extend_from_slice(&chunk);
+                if buf.len().saturating_add(chunk.len()) > 4096 {
+                    continue;
                 }
+                buf.extend_from_slice(&chunk);
             }
             buf
         };

@@ -52,6 +52,12 @@ pub enum IoErrorCode {
     // (same shape as RevisionMismatch — "precondition for the
     // operation isn't met").
     DirectoryNotEmpty,
+    // v1.0.3: emitted by the agent on any delete_file failure
+    // that isn't a populated-directory conflict (permission
+    // denied, read-only fs, target busy, etc). Routes to a
+    // typed 500-class error so the UI can distinguish "delete
+    // failed for a real reason" from a generic IoStreamFailed.
+    DeleteFailed,
     /// Catch-all for codes the contract doesn't know about. Senders
     /// should still avoid emitting unknown codes; receivers tolerate
     /// them so a downstream crate that runs v1.0.1 forward-compat keeps
@@ -76,6 +82,7 @@ impl IoErrorCode {
             Self::RevisionMismatch => "REVISION_MISMATCH",
             Self::NotImplemented => "NOT_IMPLEMENTED",
             Self::DirectoryNotEmpty => "DIRECTORY_NOT_EMPTY",
+            Self::DeleteFailed => "DELETE_FAILED",
             Self::Other(s) => s.as_str(),
         }
     }
@@ -107,6 +114,7 @@ impl From<&str> for IoErrorCode {
             "REVISION_MISMATCH" => Self::RevisionMismatch,
             "NOT_IMPLEMENTED" => Self::NotImplemented,
             "DIRECTORY_NOT_EMPTY" => Self::DirectoryNotEmpty,
+            "DELETE_FAILED" => Self::DeleteFailed,
             other => Self::Other(other.to_string()),
         }
     }

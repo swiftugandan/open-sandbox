@@ -510,6 +510,36 @@ export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
           config={config}
           sandboxId={sandboxId}
           onSelect={openFile}
+          onPathDeleted={(absPath) => {
+            // v1.0.3: when the tree deletes a path, drop any
+            // editor tab keyed on that path (or any tab whose
+            // path was UNDER the deleted directory). Without
+            // this, Cmd-S on the now-orphan tab would silently
+            // recreate the file via the agent's `mkdir -p` +
+            // write — "I deleted the file and it came back".
+            const prefix = absPath.endsWith("/") ? absPath : `${absPath}/`;
+            setTabs((prev) =>
+              prev.filter(
+                (t) => t.path !== absPath && !t.path.startsWith(prefix),
+              ),
+            );
+            setActivePath((cur) => {
+              if (cur == null) return cur;
+              if (cur === absPath || cur.startsWith(prefix)) {
+                // Fall back to the first remaining tab (or
+                // null if none survive).
+                const remaining = tabsRef.current.filter(
+                  (t) => t.path !== absPath && !t.path.startsWith(prefix),
+                );
+                return remaining[0]?.path ?? null;
+              }
+              return cur;
+            });
+            // Also clear any IndexedDB stash for the gone path
+            // so a future re-open doesn't restore stale
+            // unsaved content.
+            void removeUnsavedBuffer(sandboxId, absPath);
+          }}
           selectedPath={activePath ?? undefined}
         />
       </div>

@@ -49,6 +49,12 @@ interface Props {
   /** Called when a file leaf is clicked. The selected path is the
    *  absolute path inside the sandbox. */
   onSelect?: (absPath: string) => void;
+  /** v1.0.3: called when a path is successfully deleted (either
+   *  by trash-icon click or its recursive re-prompt). The parent
+   *  uses this to close any open editor tabs whose path is now
+   *  stale — without that, the editor's next Cmd-S would
+   *  silently resurrect the file via the agent's `mkdir -p`. */
+  onPathDeleted?: (absPath: string) => void;
   /** Path of the currently-selected leaf, for the highlighted-row UI. */
   selectedPath?: string;
 }
@@ -97,6 +103,7 @@ export function FileTree({
   sandboxId,
   rootPath: rawRootPath = DEFAULT_TREE_ROOT,
   onSelect,
+  onPathDeleted,
   selectedPath,
 }: Props) {
   // Defensive: callers occasionally pass paths with trailing slashes
@@ -309,21 +316,21 @@ export function FileTree({
       });
       if (!ok) return;
       try {
-        // The caller may have passed isDir=false on a row the
-        // server in fact reports as a directory (e.g. a symlink
-        // to a dir, or stale tree state). We pass `recursive:
-        // isDir` so the dir-path is auto-recursive; for non-
-        // directories the agent treats `recursive=true` the
-        // same as `rm -rf` on a leaf (no-op flag — `rm -rf foo`
-        // works on files too).
+        // Tree row's `isDir` drives the `recursive` flag:
+        // directories the tree correctly classifies → first
+        // call already has recursive=true and succeeds without
+        // a 409 round-trip. The 409 re-prompt branch below
+        // only fires for stale-tree-state edge cases (e.g. the
+        // entry was a file at list time but now resolves as a
+        // populated directory).
         await api.deleteFile(config, sandboxId, absPath, { recursive: isDir });
         setRefreshNonce((n) => n + 1);
+        onPathDeleted?.(absPath);
       } catch (e) {
         // v1.0.3: 409 DIRECTORY_NOT_EMPTY is the typed-conflict
-        // case the agent emits when the user clicked "delete"
-        // on something the tree thought was a file but the
-        // server resolved as a populated dir (e.g. a stale
-        // listing). Re-prompt with the recursive option.
+        // re-prompt case (stale-listing / symlink-to-dir).
+        // Confirmation dialog re-opens with the recursive
+        // option.
         if (
           e instanceof ApiError &&
           e.errorCode === "DIRECTORY_NOT_EMPTY"
@@ -345,6 +352,7 @@ export function FileTree({
                 recursive: true,
               });
               setRefreshNonce((n) => n + 1);
+              onPathDeleted?.(absPath);
             } catch (e2) {
               const message =
                 e2 instanceof ApiError
@@ -373,7 +381,7 @@ export function FileTree({
         });
       }
     },
-    [confirm, config, sandboxId],
+    [confirm, config, sandboxId, onPathDeleted],
   );
 
   return (
