@@ -22,15 +22,28 @@
 
 import { useCallback, useRef, useState } from "react";
 
-import type { ApiConfig } from "@/lib/api";
-import { ApiError, api } from "@/lib/api";
+import type { ApiConfig, Sandbox } from "@/lib/api";
+import { ApiError, api, publicUrl } from "@/lib/api";
 import { FileTree } from "@/components/file-tree";
 import { Editor, type OpenTab, type SaveStatus } from "@/components/editor";
+import { PreviewPane } from "@/components/preview-pane";
 
 interface Props {
   config: ApiConfig;
-  sandboxId: string;
+  sandbox: Sandbox;
+  /** In-container port the dev-server listens on. Defaults to
+   *  8080 (matches the platform-wide DEFAULT_SANDBOX_EXPOSED_PORT).
+   *  Surfaced so a future per-sandbox port-setting UI can plumb
+   *  through without re-threading. */
+  previewPort?: number;
 }
+
+/** Save chain: how long to wait for the in-container server to
+ *  re-accept after a watchexec restart before giving up. 3s per
+ *  PLAN_LIVE_EDIT.md; the gateway clamps to 5min. A failed wait
+ *  doesn't block the iframe reload — we still bump the cache
+ *  bust, the iframe just re-renders the same down-state. */
+const WAIT_PORT_TIMEOUT_MS = 3_000;
 
 /** Internal per-tab record. Extends the public OpenTab with a
  *  `savedContent` snapshot so `dirty` can flip back to false when
@@ -41,10 +54,31 @@ interface InternalTab extends OpenTab {
   savedContent: string;
 }
 
-export function LiveEditPanel({ config, sandboxId }: Props) {
+export function LiveEditPanel({ config, sandbox, previewPort = 8080 }: Props) {
+  const sandboxId = sandbox.sandbox_id;
   const [tabs, setTabs] = useState<InternalTab[]>([]);
   const [activePath, setActivePath] = useState<string | null>(null);
   const [status, setStatus] = useState<SaveStatus>({ kind: "idle" });
+  // Monotonically increasing — PreviewPane re-creates the iframe
+  // (with a `?__t=<reloadKey>` cache-bust) whenever this bumps.
+  // Driven by both the save-chain and the manual Reload toolbar
+  // button.
+  const [reloadKey, setReloadKey] = useState(0);
+  const previewUrl = publicUrl(config.base, sandbox.subdomain);
+
+  // Debounce window for save-chain'd reloads — coalesces Cmd-S
+  // mashing so we don't trigger four wait_port_listening + iframe
+  // reload pairs in a row. Per PLAN_LIVE_EDIT.md §Preview reload.
+  const reloadDebounceRef = useRef<number | null>(null);
+  const scheduleReload = useCallback(() => {
+    if (reloadDebounceRef.current !== null) {
+      window.clearTimeout(reloadDebounceRef.current);
+    }
+    reloadDebounceRef.current = window.setTimeout(() => {
+      reloadDebounceRef.current = null;
+      setReloadKey((k) => k + 1);
+    }, 200);
+  }, []);
 
   // `tabs` is read from inside `onSave` to recover the current
   // content + cached revision for a path. Putting `tabs` in
@@ -188,6 +222,29 @@ export function LiveEditPanel({ config, sandboxId }: Props) {
           ),
         );
         setStatus({ kind: "saved", path, at: Date.now() });
+        // v1.0.3 save chain: writeFile succeeded → wait for the
+        // in-container dev-server to come back up after watchexec
+        // restarts the process → bump the preview iframe's
+        // cache-bust so the next render shows the new build.
+        // Don't await the wait — it's best-effort and the iframe
+        // reload should happen even if the dev-server takes a
+        // while (PreviewPane handles the down-state gracefully).
+        void (async () => {
+          try {
+            await api.waitPortListening(
+              config,
+              sandboxId,
+              previewPort,
+              WAIT_PORT_TIMEOUT_MS,
+            );
+          } catch {
+            // wait_port_listening failures (sandbox gone,
+            // network blip) shouldn't block the user; the
+            // preview will just be stale until the next save
+            // or manual reload.
+          }
+          scheduleReload();
+        })();
       } catch (e) {
         const message =
           e instanceof ApiError
@@ -209,7 +266,7 @@ export function LiveEditPanel({ config, sandboxId }: Props) {
           selectedPath={activePath ?? undefined}
         />
       </div>
-      <div className="flex-1 min-w-0">
+      <div className="flex-1 min-w-0 border-r border-border">
         <Editor
           tabs={tabs}
           activePath={activePath}
@@ -218,6 +275,15 @@ export function LiveEditPanel({ config, sandboxId }: Props) {
           onCloseTab={closeTab}
           onChange={onChange}
           onSave={onSave}
+        />
+      </div>
+      <div className="flex-1 min-w-0">
+        <PreviewPane
+          publicUrl={previewUrl}
+          status={sandbox.status}
+          reloadKey={reloadKey}
+          onManualReload={() => setReloadKey((k) => k + 1)}
+          port={previewPort}
         />
       </div>
     </div>

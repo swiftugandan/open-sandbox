@@ -117,7 +117,7 @@ export function RightPane({
           />
         </div>
         <div className={cn("h-full", tab !== "edit" && "hidden")}>
-          <LiveEditPanel config={config} sandboxId={sandbox.sandbox_id} />
+          <LiveEditPanel config={config} sandbox={sandbox} />
         </div>
         <div className={cn("h-full", tab !== "files" && "hidden")}>
           <FilesPanel config={config} sandboxId={sandbox.sandbox_id} />
