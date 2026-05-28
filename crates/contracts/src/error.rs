@@ -86,6 +86,22 @@ pub enum ApiError {
     #[error("invalid state transition: {detail}")]
     InvalidState { detail: String },
 
+    /// v1.0.3: write_file's `expected_revision` precondition did not
+    /// match the file's current revision. `actual_revision` carries
+    /// the live token so the client can reload + retry without an
+    /// extra stat round trip. An empty `actual_revision` means the
+    /// file did not exist at the time of the precondition check.
+    /// Maps to HTTP 409 Conflict.
+    #[error("revision mismatch (current revision: {actual_revision:?})")]
+    RevisionMismatch { actual_revision: String },
+
+    /// v1.0.3: the agent runtime backend does not yet implement a
+    /// requested capability (e.g. `stat_revision` on a runtime that
+    /// hasn't wired it). Maps to HTTP 501 Not Implemented so SDKs
+    /// can feature-detect and fall back.
+    #[error("not implemented: {detail}")]
+    NotImplemented { detail: String },
+
     #[error("internal error: {detail}")]
     Internal { detail: String },
 }
@@ -108,6 +124,8 @@ impl ApiError {
             ApiError::SandboxGone { .. } => "SANDBOX_GONE",
             ApiError::FileNotFound { .. } => "FILE_NOT_FOUND",
             ApiError::InvalidState { .. } => "INVALID_STATE",
+            ApiError::RevisionMismatch { .. } => "REVISION_MISMATCH",
+            ApiError::NotImplemented { .. } => "NOT_IMPLEMENTED",
             ApiError::Internal { .. } => "INTERNAL_ERROR",
         }
     }

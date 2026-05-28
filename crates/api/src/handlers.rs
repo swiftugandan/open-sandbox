@@ -11,13 +11,15 @@ use tokio::sync::mpsc;
 
 use open_sandbox_contracts::error::ApiError;
 use open_sandbox_contracts::proxy::{
-    IoClientFrame, IoStart, ReadFileParams, WriteFileParams, WriteFilesTargzParams,
-    io_client_frame, io_server_frame, io_start,
+    IoClientFrame, IoStart, ListDirParams, ReadFileParams, WaitPortListeningParams,
+    WriteFileParams, WriteFilesTargzParams, io_client_frame, io_server_frame, io_start,
 };
 use open_sandbox_contracts::types::SandboxId;
 
 use crate::service::{
-    CreateRequest, ReadFileQuery, SandboxService, WriteFileRequest, WriteFilesResult,
+    CreateRequest, ListDirEntryJson, ListDirQuery, ListDirResultJson, ReadFileQuery,
+    SandboxService, WaitPortListeningRequest, WaitPortListeningResultJson, WriteFileRequest,
+    WriteFilesResult,
 };
 use crate::state::ApiState;
 
@@ -340,7 +342,11 @@ pub async fn write_files<S: SandboxService>(
     .await;
 
     match result {
-        Ok(_) => Json(WriteFilesResult { success: true }).into_response(),
+        Ok(_) => Json(WriteFilesResult {
+            success: true,
+            revision: None,
+        })
+        .into_response(),
         Err(e) => api_error_response(e),
     }
 }
@@ -380,12 +386,11 @@ pub async fn write_file<S: SandboxService>(
             params: Some(io_start::Params::WriteFile(WriteFileParams {
                 path: body.path,
                 cwd: body.cwd.unwrap_or_default(),
-                // v1.0.3 fields. Default values preserve v1.0.2
-                // behavior: empty `expected_revision` skips the
-                // precondition check; `force` is irrelevant in that
-                // case. Group C wires the gateway-side opt-in.
-                expected_revision: String::new(),
-                force: false,
+                // v1.0.3: forward the precondition fields through.
+                // Default empty `expected_revision` keeps v1.0.2
+                // wire-compat for callers that don't supply it.
+                expected_revision: body.expected_revision.unwrap_or_default(),
+                force: body.force,
             })),
         },
         Some(content),
@@ -393,7 +398,11 @@ pub async fn write_file<S: SandboxService>(
     .await;
 
     match result {
-        Ok(_) => Json(WriteFilesResult { success: true }).into_response(),
+        Ok(meta) => Json(WriteFilesResult {
+            success: true,
+            revision: meta.map(|m| m.revision),
+        })
+        .into_response(),
         Err(e) => api_error_response(e),
     }
 }
@@ -433,27 +442,135 @@ pub async fn read_file<S: SandboxService>(
     .await;
 
     match result {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
-        )
-            .into_response(),
+        Ok(ReadFileResult { bytes, meta }) => {
+            // v1.0.3: surface the revision token as the
+            // X-File-Revision response header so the UI can capture
+            // it without parsing the body. Missing when the runtime
+            // backend hasn't wired stat_revision yet.
+            let mut response_headers = vec![(
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            )];
+            if let Some(m) = meta {
+                response_headers.push((
+                    axum::http::HeaderName::from_static("x-file-revision"),
+                    m.revision,
+                ));
+            }
+            let mut response = (StatusCode::OK, bytes).into_response();
+            for (name, value) in response_headers {
+                if let Ok(v) = axum::http::HeaderValue::from_str(&value) {
+                    response.headers_mut().insert(name, v);
+                }
+            }
+            response
+        }
+        Err(e) => api_error_response(e),
+    }
+}
+
+pub async fn list_dir<S: SandboxService>(
+    State(state): State<Arc<ApiState<S>>>,
+    Path(id): Path<String>,
+    Query(query): Query<ListDirQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = check_rest_auth(&headers, &state) {
+        return r;
+    }
+    let sandbox_id = match parse_sandbox_id(&id) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    if query.path.is_empty() {
+        return invalid_request("path query parameter is required");
+    }
+    if let Err(msg) = validate_sandbox_path(&query.path) {
+        return invalid_request(msg);
+    }
+
+    let result = list_dir_via_io_stream(
+        &state,
+        &sandbox_id,
+        IoStart {
+            sandbox_id: sandbox_id.to_string(),
+            params: Some(io_start::Params::ListDir(ListDirParams {
+                path: query.path,
+                cwd: query.cwd.unwrap_or_default(),
+            })),
+        },
+    )
+    .await;
+
+    match result {
+        Ok(listing) => (StatusCode::OK, Json(listing)).into_response(),
+        Err(e) => api_error_response(e),
+    }
+}
+
+pub async fn wait_port_listening<S: SandboxService>(
+    State(state): State<Arc<ApiState<S>>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ValidJson(body): ValidJson<WaitPortListeningRequest>,
+) -> Response {
+    if let Err(r) = check_rest_auth(&headers, &state) {
+        return r;
+    }
+    let sandbox_id = match parse_sandbox_id(&id) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    // Belt-and-suspenders gateway-side clamp: the agent ALSO clamps,
+    // but enforcing it here too prevents tying up an OpenIoStream
+    // session slot for longer than the platform cap. (Defense in
+    // depth — closes the D2 design concern from FOLLOWUPS_v1.0.3.)
+    let clamped_timeout = body
+        .timeout_ms
+        .min(open_sandbox_contracts::constants::WAIT_PORT_LISTENING_MAX_TIMEOUT_MS);
+
+    let result = wait_port_via_io_stream(
+        &state,
+        &sandbox_id,
+        IoStart {
+            sandbox_id: sandbox_id.to_string(),
+            params: Some(io_start::Params::WaitPortListening(WaitPortListeningParams {
+                port: body.port,
+                timeout_ms: clamped_timeout,
+            })),
+        },
+    )
+    .await;
+
+    match result {
+        Ok(r) => (StatusCode::OK, Json(r)).into_response(),
         Err(e) => api_error_response(e),
     }
 }
 
 // ===== Helpers =====
 
+/// v1.0.3: optional FileMeta sidecar observed during the session.
+/// Returned alongside the unary success so REST handlers can surface
+/// `X-File-Revision` headers / response-body revision fields without
+/// an extra round-trip. `None` when the agent didn't emit FileMeta
+/// (legacy v1.0.2 wire, or a runtime stub).
+#[derive(Debug, Default, Clone)]
+pub struct UnaryFileMeta {
+    pub revision: String,
+    pub size: u64,
+}
+
 /// Open an OpenIoStream, push the first IoStart, optionally push
 /// the content as a single Stdin frame, await IoExited (success)
-/// or IoError. Returns Ok with empty bytes on success.
+/// or IoError. Returns Ok with the captured FileMeta sidecar (if
+/// the agent emitted one before terminating).
 async fn unary_via_io_stream<S: SandboxService>(
     state: &Arc<ApiState<S>>,
     _sandbox_id: &SandboxId,
     start: IoStart,
     content: Option<Vec<u8>>,
-) -> Result<(), ApiError> {
+) -> Result<Option<UnaryFileMeta>, ApiError> {
     // Smoke-test fix: previously this function pushed ALL frames into
     // client_tx (capacity 8) BEFORE calling open_io_stream, deadlocking
     // whenever the content needed >7 Stdin chunks (~448 KiB). The
@@ -513,12 +630,13 @@ async fn unary_via_io_stream<S: SandboxService>(
             })
             .await;
     });
+    let mut captured_meta: Option<UnaryFileMeta> = None;
     while let Some(frame_res) = server_rx.recv().await {
         let frame = frame_res?;
         match frame.payload {
             Some(io_server_frame::Payload::Exited(e)) => {
                 if e.exit_code == 0 && !e.command_not_found {
-                    return Ok(());
+                    return Ok(captured_meta);
                 }
                 return Err(ApiError::IoStreamFailed {
                     detail: format!(
@@ -530,6 +648,15 @@ async fn unary_via_io_stream<S: SandboxService>(
             Some(io_server_frame::Payload::Error(err)) => {
                 return Err(map_io_error(&err));
             }
+            // v1.0.3: capture FileMeta sidecar (emitted by
+            // drive_write_file after a successful write) so the
+            // REST response can carry the new revision back.
+            Some(io_server_frame::Payload::FileMeta(m)) => {
+                captured_meta = Some(UnaryFileMeta {
+                    revision: m.revision,
+                    size: m.size,
+                });
+            }
             // ignore stdout/stderr/started for unary file writes
             _ => {}
         }
@@ -539,13 +666,22 @@ async fn unary_via_io_stream<S: SandboxService>(
     })
 }
 
+/// v1.0.3: ReadFile session result — body bytes plus the optional
+/// FileMeta sidecar observed before the first Stdout chunk. The
+/// `read_file` REST handler surfaces `meta.revision` as the
+/// `X-File-Revision` response header.
+pub struct ReadFileResult {
+    pub bytes: ProstBytes,
+    pub meta: Option<UnaryFileMeta>,
+}
+
 /// Open an OpenIoStream for ReadFile and collect all stdout chunks
 /// into a single Bytes buffer (unary REST read endpoint).
 async fn stream_via_io_stream<S: SandboxService>(
     state: &Arc<ApiState<S>>,
     _sandbox_id: &SandboxId,
     start: IoStart,
-) -> Result<ProstBytes, ApiError> {
+) -> Result<ReadFileResult, ApiError> {
     let (client_tx, client_rx) = mpsc::channel::<IoClientFrame>(8);
     client_tx
         .send(IoClientFrame {
@@ -558,6 +694,7 @@ async fn stream_via_io_stream<S: SandboxService>(
 
     let mut server_rx = state.proxy.open_io_stream(client_rx).await?;
     let mut buf: Vec<u8> = Vec::new();
+    let mut captured_meta: Option<UnaryFileMeta> = None;
     while let Some(frame_res) = server_rx.recv().await {
         let frame = frame_res?;
         match frame.payload {
@@ -569,7 +706,142 @@ async fn stream_via_io_stream<S: SandboxService>(
                         detail: format!("read_file exited with {}", e.exit_code),
                     });
                 }
-                return Ok(ProstBytes::from(buf));
+                return Ok(ReadFileResult {
+                    bytes: ProstBytes::from(buf),
+                    meta: captured_meta,
+                });
+            }
+            Some(io_server_frame::Payload::Error(err)) => {
+                return Err(map_io_error(&err));
+            }
+            // v1.0.3: capture the FileMeta sidecar emitted before
+            // the first Stdout chunk. read_file's REST handler
+            // surfaces revision via the X-File-Revision header.
+            Some(io_server_frame::Payload::FileMeta(m)) => {
+                captured_meta = Some(UnaryFileMeta {
+                    revision: m.revision,
+                    size: m.size,
+                });
+            }
+            _ => {}
+        }
+    }
+    Err(ApiError::IoStreamFailed {
+        detail: "proxy stream ended without terminal frame".into(),
+    })
+}
+
+/// v1.0.3: open an OpenIoStream for ListDir and collect the single
+/// ListDirResult sidecar frame; map the proto entry shape into the
+/// JSON wire shape used by the REST handler.
+async fn list_dir_via_io_stream<S: SandboxService>(
+    state: &Arc<ApiState<S>>,
+    _sandbox_id: &SandboxId,
+    start: IoStart,
+) -> Result<ListDirResultJson, ApiError> {
+    use open_sandbox_contracts::proxy::ListDirEntryType;
+
+    let (client_tx, client_rx) = mpsc::channel::<IoClientFrame>(2);
+    client_tx
+        .send(IoClientFrame {
+            stream_id: String::new(),
+            payload: Some(io_client_frame::Payload::Start(start)),
+        })
+        .await
+        .ok();
+    drop(client_tx);
+
+    let mut server_rx = state.proxy.open_io_stream(client_rx).await?;
+    let mut captured: Option<ListDirResultJson> = None;
+    while let Some(frame_res) = server_rx.recv().await {
+        let frame = frame_res?;
+        match frame.payload {
+            Some(io_server_frame::Payload::ListDirResult(r)) => {
+                let entries = r
+                    .entries
+                    .into_iter()
+                    .map(|e| ListDirEntryJson {
+                        name: e.name,
+                        kind: match ListDirEntryType::try_from(e.r#type)
+                            .unwrap_or(ListDirEntryType::Unspecified)
+                        {
+                            ListDirEntryType::File => "file",
+                            ListDirEntryType::Dir => "dir",
+                            ListDirEntryType::Symlink => "symlink",
+                            ListDirEntryType::Other => "other",
+                            ListDirEntryType::Unspecified => "other",
+                        },
+                        size: e.size,
+                        revision: e.revision,
+                        mode: e.mode,
+                        target: e.target,
+                    })
+                    .collect();
+                captured = Some(ListDirResultJson {
+                    path: r.path,
+                    entries,
+                    truncated: r.truncated,
+                    total_entries: r.total_entries,
+                });
+            }
+            Some(io_server_frame::Payload::Exited(e)) => {
+                if e.exit_code != 0 {
+                    return Err(ApiError::IoStreamFailed {
+                        detail: format!("list_dir exited with {}", e.exit_code),
+                    });
+                }
+                return captured.ok_or(ApiError::IoStreamFailed {
+                    detail: "list_dir session ended without ListDirResult".into(),
+                });
+            }
+            Some(io_server_frame::Payload::Error(err)) => {
+                return Err(map_io_error(&err));
+            }
+            _ => {}
+        }
+    }
+    Err(ApiError::IoStreamFailed {
+        detail: "proxy stream ended without terminal frame".into(),
+    })
+}
+
+/// v1.0.3: open an OpenIoStream for WaitPortListening and collect
+/// the single WaitPortListeningResult sidecar frame.
+async fn wait_port_via_io_stream<S: SandboxService>(
+    state: &Arc<ApiState<S>>,
+    _sandbox_id: &SandboxId,
+    start: IoStart,
+) -> Result<WaitPortListeningResultJson, ApiError> {
+    let (client_tx, client_rx) = mpsc::channel::<IoClientFrame>(2);
+    client_tx
+        .send(IoClientFrame {
+            stream_id: String::new(),
+            payload: Some(io_client_frame::Payload::Start(start)),
+        })
+        .await
+        .ok();
+    drop(client_tx);
+
+    let mut server_rx = state.proxy.open_io_stream(client_rx).await?;
+    let mut captured: Option<WaitPortListeningResultJson> = None;
+    while let Some(frame_res) = server_rx.recv().await {
+        let frame = frame_res?;
+        match frame.payload {
+            Some(io_server_frame::Payload::WaitPortListeningResult(r)) => {
+                captured = Some(WaitPortListeningResultJson {
+                    ready: r.ready,
+                    elapsed_ms: r.elapsed_ms,
+                });
+            }
+            Some(io_server_frame::Payload::Exited(e)) => {
+                if e.exit_code != 0 {
+                    return Err(ApiError::IoStreamFailed {
+                        detail: format!("wait_port_listening exited with {}", e.exit_code),
+                    });
+                }
+                return captured.ok_or(ApiError::IoStreamFailed {
+                    detail: "wait_port_listening session ended without result".into(),
+                });
             }
             Some(io_server_frame::Payload::Error(err)) => {
                 return Err(map_io_error(&err));
@@ -594,6 +866,16 @@ fn map_io_error(err: &open_sandbox_contracts::proxy::IoError) -> ApiError {
         },
         IoErrorCode::SandboxGone => ApiError::SandboxGone {
             sandbox_id: err.detail.clone(),
+        },
+        // v1.0.3: revision mismatch carries the live token in the
+        // detail field (or empty when the file didn't exist).
+        IoErrorCode::RevisionMismatch => ApiError::RevisionMismatch {
+            actual_revision: err.detail.clone(),
+        },
+        // v1.0.3: runtime backend hasn't wired a v1.0.3 capability.
+        // Maps to 501; the agent's detail explains which capability.
+        IoErrorCode::NotImplemented => ApiError::NotImplemented {
+            detail: err.detail.clone(),
         },
         other => ApiError::IoStreamFailed {
             detail: format!("{other}: {}", err.detail),
@@ -642,13 +924,32 @@ fn api_error_response(err: ApiError) -> Response {
         }
         ApiError::IoStreamFailed { .. } => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         ApiError::InvalidState { .. } => (StatusCode::CONFLICT, err.to_string()),
+        // v1.0.3: optimistic-concurrency precondition failed. 409 is
+        // the canonical HTTP code for "the resource exists but its
+        // state didn't match the caller's expectation" — see also
+        // InvalidState above which uses the same status for the
+        // lifecycle-transition precondition.
+        ApiError::RevisionMismatch { .. } => (StatusCode::CONFLICT, err.to_string()),
+        // v1.0.3: runtime capability gap — gateway is fine, agent
+        // can't fulfill yet. 501 (not 500) so SDKs can feature-
+        // detect and fall back without retrying.
+        ApiError::NotImplemented { .. } => (StatusCode::NOT_IMPLEMENTED, err.to_string()),
         ApiError::Internal { .. } => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
     let code = err.error_code();
-    (
-        status,
-        Json(serde_json::json!({"error": message, "error_code": code})),
-    )
-        .into_response()
+    // v1.0.3: revision-mismatch carries an extra structured field
+    // (the live revision token) so the client can refetch + retry
+    // without an extra stat round-trip. Other variants stay on the
+    // legacy {error, error_code} shape.
+    let body = if let ApiError::RevisionMismatch { actual_revision } = &err {
+        serde_json::json!({
+            "error": message,
+            "error_code": code,
+            "actual_revision": actual_revision,
+        })
+    } else {
+        serde_json::json!({"error": message, "error_code": code})
+    };
+    (status, Json(body)).into_response()
 }

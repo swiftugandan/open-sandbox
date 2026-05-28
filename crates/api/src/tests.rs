@@ -407,6 +407,124 @@ async fn create_sandbox_rejects_unknown_pull_policy() {
     );
 }
 
+// ===== v1.0.3: list_dir + wait_port_listening validation =====
+//
+// The full happy-path coverage for these routes (the actual proxy
+// round-trip + ListDirResult / WaitPortListeningResult decoding)
+// lives in the agent crate's drive_list_dir / drive_wait_port_
+// listening unit tests, which exercise the same wire shape end to
+// end. Here we only pin the pre-proxy validation (auth, query/body
+// shape) — exactly the same pattern as the existing read_file and
+// write_file tests above.
+
+#[tokio::test]
+async fn list_dir_rejects_empty_path() {
+    // axum's Query extractor rejects missing required fields before
+    // the handler runs; the empty-string check inside the handler
+    // covers the `path=` (present but empty) case.
+    let (svc, app) = build_app().await;
+    let id = svc.sandbox.sandbox_id.to_string();
+    let req = empty_request("GET", &format!("/v1/sandboxes/{id}/files/list?path="));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error_code"], "INVALID_REQUEST");
+}
+
+#[tokio::test]
+async fn list_dir_rejects_path_traversal() {
+    let (svc, app) = build_app().await;
+    let id = svc.sandbox.sandbox_id.to_string();
+    let req = empty_request(
+        "GET",
+        &format!("/v1/sandboxes/{id}/files/list?path=../../etc/passwd"),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error_code"], "INVALID_REQUEST");
+}
+
+#[tokio::test]
+async fn list_dir_without_auth_returns_401() {
+    let (svc, app) = build_app().await;
+    let id = svc.sandbox.sandbox_id.to_string();
+    let req = empty_request_no_auth(
+        "GET",
+        &format!("/v1/sandboxes/{id}/files/list?path=/workspace"),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn wait_port_listening_without_auth_returns_401() {
+    let (svc, app) = build_app().await;
+    let id = svc.sandbox.sandbox_id.to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/sandboxes/{id}/wait_port_listening"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "port": 8080,
+                "timeout_ms": 3000,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn wait_port_listening_rejects_missing_port() {
+    let (svc, app) = build_app().await;
+    let id = svc.sandbox.sandbox_id.to_string();
+    let req = json_request(
+        "POST",
+        &format!("/v1/sandboxes/{id}/wait_port_listening"),
+        serde_json::json!({"timeout_ms": 3000}),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    // serde rejects missing required field — axum surfaces as 400/422.
+    assert!(
+        resp.status() == StatusCode::BAD_REQUEST
+            || resp.status() == StatusCode::UNPROCESSABLE_ENTITY,
+        "expected 400/422 for missing port, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn write_file_accepts_expected_revision_and_force_fields() {
+    // v1.0.3: WriteFileRequest gains two optional fields. The
+    // parser must not reject a body that includes them; downstream
+    // routing to the (stub) proxy is fine — we just pin the JSON
+    // schema acceptance here.
+    let (svc, app) = build_app().await;
+    let id = svc.sandbox.sandbox_id.to_string();
+    let req = json_request(
+        "POST",
+        &format!("/v1/sandboxes/{id}/files/write_file"),
+        serde_json::json!({
+            "path": "a.txt",
+            "content": "hi",
+            "expected_revision": "1716800123:421",
+            "force": false,
+        }),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    // The stub proxy fails open_io_stream, so we expect 503 (or
+    // 500) NOT 400 — the JSON parsed fine.
+    assert!(
+        resp.status() != StatusCode::BAD_REQUEST
+            && resp.status() != StatusCode::UNPROCESSABLE_ENTITY,
+        "v1.0.3 WriteFileRequest fields must parse; got {}",
+        resp.status()
+    );
+}
+
 // ===== WebSocket auth helper =====
 
 mod ws_auth {

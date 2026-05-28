@@ -42,6 +42,11 @@ pub enum IoErrorCode {
     PayloadTooLarge,
     Cancelled,
     StreamIdReused,
+    // v1.0.3 additions — emitted by the agent on the optimistic-
+    // concurrency path of write_file. The gateway maps these to
+    // 409 Conflict / 501 Not Implemented respectively.
+    RevisionMismatch,
+    NotImplemented,
     /// Catch-all for codes the contract doesn't know about. Senders
     /// should still avoid emitting unknown codes; receivers tolerate
     /// them so a downstream crate that runs v1.0.1 forward-compat keeps
@@ -63,6 +68,8 @@ impl IoErrorCode {
             Self::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
             Self::Cancelled => "CANCELLED",
             Self::StreamIdReused => "STREAM_ID_REUSED",
+            Self::RevisionMismatch => "REVISION_MISMATCH",
+            Self::NotImplemented => "NOT_IMPLEMENTED",
             Self::Other(s) => s.as_str(),
         }
     }
@@ -91,6 +98,8 @@ impl From<&str> for IoErrorCode {
             "PAYLOAD_TOO_LARGE" => Self::PayloadTooLarge,
             "CANCELLED" => Self::Cancelled,
             "STREAM_ID_REUSED" => Self::StreamIdReused,
+            "REVISION_MISMATCH" => Self::RevisionMismatch,
+            "NOT_IMPLEMENTED" => Self::NotImplemented,
             other => Self::Other(other.to_string()),
         }
     }

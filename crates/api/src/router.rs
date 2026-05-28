@@ -145,6 +145,22 @@ pub fn build_router<S: SandboxService>(state: Arc<ApiState<S>>) -> Router {
             "/v1/sandboxes/{id}/files/read-stream",
             get(ws_read_file::ws_read_file::<S>),
         )
+        // v1.0.3: one-level directory listing for the UI file
+        // tree. JSON response; caps at LIST_DIR_MAX_ENTRIES with
+        // a `truncated` flag. Default JSON body cap is fine —
+        // listings are tightly bounded.
+        .route(
+            "/v1/sandboxes/{id}/files/list",
+            get(handlers::list_dir::<S>),
+        )
+        // v1.0.3: TCP-probe the sandbox's host port until the
+        // in-container dev-server is listening or timeout_ms
+        // elapses. Gates the UI's preview-iframe refresh on
+        // watchexec-restart completion.
+        .route(
+            "/v1/sandboxes/{id}/wait_port_listening",
+            post(handlers::wait_port_listening::<S>),
+        )
         // Streaming exec (WebSocket)
         .route("/v1/sandboxes/{id}/exec", get(ws_exec::ws_exec::<S>))
         .with_state(state);

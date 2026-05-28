@@ -6,6 +6,11 @@
 //! Wire shape (server → client only — client sends no frames after
 //! the upgrade handshake):
 //!
+//! - v1.0.3: an optional first WS Text frame carrying a JSON
+//!   `{ "revision": "<opaque>", "size": <u64> }` sidecar — emitted
+//!   when the agent supports `stat_revision`. Clients that don't
+//!   care about revisions (older ws-client builds) ignore Text
+//!   frames and consume only Binary; backwards compatible.
 //! - WS Binary frames carrying raw file bytes, in the order the
 //!   agent emits its 64 KiB stdout chunks.
 //! - WS Close on terminal status:
@@ -196,6 +201,24 @@ async fn pump(
                     .is_err()
                 {
                     // Client gone — nothing left to do.
+                    return;
+                }
+            }
+            // v1.0.3: surface the revision sidecar as a single
+            // JSON Text frame ahead of the first Binary chunk. The
+            // agent guarantees FileMeta arrives before the first
+            // Stdout chunk (CONTRACTS.md), so we don't need to
+            // buffer-and-prepend on the gateway.
+            Some(io_server_frame::Payload::FileMeta(m)) => {
+                let body = serde_json::json!({
+                    "revision": m.revision,
+                    "size": m.size,
+                });
+                if socket
+                    .send(Message::Text(body.to_string().into()))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }

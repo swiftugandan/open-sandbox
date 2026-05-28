@@ -50,6 +50,13 @@ fn default_memory() -> u64 {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WriteFilesResult {
     pub success: bool,
+    /// v1.0.3: opaque revision token for the just-written file, when
+    /// the runtime backend reports it via the FileMeta sidecar.
+    /// `None` for runtimes that haven't wired stat_revision yet —
+    /// callers that need the revision must follow up with
+    /// `GET /files/read` and read the `X-File-Revision` header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 /// Single-file write JSON body. Exactly one of `content` / `content_b64`
@@ -64,6 +71,18 @@ pub struct WriteFileRequest {
     pub content_b64: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// v1.0.3: opaque revision token the caller previously received
+    /// (from the `X-File-Revision` header on read_file, or from a
+    /// prior write's response). When non-empty, the agent compares
+    /// against the file's current revision before writing. Empty
+    /// (the default) preserves v1.0.1 / v1.0.2 "no precondition"
+    /// behavior so existing callers keep working unchanged.
+    #[serde(default)]
+    pub expected_revision: Option<String>,
+    /// v1.0.3: scripted-bulk-write escape hatch. When true the agent
+    /// skips the `expected_revision` precondition. Default false.
+    #[serde(default)]
+    pub force: bool,
 }
 
 impl WriteFileRequest {
@@ -91,6 +110,63 @@ pub struct ReadFileQuery {
     pub path: String,
     #[serde(default)]
     pub cwd: Option<String>,
+}
+
+/// v1.0.3: query shape for the one-level directory listing endpoint
+/// `GET /v1/sandboxes/{id}/files/list?path=&cwd=`. Relative paths
+/// resolve against `cwd`; `cwd` defaults to the runtime's
+/// DEFAULT_WRITE_CWD when omitted.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListDirQuery {
+    pub path: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// v1.0.3: directory entry shape on the wire. `type` is one of
+/// "file" / "dir" / "symlink" / "other". `target` is only populated
+/// for symlinks; omitted otherwise.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ListDirEntryJson {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub size: u64,
+    pub revision: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub target: String,
+}
+
+/// v1.0.3: response body for `GET /files/list`. Hard-capped at
+/// `LIST_DIR_MAX_ENTRIES`; `truncated` flags the cap; `total_entries`
+/// reports the underlying readdir count.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ListDirResultJson {
+    pub path: String,
+    pub entries: Vec<ListDirEntryJson>,
+    pub truncated: bool,
+    pub total_entries: u64,
+}
+
+/// v1.0.3: request body for `POST /v1/sandboxes/{id}/wait_port_listening`.
+/// `port` is the in-container port the caller observed (informational
+/// — the agent resolves to its host-side port via SandboxManager).
+/// `timeout_ms` is clamped server-side to
+/// `WAIT_PORT_LISTENING_MAX_TIMEOUT_MS`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitPortListeningRequest {
+    pub port: u32,
+    pub timeout_ms: u32,
+}
+
+/// v1.0.3: response body for `POST /wait_port_listening`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WaitPortListeningResultJson {
+    pub ready: bool,
+    pub elapsed_ms: u32,
 }
 
 /// v1.0.2: transition response returned by PauseSandbox / UnpauseSandbox.
