@@ -1193,12 +1193,33 @@ async fn exec_collect_stdout(
 
     let mut handle = handle;
     drop(handle.stdin);
+    // Bound the in-memory buffer so a directory with millions of
+    // entries can't OOM the agent before parse_ls_lan_output gets a
+    // chance to apply the LIST_DIR_MAX_ENTRIES cap. Sized at
+    // `LIST_DIR_MAX_ENTRIES * MAX_ENTRY_LINE_BYTES` so we have
+    // comfortable headroom over the realistic per-entry size
+    // (mode+links+uid+gid+size+mtime+name+symlink-target ≈
+    // 50–200 bytes/line).
+    const MAX_ENTRY_LINE_BYTES: usize = 512;
+    let max_stdout_bytes = LIST_DIR_MAX_ENTRIES * MAX_ENTRY_LINE_BYTES;
     let mut stdout: Vec<u8> = Vec::new();
     while let Some(chunk) = handle.stdout.recv().await {
+        if stdout.len().saturating_add(chunk.len()) > max_stdout_bytes {
+            return Err(ListExecError::Other(format!(
+                "exec stdout exceeded {max_stdout_bytes}-byte cap"
+            )));
+        }
         stdout.extend_from_slice(&chunk);
     }
     let mut stderr: Vec<u8> = Vec::new();
     while let Some(chunk) = handle.stderr.recv().await {
+        // Same cap shape on stderr — busybox can emit a per-entry
+        // warning that doesn't gate the success path but still
+        // burns memory if uncapped. Use a smaller cap (64KiB).
+        const MAX_STDERR_BYTES: usize = 64 * 1024;
+        if stderr.len().saturating_add(chunk.len()) > MAX_STDERR_BYTES {
+            break;
+        }
         stderr.extend_from_slice(&chunk);
     }
     let info = handle.exited.await.map_err(|_| {
@@ -1208,11 +1229,14 @@ async fn exec_collect_stdout(
     if info.exit_code == 0 {
         Ok(stdout)
     } else {
+        // Tightened from a looser `contains("not found")` —
+        // see the v2 code-review pass. "command not found" /
+        // "executable file not found in $PATH" (the OCI runtime's
+        // missing-binary diagnostic) MUST NOT be folded into
+        // FILE_NOT_FOUND, or callers would treat a missing `ls`
+        // binary on a scratch image as a missing directory.
         let stderr_text = String::from_utf8_lossy(&stderr);
-        if stderr_text.contains("No such file")
-            || stderr_text.contains("cannot access")
-            || stderr_text.contains("not found")
-        {
+        if stderr_text.contains("No such file") || stderr_text.contains("cannot access") {
             Err(ListExecError::NotFound)
         } else {
             Err(ListExecError::Other(format!(
@@ -1270,17 +1294,48 @@ fn parse_ls_lan_output(stdout: &[u8], dir_path: &str) -> Result<DirListing, Agen
 
 /// Parse a single `ls -lAn` line. Returns None on malformed input.
 fn parse_ls_entry_line(line: &str) -> Option<DirEntry> {
-    // Columns 0..=5 are fixed-shape; the name starts at column 6 and
-    // may contain spaces (preserved by splitn). For symlinks the
-    // name field also contains ` -> target`.
-    let mut cols = line.splitn(7, char::is_whitespace).filter(|s| !s.is_empty());
-    let mode_str = cols.next()?;
-    let _links = cols.next()?;
-    let _uid = cols.next()?;
-    let _gid = cols.next()?;
-    let size_str = cols.next()?;
-    let mtime_str = cols.next()?;
-    let name_field = cols.next()?;
+    // Real-world `ls -lAn` output right-justifies numeric columns
+    // (links, uid, gid, size) — runs of spaces appear between them
+    // whenever column widths vary. Walk the line manually: skip
+    // leading whitespace, take six whitespace-delimited tokens,
+    // then capture everything after the sixth column's trailing
+    // whitespace as the name field (which may itself contain
+    // spaces, OR be `<name> -> <target>` for symlinks).
+    //
+    // A naive `split_whitespace` + `line.find(token)` recovery is
+    // broken for filenames that match an earlier column (e.g. a
+    // file literally named "1000" matching the uid column).
+    let mut cursor = 0usize;
+    let bytes = line.as_bytes();
+    let take_token = |cursor: &mut usize| -> Option<&str> {
+        // Skip leading whitespace.
+        while *cursor < bytes.len() && bytes[*cursor].is_ascii_whitespace() {
+            *cursor += 1;
+        }
+        let start = *cursor;
+        while *cursor < bytes.len() && !bytes[*cursor].is_ascii_whitespace() {
+            *cursor += 1;
+        }
+        if start == *cursor {
+            None
+        } else {
+            Some(&line[start..*cursor])
+        }
+    };
+    let mode_str = take_token(&mut cursor)?;
+    let _links = take_token(&mut cursor)?;
+    let _uid = take_token(&mut cursor)?;
+    let _gid = take_token(&mut cursor)?;
+    let size_str = take_token(&mut cursor)?;
+    let mtime_str = take_token(&mut cursor)?;
+    // Skip one run of whitespace and use the rest as the name field.
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= bytes.len() {
+        return None;
+    }
+    let name_field = &line[cursor..];
 
     let kind_char = mode_str.chars().next()?;
     let entry_type = match kind_char {
@@ -1302,10 +1357,8 @@ fn parse_ls_entry_line(line: &str) -> Option<DirEntry> {
         (name_field.to_string(), String::new())
     };
 
-    // Mode bits as octal — drop the type char and convert the rest
-    // ("rwxr-xr-x" style) to a numeric "0755" via the standard
-    // mapping. The contract just requires an octal-formatted string;
-    // most callers display it as-is.
+    // Mode bits as octal — see mode_string_to_octal for the
+    // setuid/setgid/sticky-bit handling.
     let mode = mode_string_to_octal(mode_str).unwrap_or_else(|| mode_str.to_string());
 
     let size: u64 = size_str.parse().unwrap_or(0);
@@ -1323,8 +1376,10 @@ fn parse_ls_entry_line(line: &str) -> Option<DirEntry> {
 }
 
 /// Convert an `ls -l`-style permission string like "drwxr-xr-x" or
-/// "-rw-r--r--" to a 4-character octal mode string like "0755" or
-/// "0644". Returns None on malformed input.
+/// "-rwsr-xr-t" to a 4-character octal mode string. The first
+/// digit captures setuid (4), setgid (2), and sticky (1) bits; the
+/// trailing three digits are the per-class rwx triplets. Returns
+/// None on malformed input.
 fn mode_string_to_octal(mode_str: &str) -> Option<String> {
     if mode_str.len() < 10 {
         return None;
@@ -1333,7 +1388,23 @@ fn mode_string_to_octal(mode_str: &str) -> Option<String> {
     let owner = mode_triplet(&bytes[1..4])?;
     let group = mode_triplet(&bytes[4..7])?;
     let other = mode_triplet(&bytes[7..10])?;
-    Some(format!("0{}{}{}", owner, group, other))
+    // High nibble — setuid (4) from owner's execute slot, setgid
+    // (2) from group's, sticky (1) from other's. ls signals each
+    // via the corresponding letter in the execute position:
+    //   's' / 'S' on owner → setuid (with / without execute)
+    //   's' / 'S' on group → setgid
+    //   't' / 'T' on other → sticky
+    let mut high = 0u8;
+    if matches!(bytes[3], b's' | b'S') {
+        high |= 4;
+    }
+    if matches!(bytes[6], b's' | b'S') {
+        high |= 2;
+    }
+    if matches!(bytes[9], b't' | b'T') {
+        high |= 1;
+    }
+    Some(format!("{high}{owner}{group}{other}"))
 }
 
 fn mode_triplet(bytes: &[u8]) -> Option<u8> {
@@ -1674,6 +1745,24 @@ mod parser_tests {
     }
 
     #[test]
+    fn mode_string_to_octal_preserves_setuid_setgid_sticky() {
+        // setuid binary with execute (s).
+        assert_eq!(mode_string_to_octal("-rwsr-xr-x").as_deref(), Some("4755"));
+        // setuid no execute (S) — bit set, owner execute clear.
+        assert_eq!(mode_string_to_octal("-rwSr-xr-x").as_deref(), Some("4655"));
+        // setgid binary with execute.
+        assert_eq!(mode_string_to_octal("-rwxr-sr-x").as_deref(), Some("2755"));
+        // setgid no execute.
+        assert_eq!(mode_string_to_octal("-rwxr-Sr-x").as_deref(), Some("2745"));
+        // sticky dir with execute (t).
+        assert_eq!(mode_string_to_octal("drwxr-xr-t").as_deref(), Some("1755"));
+        // sticky no execute (T).
+        assert_eq!(mode_string_to_octal("drwxr-xr-T").as_deref(), Some("1754"));
+        // setuid + setgid + sticky together.
+        assert_eq!(mode_string_to_octal("-rwsr-sr-t").as_deref(), Some("7755"));
+    }
+
+    #[test]
     fn mode_string_to_octal_rejects_short_input() {
         assert!(mode_string_to_octal("-rwx").is_none());
     }
@@ -1689,6 +1778,39 @@ mod parser_tests {
         assert_eq!(e.revision, "1716800200:421");
         assert_eq!(e.mode, "0644");
         assert_eq!(e.target, "");
+    }
+
+    #[test]
+    fn parse_ls_entry_line_handles_right_aligned_columns() {
+        // Real ls right-justifies numeric columns: when sibling
+        // files have widely varying sizes ls pads the narrower
+        // ones with leading spaces. The parser must collapse runs
+        // of whitespace between columns.
+        let line = "-rw-r--r--   1 1000 1000  421 1716800200 README.md";
+        let e = parse_ls_entry_line(line).expect("right-aligned line parses");
+        assert_eq!(e.name, "README.md");
+        assert_eq!(e.size, 421);
+        assert_eq!(e.revision, "1716800200:421");
+    }
+
+    #[test]
+    fn parse_ls_entry_line_preserves_filename_matching_earlier_column() {
+        // A file literally named "1000" must not collide with the
+        // uid/gid columns when the parser recovers the name field.
+        // The cursor-based extraction (not substring-match) is the
+        // fix; this regression test pins the corner case.
+        let line = "-rw-r--r-- 1 1000 1000 4 1716800200 1000";
+        let e = parse_ls_entry_line(line).expect("parses");
+        assert_eq!(e.name, "1000");
+        assert_eq!(e.size, 4);
+        assert_eq!(e.revision, "1716800200:4");
+    }
+
+    #[test]
+    fn parse_ls_entry_line_preserves_filename_with_spaces() {
+        let line = "-rw-r--r-- 1 1000 1000 7 1716800200 hello world.txt";
+        let e = parse_ls_entry_line(line).expect("parses");
+        assert_eq!(e.name, "hello world.txt");
     }
 
     #[test]

@@ -24,6 +24,27 @@ the contracts/v1.0.3 surface (commits `b80a0ca..` on
 | 8 | `crates/agent/Cargo.toml` `[dependencies] tokio` was missing the `net` feature even though `drive_wait_port_listening` calls `tokio::net::TcpStream::connect`. Workspace builds compiled by feature-unification leak only. | Same commit. |
 | 9 | `impl<R: ContainerRuntime> HostPortLookup for SandboxManager<R>` had no explicit `where R: Send + Sync + 'static` bound; relied transitively on `ContainerRuntime`'s supertrait. | Same commit. |
 
+## Closed in the third code-review pass
+
+| # | Finding | Closing commit |
+|---|---|---|
+| 10 | `parse_ls_entry_line` used `splitn(7, char::is_whitespace).filter(...)` which silently dropped lines whenever ls right-justified a numeric column (real ls output collapses to runs of spaces between columns). | `fix(agent-docker): close v3 code-review findings` |
+| 11 | `mode_string_to_octal` emitted a fixed-leading-zero 4-char string and never carried the setuid / setgid / sticky bits — a 0o4755 setuid binary reported as `"0755"`, cross-runtime asymmetric with youki which preserved all four nibbles. | Same commit. |
+| 12 | `exec_collect_stdout` buffered child stdout into an unbounded `Vec<u8>` — an adversarial directory with millions of entries OOM'd the agent before parse_ls_lan_output applied its LIST_DIR_MAX_ENTRIES cap. | Same commit. |
+| 13 | `exec_collect_stdout`'s NotFound classifier matched on `"not found"`, folding the OCI runtime's `"executable file not found in $PATH"` into FILE_NOT_FOUND. Tightened to `"No such file"` / `"cannot access"` only. | Same commit. |
+| 14 | `drive_write_file` returned early on REVISION_MISMATCH / NOT_IMPLEMENTED / write-error without draining pipelined `client_frames`, leaving Stdin frames queued on the demux and head-of-line-blocking other multiplexed sessions on the same tunnel. | Same commit. |
+| 15 | `stat_revision_in_ns` (youki) used `symlink_metadata` while agent-docker's `stat -c "%Y %s"` follows symlinks by default. A symlink path returned different revisions across runtimes, breaking the cross-runtime continuity claim. Aligned youki to use `std::fs::metadata` (follows symlinks). | Same commit. |
+
+## Deferred to a v1.0.3 follow-up (or v1.1)
+
+| # | Finding | Plan |
+|---|---|---|
+| 16 | agent-docker `list_dir` uses `ls --time-style=+%s`, a GNU coreutils flag busybox rejects. Alpine sandboxes get LIST_DIR_FAILED with a cryptic stderr message. | Add a busybox-detection probe + fallback parser (or a `find -exec stat` pipeline). Deferred — most production sandbox images use coreutils-based distros. |
+| 17 | `drive_read_file` now ALWAYS issues a `runtime.stat_revision()` round trip even when the caller would discard the FileMeta sidecar. Adds latency for v1.0.2-shaped callers. | Add an opt-in `with_revision: bool` to `ReadFileParams` (additive proto change, low risk) in a v1.0.4 amendment. |
+| 18 | `WaitPortListeningResult.elapsed_ms` is clamped to the server-clamped `timeout_ms`, not the caller's original value. A caller asking for 600s gets `elapsed_ms <= 300_000` with no signal that the platform cap was hit. | Either document the clamp behavior in CONTRACTS.md as part of the v1.0.3 surface, or add a sentinel `clamped: bool` field on the result. |
+| 19 | `mtime`-second granularity opens a sub-1s TOCTOU window for optimistic writes (writer A reads at second T, writer B writes between A's read and A's write at second T, A's expected_revision still matches). | Either bump revision encoding to `<mtime_nanos>:<size>` (a wire-format change but additive to the opaque-string contract) or add a `<size>:<inode>` component. v1.1+. |
+| 20 | Cross-runtime divergence in `total_entries` semantics: agent-docker counts only parseable ls lines; agent-youki counts every readdir entry. | Tighten the trait contract in CONTRACTS.md to "every entry the runtime saw, including ones it couldn't fully describe" and align both impls. |
+
 ## Deferred design decisions (P4 — to revisit before groups B / C land)
 
 These are not blockers but want a deliberate call rather than letting the

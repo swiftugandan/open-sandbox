@@ -346,9 +346,15 @@ pub async fn list_dir_in_ns(
 
 /// v1.0.3: stat a single path inside the container's mount
 /// namespace and return the agent's opaque revision token.
-/// Reference encoding: `<mtime_secs>:<size>`. Matches the agent-
-/// docker shell-exec'd `stat` output 1:1 so a sandbox migrated
-/// between runtimes mid-session retains revision continuity.
+/// Reference encoding: `<mtime_secs>:<size>`. Matches the
+/// agent-docker shell-exec'd `stat -c "%Y %s"` output 1:1 so a
+/// sandbox migrated between runtimes mid-session retains revision
+/// continuity. Specifically: both runtimes FOLLOW symlinks here,
+/// so `stat_revision("link")` returns the target's mtime/size,
+/// not the link's. (`list_dir`'s per-entry revision is the
+/// opposite — symlinks there carry the LINK's metadata so the UI
+/// can render a symlink tree with stable revisions regardless of
+/// where the target lives.)
 pub async fn stat_revision_in_ns(
     target_pid: i32,
     path: String,
@@ -356,7 +362,12 @@ pub async fn stat_revision_in_ns(
     use std::os::unix::fs::MetadataExt;
 
     run_in_container_mount_ns(target_pid, move || {
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| match e.kind() {
+        // `metadata` follows symlinks; `symlink_metadata` does
+        // not. Use the former here to match GNU `stat` (which
+        // also follows by default) so the revision computed by
+        // read_file's sidecar lines up with what write_file's
+        // precondition check stats.
+        let meta = std::fs::metadata(&path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => AgentError::Runtime {
                 detail: format!("No such file: {path}"),
             },

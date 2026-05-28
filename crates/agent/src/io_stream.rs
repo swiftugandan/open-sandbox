@@ -866,13 +866,13 @@ async fn drive_write_file<R, S>(
                 // Stale revision. Surface as an IoError with the
                 // actual revision in the detail so the gateway can
                 // bubble up a `409 Conflict` with the live token.
-                send_error(
-                    &server_tx,
-                    &stream_id,
-                    "REVISION_MISMATCH",
-                    &rev.revision,
-                )
-                .await;
+                send_error(&server_tx, &stream_id, "REVISION_MISMATCH", &rev.revision)
+                    .await;
+                // The caller's SDK may already be pipelining Stdin
+                // frames toward this session — drain them so the
+                // demux's bounded channel doesn't head-of-line block
+                // other multiplexed sessions on the same tunnel.
+                drain_remaining_client_frames(&mut client_frames).await;
                 return;
             }
             Err(AgentError::Runtime { detail })
@@ -888,6 +888,7 @@ async fn drive_write_file<R, S>(
                      bypass.",
                 )
                 .await;
+                drain_remaining_client_frames(&mut client_frames).await;
                 return;
             }
             Err(AgentError::Runtime { detail }) if detail.contains("No such file") => {
@@ -896,10 +897,12 @@ async fn drive_write_file<R, S>(
                 // "absent" actual revision so the gateway maps to
                 // 409 in the same way as a stale revision.
                 send_error(&server_tx, &stream_id, "REVISION_MISMATCH", "").await;
+                drain_remaining_client_frames(&mut client_frames).await;
                 return;
             }
             Err(e) => {
                 send_error(&server_tx, &stream_id, "WRITE_FAILED", &e.to_string()).await;
+                drain_remaining_client_frames(&mut client_frames).await;
                 return;
             }
         }
@@ -1089,6 +1092,29 @@ async fn send_error(
 
 async fn cleanup<R: ContainerRuntime>(runtime: &R, registry: &ExecRegistry, stream_id: &str) {
     on_stream_closed(runtime, registry, stream_id, EXEC_KILL_GRACE).await;
+}
+
+/// v1.0.3: drain any remaining client frames after an early-return
+/// error in `drive_write_file` (or any future single-shot handler
+/// whose caller may have pipelined frames). Without this drain, the
+/// per-stream sender on the proxy-tunnel demux blocks indefinitely
+/// — head-of-line-blocking every other multiplexed session on the
+/// same agent tunnel.
+///
+/// `client_frames` is consumed; this never panics on a closed
+/// channel — it just exits when `.next()` returns None.
+async fn drain_remaining_client_frames<S>(client_frames: &mut S)
+where
+    S: Stream<Item = Result<IoClientFrame, AgentError>> + Unpin,
+{
+    while client_frames.next().await.is_some() {
+        // Discard. The drain runs in the same task as the rest of
+        // drive_write_file's tail, so it doesn't escalate from
+        // "task ending" to "task lingering forever" — once the
+        // proxy demux closes its sender (either because the gateway
+        // closed its WS, or after a small EOF window), .next()
+        // resolves to None and we return.
+    }
 }
 
 // =====================================================================
