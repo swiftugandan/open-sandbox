@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import {
   Check,
   Copy,
+  Edit3,
   ExternalLink,
   FileText,
   Info,
@@ -14,16 +15,20 @@ import type { ApiConfig, Sandbox, SandboxStatus } from "@/lib/api";
 import { isRunningStatus, publicUrl } from "@/lib/api";
 import { ExecTerminal } from "@/components/exec-terminal";
 import { FilesPanel } from "@/components/files-panel";
+import { LiveEditPanel } from "@/components/live-edit-panel";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
 
-type Tab = "exec" | "files" | "info";
+type Tab = "exec" | "edit" | "files" | "info";
 const TABS: {
   id: Tab;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
   { id: "exec", label: "Exec", icon: Terminal },
+  // v1.0.3 live-edit: tree + CodeMirror tabbed editor. Preview
+  // iframe lands here too once D13 ships.
+  { id: "edit", label: "Edit", icon: Edit3 },
   { id: "files", label: "Files", icon: FileText },
   { id: "info", label: "Info", icon: Info },
 ];
@@ -110,6 +115,9 @@ export function RightPane({
             sandboxStatus={sandbox.status}
             onUrlExpectedChange={onUrlExpectedChange}
           />
+        </div>
+        <div className={cn("h-full", tab !== "edit" && "hidden")}>
+          <LiveEditPanel config={config} sandboxId={sandbox.sandbox_id} />
         </div>
         <div className={cn("h-full", tab !== "files" && "hidden")}>
           <FilesPanel config={config} sandboxId={sandbox.sandbox_id} />
