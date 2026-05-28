@@ -195,7 +195,7 @@ The proxy's gRPC service, renamed in v1.0 from `TunnelService` to reflect its br
   - `PROXY_STARTUP_RETRY_ATTEMPTS`: 15 attempts
   - `PROXY_STARTUP_RETRY_INTERVAL`: 2 seconds
   - `DEFAULT_WRITE_CWD`: `/home` (default target directory for file writes when no explicit cwd is provided)
-  - `DEFAULT_SANDBOX_ENTRYPOINT`: `["sleep", "infinity"]` (overrides image CMD/ENTRYPOINT to keep sandbox idle for exec-based interaction)
+  - `DEFAULT_SANDBOX_ENTRYPOINT`: `["sh", "-c", "mkdir -p /workspace 2>/dev/null; exec sleep infinity"]` (overrides image CMD/ENTRYPOINT to keep sandbox idle for exec-based interaction; pre-creates `/workspace` so the Edit tab's file tree opens to an existing directory, fail-open on read-only/non-writable `/`. Assumes `/bin/sh` is on PATH — distroless / scratch images without a shell fail to start; per-sandbox entrypoint override is deferred)
   - `WS_IDLE_PING_INTERVAL`: 30 seconds (gateway → client WebSocket ping cadence on idle exec sessions)
   - `WS_IDLE_PING_TIMEOUT`: 60 seconds (peer-gone threshold; triggers ExecRegistry cleanup)
   - `EXEC_KILL_GRACE`: 5 seconds (between SIGTERM and SIGKILL when the registry hook fires)

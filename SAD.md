@@ -205,7 +205,7 @@ Reverse tunnel setup:
 **Internal structure.**
 - `controller_client` — gRPC client maintaining the bidi stream to the controller (registration, heartbeats, receiving commands)
 - `proxy_client` — gRPC client maintaining the reverse tunnel to the proxy (receiving forwarded requests)
-- `sandbox_manager` — manages OCI container lifecycle via the `ContainerRuntime` trait. Production: `YoukiRuntime` (libcontainer + CNI + oci-client). Development: `DockerRuntime` (bollard). Both runtimes pull images before container creation. Both runtimes override the container entrypoint to `["sleep", "infinity"]`, keeping sandboxes idle for exec-based interaction.
+- `sandbox_manager` — manages OCI container lifecycle via the `ContainerRuntime` trait. Production: `YoukiRuntime` (libcontainer + CNI + oci-client). Development: `DockerRuntime` (bollard). Both runtimes pull images before container creation. Both runtimes override the container entrypoint to `["sh", "-c", "mkdir -p /workspace 2>/dev/null; exec sleep infinity"]`, keeping sandboxes idle for exec-based interaction and pre-creating `/workspace` (the Edit-tab tree root) fail-open on read-only/non-writable `/`.
 - `image_manager` — pulls and unpacks OCI images from registries via `oci-client` (production runtime only)
 - `cni_manager` — invokes CNI plugins (bridge, portmap, loopback) for container networking and dynamic port allocation (production runtime only)
 - `tunnel_forwarder` — receives virtual streams from the proxy, connects them to local sandbox ports

@@ -52,10 +52,11 @@ export function PreviewPane({
     return `${publicUrl}${sep}__t=${reloadKey}`;
   }, [publicUrl, reloadKey]);
 
-  // v1.0.3: copy URL to clipboard. Matches the SandboxUrlBar's
-  // copy affordance from right-pane.tsx (kept for other tabs)
-  // so users on the Edit tab have parity. Clears the "copied"
-  // indicator after 1.5s.
+  // v1.0.3: copy the sandbox's public URL to the clipboard. This is
+  // now the only in-UI copy affordance for the URL (the previous
+  // top-of-pane URL bar was removed in commit 7208938); other tabs
+  // surface the URL only via the sandbox-list / Info JSON. Clears
+  // the "copied" indicator after 1.5s.
   const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (!copied) return;

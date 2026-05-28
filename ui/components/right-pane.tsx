@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Edit3, Info, ListChecks, Terminal } from "lucide-react";
 import type { ApiConfig, Sandbox } from "@/lib/api";
 import { ExecTerminal } from "@/components/exec-terminal";
@@ -45,9 +45,26 @@ export function RightPane({
   // request against the sandbox's public URL even when the user
   // is on a different tab. Reset on sandbox change so a fresh
   // sandbox starts with no Edit-tab side-effects.
+  // Lazy-mount semantics:
+  //   * mount LiveEditPanel only after the user has visited the Edit
+  //     tab at least once for this sandbox (avoids the iframe firing
+  //     network requests against the public URL on every save-chain
+  //     reload when the user is on Exec / Info)
+  //   * once mounted, stay mounted across tab switches so the
+  //     editor's open-tab list and dirty buffers survive a peek at
+  //     Exec / Info
+  //   * reset on sandbox change so a fresh sandbox starts clean,
+  //     UNLESS the user happens to be on the Edit tab when they
+  //     switch — in that case we want LiveEditPanel mounted
+  //     immediately, not blank-pane-until-next-tab-click.
+  // The tab-ref read lets the sandbox-change effect peek at the
+  // current tab without taking it as a dep (which would un-throttle
+  // the reset and undo the "stay mounted across tab switches" half).
   const [editTabEverVisited, setEditTabEverVisited] = useState(false);
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
   useEffect(() => {
-    setEditTabEverVisited(false);
+    setEditTabEverVisited(tabRef.current === "edit");
   }, [sandbox?.sandbox_id]);
   useEffect(() => {
     if (tab === "edit") setEditTabEverVisited(true);

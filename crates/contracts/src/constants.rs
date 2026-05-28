@@ -79,6 +79,13 @@ pub const DEFAULT_WRITE_CWD: &str = "/home";
 /// (`DEFAULT_TREE_ROOT` in the UI, also the convention every
 /// quickstart template uses) so the file tree shows an existing
 /// (possibly empty) directory before any user-supplied process runs.
+/// The `; exec sleep infinity` uses a sequence-separator (not `&&`)
+/// so a failed mkdir — image runs as non-root and `/` is not
+/// writable, or rootfs is read-only — does NOT tear down the
+/// container. The sandbox still enters running state with PID 1 as
+/// sleep; the Edit tab in that case lists an empty /workspace via
+/// the file tree's missing-dir empty state. Fail open, not closed.
+///
 /// `exec sleep infinity` replaces the shell with sleep so signals
 /// (SIGTERM on stop) propagate to PID 1 as expected.
 ///
@@ -87,7 +94,7 @@ pub const DEFAULT_WRITE_CWD: &str = "/home";
 /// without a shell will fail to start; users of those images must
 /// override via a future per-sandbox `entrypoint` config (deferred).
 pub const DEFAULT_SANDBOX_ENTRYPOINT: &[&str] =
-    &["sh", "-c", "mkdir -p /workspace && exec sleep infinity"];
+    &["sh", "-c", "mkdir -p /workspace 2>/dev/null; exec sleep infinity"];
 
 // v1.0.2 (closes comp-0 subdomain hardcoded-12 finding): single source of
 // truth for the sandbox-subdomain length. SandboxId::subdomain() and the

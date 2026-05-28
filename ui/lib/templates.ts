@@ -41,8 +41,14 @@ export const TEMPLATES: readonly Template[] = [
     image: "python:3.12-alpine",
     // Seed /workspace/index.html, then serve /workspace on :8080.
     // python -m http.server uses cwd as the doc root.
+    //
+    // `exec` on the final command replaces the wrapping sh, so the
+    // exec session's recorded PID points at python3 directly. A
+    // SIGTERM from the agent on WS disconnect (spike-01 / ADR-006)
+    // then reaches python3 instead of an outer sh whose dying-child
+    // (python3) would be orphaned to PID 1 and survive.
     execCommand:
-      'sh -c "mkdir -p /workspace && cd /workspace && echo \'<h1>hello from open-sandbox — edit /workspace/index.html</h1>\' > index.html && python3 -m http.server 8080"',
+      'sh -c "mkdir -p /workspace && cd /workspace && echo \'<h1>hello from open-sandbox — edit /workspace/index.html</h1>\' > index.html && exec python3 -m http.server 8080"',
     exposedPort: 8080,
     description:
       "python http.server serving /workspace on :8080. Edit /workspace/index.html.",
@@ -60,8 +66,12 @@ export const TEMPLATES: readonly Template[] = [
     // `node --watch` (stable since Node 20) restarts the process
     // when any required source file changes — so saving server.js
     // in the Edit tab reloads the server on the next request.
+    //
+    // `exec` on the final command replaces sh with node, so SIGTERM
+    // from the agent reaches the watcher directly; node --watch then
+    // cleans up its child fork on shutdown.
     execCommand:
-      `sh -c 'mkdir -p /workspace && cd /workspace && printf "%s\\n" "const http = require(\\"http\\");" "http.createServer((q, r) => r.end(\\"hi from node — edit /workspace/server.js\\")).listen(8080);" > server.js && node --watch server.js'`,
+      `sh -c 'mkdir -p /workspace && cd /workspace && printf "%s\\n" "const http = require(\\"http\\");" "http.createServer((q, r) => r.end(\\"hi from node — edit /workspace/server.js\\")).listen(8080);" > server.js && exec node --watch server.js'`,
     exposedPort: 8080,
     description:
       "Node HTTP server on :8080 with --watch. Edit /workspace/server.js; save reloads.",
@@ -75,7 +85,7 @@ export const TEMPLATES: readonly Template[] = [
     // proxy's default port wiring catches it) and serve /workspace
     // (so the Edit tab and the public URL stay aligned).
     execCommand:
-      "sh -c \"mkdir -p /workspace && echo '<h1>hello from nginx — edit /workspace/index.html</h1>' > /workspace/index.html && sed -i 's|listen       80;|listen       8080;|; s|/usr/share/nginx/html|/workspace|' /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'\"",
+      "sh -c \"mkdir -p /workspace && echo '<h1>hello from nginx — edit /workspace/index.html</h1>' > /workspace/index.html && sed -i 's|listen       80;|listen       8080;|; s|/usr/share/nginx/html|/workspace|' /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'\"",
     exposedPort: 8080,
     description:
       "nginx serving /workspace on :8080. Edit /workspace/index.html.",
@@ -89,14 +99,23 @@ export const TEMPLATES: readonly Template[] = [
     // sh. Writes /workspace/app.py, then pip-installs Flask and runs
     // the script.
     //
-    // `debug=True` enables Flask's stat-based reloader, which forks
-    // a child process and restarts it on app.py changes — so saving
-    // in the Edit tab refreshes the route on the next request.
+    // `use_reloader=True, use_debugger=False` enables Werkzeug's
+    // stat-based reloader (so saving app.py reloads the route on
+    // the next request) WITHOUT enabling Werkzeug's interactive
+    // debugger. The debugger would expose source tracebacks and a
+    // PIN-gated arbitrary-Python-eval console over the public URL —
+    // PINs are deterministic from machine state and brute-forceable
+    // in seconds inside a known image. Splitting the two flags
+    // gives the user the dev ergonomics without the RCE surface.
+    //
+    // `exec` on the final command replaces sh with python3 so the
+    // agent's SIGTERM reaches the reloader parent directly; the
+    // parent then takes the reloader child down on its way out.
     execCommand:
-      `sh -c 'mkdir -p /workspace && cd /workspace && printf "%s\\n" "from flask import Flask" "a = Flask(__name__)" "@a.route(\\"/\\")" "def hi(): return \\"hi from flask — edit /workspace/app.py\\"" "a.run(host=\\"0.0.0.0\\", port=8080, debug=True)" > app.py && pip install --quiet flask && python3 app.py'`,
+      `sh -c 'mkdir -p /workspace && cd /workspace && printf "%s\\n" "from flask import Flask" "a = Flask(__name__)" "@a.route(\\"/\\")" "def hi(): return \\"hi from flask — edit /workspace/app.py\\"" "a.run(host=\\"0.0.0.0\\", port=8080, use_reloader=True, use_debugger=False)" > app.py && pip install --quiet flask && exec python3 app.py'`,
     exposedPort: 8080,
     description:
-      "Flask app on :8080 with debug reloader. Edit /workspace/app.py; save reloads.",
+      "Flask app on :8080 with reloader. Edit /workspace/app.py; save reloads.",
   },
   {
     id: "shell",
