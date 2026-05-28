@@ -1021,6 +1021,93 @@ done
         parse_portable_list_output(&stdout, &resolved)
     }
 
+    async fn wait_port_listening(
+        &self,
+        id: &ContainerId,
+        port: u32,
+        timeout: Duration,
+    ) -> Result<bool, AgentError> {
+        // Probe inside the container's network namespace via
+        // `docker exec sh -c 'nc -z ... in a poll loop'`. The host-
+        // port-from-host probe is unreliable on Docker Desktop —
+        // see the trait doc comment on wait_port_listening for
+        // detail.
+        //
+        // The shell loop polls `nc -z 127.0.0.1 <port>` every 50ms
+        // and exits 0 the moment a listener is detected, or exits
+        // 1 when `iterations` polls have all failed. `nc -z` is
+        // supported by both BusyBox and GNU netcat.
+        //
+        // 50ms cadence × (timeout_ms / 50) iterations bounds total
+        // duration to ~timeout_ms; small overshoot from sleep
+        // granularity is acceptable.
+        let timeout_ms = timeout.as_millis().max(50) as u64;
+        let iterations = (timeout_ms / 50).max(1);
+        let script = format!(
+            "i=0; while [ $i -lt {iterations} ]; do \
+             nc -z 127.0.0.1 {port} 2>/dev/null && echo OSB:READY && exit 0; \
+             i=$((i+1)); sleep 0.05; done; \
+             echo OSB:TIMEOUT; exit 1"
+        );
+        let handle = self
+            .start_exec(
+                id,
+                ExecStart {
+                    command: vec!["sh".into(), "-c".into(), script],
+                    cwd: String::new(),
+                    env: HashMap::new(),
+                },
+            )
+            .await?;
+        let mut handle = handle;
+        drop(handle.stdin);
+        // Drain stdout and check for the OSB:READY sentinel rather
+        // than relying solely on exit code — if the container's
+        // image lacks nc the exec fails with 127 and we want to
+        // surface a typed error so the caller can fall back.
+        let mut stdout: Vec<u8> = Vec::new();
+        while let Some(chunk) = handle.stdout.recv().await {
+            stdout.extend_from_slice(&chunk);
+            if stdout.len() > 1024 {
+                break;
+            }
+        }
+        let mut stderr: Vec<u8> = Vec::new();
+        while let Some(chunk) = handle.stderr.recv().await {
+            stderr.extend_from_slice(&chunk);
+            if stderr.len() > 4096 {
+                break;
+            }
+        }
+        let info = handle.exited.await.map_err(|_| AgentError::Runtime {
+            detail: "wait_port_listening probe terminated without exit info".into(),
+        })?;
+        let stdout_text = String::from_utf8_lossy(&stdout);
+        if stdout_text.contains("OSB:READY") {
+            return Ok(true);
+        }
+        if stdout_text.contains("OSB:TIMEOUT") {
+            return Ok(false);
+        }
+        // Exec failed before the script could print either
+        // sentinel — most likely `nc` is missing from the image,
+        // or the exit code was non-zero before any sentinel
+        // landed.
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        if info.command_not_found || stderr_text.contains("not found") {
+            return Err(AgentError::Runtime {
+                detail: "wait_port_listening requires `nc` in the container image".into(),
+            });
+        }
+        Err(AgentError::Runtime {
+            detail: format!(
+                "wait_port_listening probe exit={} stderr={}",
+                info.exit_code,
+                stderr_text.trim()
+            ),
+        })
+    }
+
     async fn stat_revision(
         &self,
         id: &ContainerId,

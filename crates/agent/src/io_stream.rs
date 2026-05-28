@@ -58,7 +58,15 @@ const MAX_WRITE_BYTES: usize = 256 * 1024 * 1024;
 pub async fn drive_io_session<R, S>(
     runtime: Arc<R>,
     registry: Arc<ExecRegistry>,
-    host_ports: Arc<dyn crate::container::HostPortLookup>,
+    // v1.0.3 carried `host_ports` here so drive_wait_port_listening
+    // could probe `127.0.0.1:<host_port>` from the agent host. That
+    // approach was wrong on Docker Desktop (docker-proxy false-
+    // positives) — fixed in v1.0.3.x by delegating to the runtime's
+    // `wait_port_listening` (probes from inside the container's
+    // netns). The param stays in the public signature so the trait
+    // remains available for any future host-side probe; rename to
+    // `_host_ports` to silence unused-variable lints.
+    _host_ports: Arc<dyn crate::container::HostPortLookup>,
     stream_id: String,
     sandbox_id: SandboxId,
     container_id: ContainerId,
@@ -135,8 +143,15 @@ pub async fn drive_io_session<R, S>(
             drive_list_dir(runtime, stream_id, container_id, params, server_tx).await;
         }
         Some(io_start::Params::WaitPortListening(params)) => {
-            drive_wait_port_listening(host_ports, stream_id, sandbox_id, params, server_tx)
-                .await;
+            drive_wait_port_listening(
+                runtime,
+                container_id,
+                stream_id,
+                sandbox_id,
+                params,
+                server_tx,
+            )
+            .await;
         }
         None => {
             send_error(
@@ -688,97 +703,73 @@ async fn drive_list_dir<R>(
 /// `HostPortLookup` trait. (The in-container port and the host
 /// port aren't generally equal; the host port is what
 /// `localhost:<host_port>` actually accepts a connect on.)
-async fn drive_wait_port_listening(
-    host_ports: Arc<dyn crate::container::HostPortLookup>,
+async fn drive_wait_port_listening<R>(
+    runtime: Arc<R>,
+    container_id: ContainerId,
     stream_id: String,
     sandbox_id: SandboxId,
     params: open_sandbox_contracts::proxy::WaitPortListeningParams,
     server_tx: mpsc::Sender<IoServerFrame>,
-) {
-    use open_sandbox_contracts::constants::{
-        WAIT_PORT_LISTENING_MAX_TIMEOUT_MS, WAIT_PORT_LISTENING_PROBE_INTERVAL_MS,
-    };
+) where
+    R: ContainerRuntime,
+{
+    use open_sandbox_contracts::constants::WAIT_PORT_LISTENING_MAX_TIMEOUT_MS;
     use open_sandbox_contracts::proxy::WaitPortListeningResult;
     use tokio::time::{Duration, Instant};
 
-    // Clamp + resolve before any I/O. The wire `port` field is the
-    // in-container port the caller observed; we map it through the
-    // sandbox manager to the host-side port.
     let timeout_ms = params.timeout_ms.min(WAIT_PORT_LISTENING_MAX_TIMEOUT_MS);
-    let host_port = match host_ports.host_port_for(&sandbox_id) {
-        Ok(p) => p,
-        Err(_) => {
+
+    info!(
+        stream_id = %stream_id,
+        sandbox_id = %sandbox_id,
+        port = params.port,
+        timeout_ms,
+        "io_session.start op=wait_port_listening"
+    );
+
+    let started = Instant::now();
+    // The probe is delegated to the runtime so it can run INSIDE
+    // the container's network namespace. From the agent host on
+    // Docker Desktop a TCP-connect to the host-mapped port goes
+    // through the docker-proxy userspace intermediary, which
+    // accepts even when the container's bound process isn't
+    // listening — i.e. the probe falsely reports ready=true. The
+    // in-namespace probe sees the container's own network stack
+    // directly.
+    let ready_res = runtime
+        .wait_port_listening(
+            &container_id,
+            params.port,
+            Duration::from_millis(timeout_ms as u64),
+        )
+        .await;
+
+    let ready = match ready_res {
+        Ok(b) => b,
+        Err(AgentError::Runtime { detail })
+            if detail.starts_with("wait_port_listening not yet implemented") =>
+        {
             send_error(
                 &server_tx,
                 &stream_id,
-                "SANDBOX_GONE",
-                &format!("sandbox {sandbox_id} not found by agent"),
+                "NOT_IMPLEMENTED",
+                "wait_port_listening not yet implemented for this backend",
+            )
+            .await;
+            return;
+        }
+        Err(e) => {
+            send_error(
+                &server_tx,
+                &stream_id,
+                "WAIT_PORT_LISTENING_FAILED",
+                &e.to_string(),
             )
             .await;
             return;
         }
     };
 
-    info!(
-        stream_id = %stream_id,
-        sandbox_id = %sandbox_id,
-        port = params.port,
-        host_port,
-        timeout_ms,
-        "io_session.start op=wait_port_listening"
-    );
-
-    let started = Instant::now();
-    let deadline = started + Duration::from_millis(timeout_ms as u64);
-    let interval = Duration::from_millis(WAIT_PORT_LISTENING_PROBE_INTERVAL_MS);
-    let addr = format!("127.0.0.1:{host_port}");
-
-    let ready = loop {
-        // Cap each individual connect attempt by the remaining budget
-        // — without this, a half-open SYN_RECV port can leave the
-        // probe blocked past the caller's timeout.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break false;
-        }
-        let attempt_timeout = remaining.min(interval);
-        // Measure the actual wall-clock cost of this attempt so the
-        // post-failure sleep can be `interval - measured_attempt`
-        // rather than a fixed `interval`. Without this measurement
-        // the loop sleeps a full interval even on a fast refusal,
-        // making the effective cadence ~2× the documented 50ms
-        // budget under slow handshake / SYN_DROP conditions.
-        let attempt_start = Instant::now();
-        match tokio::time::timeout(attempt_timeout, tokio::net::TcpStream::connect(&addr)).await {
-            Ok(Ok(_stream)) => break true,
-            Ok(Err(_connect_err)) => {
-                // Refused / not-listening: sleep the remainder of the
-                // probe interval (or the deadline budget, whichever
-                // is smaller) and retry. Clamping by `remaining`
-                // bounds the total elapsed_ms to ~timeout_ms even
-                // on the final iteration before the deadline.
-                let elapsed_attempt = attempt_start.elapsed();
-                let remaining_after_attempt =
-                    deadline.saturating_duration_since(Instant::now());
-                let sleep = interval
-                    .saturating_sub(elapsed_attempt)
-                    .min(remaining_after_attempt);
-                if !sleep.is_zero() {
-                    tokio::time::sleep(sleep).await;
-                }
-            }
-            Err(_timed_out) => {
-                // The connect itself timed out (handshake stalled).
-                // No additional sleep — the probe attempt already
-                // consumed the interval budget.
-            }
-        }
-    };
-
-    // Clamp `elapsed_ms` to the caller's `timeout_ms` on the
-    // not-ready branch so callers can rely on
-    // `elapsed_ms <= timeout_ms` as an invariant when ready=false.
-    // The success path reports the true time-to-ready unchanged.
     let raw_elapsed = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
     let elapsed_ms = if ready {
         raw_elapsed
@@ -1231,6 +1222,17 @@ mod tests {
         ) -> Result<crate::container::FileRevision, AgentError> {
             Err(AgentError::Runtime {
                 detail: "stat_revision not yet implemented for docker runtime".into(),
+            })
+        }
+        async fn wait_port_listening(
+            &self,
+            _id: &ContainerId,
+            _port: u32,
+            _timeout: Duration,
+        ) -> Result<bool, AgentError> {
+            Err(AgentError::Runtime {
+                detail: "wait_port_listening not yet implemented for docker runtime"
+                    .into(),
             })
         }
     }
@@ -2151,30 +2153,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_port_listening_returns_ready_when_port_accepts() {
-        // Bind a real TcpListener so the agent's connect probe
-        // succeeds. Use spawn_session_with_ports so the HostPortLookup
-        // hands the agent the listener's actual ephemeral port.
+    async fn wait_port_listening_returns_ready_when_runtime_reports_listening() {
+        // v1.0.3.x: the probe is now delegated to the runtime
+        // trait (it must run from inside the container's netns;
+        // host-side TCP probes false-positive on Docker Desktop).
+        // MockContainerRuntime.with_listening_port pre-registers
+        // the in-container port as "bound"; the agent's
+        // drive_wait_port_listening should see Ok(true).
         use open_sandbox_contracts::proxy::WaitPortListeningParams;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let listener_port = listener.local_addr().unwrap().port();
-        // Spawn a tiny accept loop so probe connects don't hang the
-        // listen queue on platforms with small SOMAXCONN defaults.
-        tokio::spawn(async move {
-            while let Ok((_socket, _)) = listener.accept().await {
-                // immediately drop — probe only needs the connect to succeed
-            }
-        });
-
-        let runtime = Arc::new(MockContainerRuntime::new());
+        let runtime = Arc::new(MockContainerRuntime::new().with_listening_port(8080));
         let registry = Arc::new(ExecRegistry::new());
-        let (tx, rx, h) = spawn_session_with_ports(
-            runtime,
-            registry,
-            "s-wpl-ok",
-            StubHostPorts::ok(listener_port),
-        );
+        let (tx, rx, h) = spawn_session(runtime, registry, "s-wpl-ok");
 
         tx.send(Ok(IoClientFrame {
             stream_id: "s-wpl-ok".into(),
@@ -2183,9 +2173,6 @@ mod tests {
                 params: Some(
                     open_sandbox_contracts::proxy::io_start::Params::WaitPortListening(
                         WaitPortListeningParams {
-                            // in-container port — informational on the
-                            // wire; the agent uses the host_port from
-                            // HostPortLookup.
                             port: 8080,
                             timeout_ms: 3_000,
                         },
@@ -2201,11 +2188,6 @@ mod tests {
         match &frames[0] {
             io_server_frame::Payload::WaitPortListeningResult(r) => {
                 assert!(r.ready, "expected ready=true; got {r:?}");
-                assert!(
-                    r.elapsed_ms < 3_000,
-                    "elapsed_ms should be well under the timeout; got {}",
-                    r.elapsed_ms
-                );
             }
             other => panic!("expected WaitPortListeningResult, got {other:?}"),
         }
@@ -2220,28 +2202,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_port_listening_returns_not_ready_after_timeout() {
-        // Pick a port nothing is listening on (we bind an ephemeral
-        // listener just to discover an unused port, then drop it
-        // before the probe runs). The agent's connect should refuse
-        // for the full timeout window.
+    async fn wait_port_listening_returns_not_ready_when_runtime_reports_silent() {
+        // Mock with no listening ports registered → wait_port_
+        // listening returns Ok(false) → drive_wait_port_listening
+        // emits ready=false. The mock returns immediately rather
+        // than honoring `timeout_ms`; we trade off real-time
+        // accuracy here against test latency (preserved by the
+        // real docker/youki impls which DO poll the actual
+        // timeout window).
         use open_sandbox_contracts::proxy::WaitPortListeningParams;
-
-        let probe_port = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let p = listener.local_addr().unwrap().port();
-            drop(listener);
-            p
-        };
 
         let runtime = Arc::new(MockContainerRuntime::new());
         let registry = Arc::new(ExecRegistry::new());
-        let (tx, rx, h) = spawn_session_with_ports(
-            runtime,
-            registry,
-            "s-wpl-timeout",
-            StubHostPorts::ok(probe_port),
-        );
+        let (tx, rx, h) = spawn_session(runtime, registry, "s-wpl-timeout");
 
         tx.send(Ok(IoClientFrame {
             stream_id: "s-wpl-timeout".into(),
@@ -2251,8 +2224,6 @@ mod tests {
                     open_sandbox_contracts::proxy::io_start::Params::WaitPortListening(
                         WaitPortListeningParams {
                             port: 8080,
-                            // Short enough to keep the test snappy;
-                            // multiple probe intervals fit in it.
                             timeout_ms: 250,
                         },
                     ),
@@ -2267,21 +2238,12 @@ mod tests {
         match &frames[0] {
             io_server_frame::Payload::WaitPortListeningResult(r) => {
                 assert!(!r.ready, "expected ready=false; got {r:?}");
-                // Both bounds matter:
-                //  * elapsed_ms must reflect that we actually waited
-                //    (a fast-path false positive would be the bug).
-                //  * elapsed_ms must NOT exceed the caller-supplied
-                //    timeout — drive_wait_port_listening clamps the
-                //    not-ready branch to timeout_ms, so anything
-                //    larger here would indicate the clamp regressed.
-                assert!(
-                    r.elapsed_ms >= 200,
-                    "elapsed_ms should be at-or-above the timeout; got {}",
-                    r.elapsed_ms
-                );
+                // elapsed_ms is clamped to timeout_ms on the
+                // not-ready branch (the docs promise the
+                // invariant `elapsed_ms <= timeout_ms`).
                 assert!(
                     r.elapsed_ms <= 250,
-                    "elapsed_ms must not exceed timeout_ms=250; got {}",
+                    "elapsed_ms must not exceed timeout_ms; got {}",
                     r.elapsed_ms
                 );
             }
@@ -2291,20 +2253,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_port_listening_missing_sandbox_surfaces_sandbox_gone() {
+    async fn wait_port_listening_routes_not_implemented_for_stub_runtime() {
+        // When the runtime's wait_port_listening returns the
+        // "not yet implemented" stub error (matching the docker /
+        // youki stubs during a rollout window), the agent should
+        // surface a typed NOT_IMPLEMENTED IoError so the SDK can
+        // feature-detect. Same shape as the drive_list_dir /
+        // drive_write_file precondition-stub routing.
         use open_sandbox_contracts::proxy::WaitPortListeningParams;
 
-        let runtime = Arc::new(MockContainerRuntime::new());
+        let runtime = Arc::new(NotYetImplementedRuntime);
         let registry = Arc::new(ExecRegistry::new());
-        let (tx, rx, h) = spawn_session_with_ports(
-            runtime,
-            registry,
-            "s-wpl-gone",
-            StubHostPorts::missing(),
-        );
+        let (tx, rx, h) = spawn_session(runtime, registry, "s-wpl-noimpl");
 
         tx.send(Ok(IoClientFrame {
-            stream_id: "s-wpl-gone".into(),
+            stream_id: "s-wpl-noimpl".into(),
             payload: Some(io_client_frame::Payload::Start(IoStart {
                 sandbox_id: "ignored".into(),
                 params: Some(
@@ -2325,7 +2288,7 @@ mod tests {
         let last = frames.last().expect("at least one frame");
         match last {
             io_server_frame::Payload::Error(e) => {
-                assert_eq!(e.code, "SANDBOX_GONE");
+                assert_eq!(e.code, "NOT_IMPLEMENTED");
             }
             other => panic!("expected Error frame, got {other:?}"),
         }

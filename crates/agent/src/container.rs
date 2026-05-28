@@ -223,6 +223,29 @@ pub trait ContainerRuntime: Send + Sync {
         path: &str,
         cwd: Option<&str>,
     ) -> impl Future<Output = Result<FileRevision, AgentError>> + Send;
+
+    /// v1.0.3: poll TCP-listening status from inside the
+    /// container's network namespace.
+    ///
+    /// Returns `Ok(true)` as soon as a process inside the
+    /// container is accepting on `in_container_port`;
+    /// `Ok(false)` when `timeout` elapses with nothing listening;
+    /// `Err` only on infrastructure failure (container gone,
+    /// exec spawn refused).
+    ///
+    /// Why not a TCP-connect from the agent host: on Docker
+    /// Desktop (macOS/Windows) the docker-proxy userspace
+    /// intermediary accepts host-port connects even when the
+    /// container's bound process isn't listening. The save-chain
+    /// preview-reload would race watchexec restart and fire the
+    /// iframe before the dev-server is back. Probing from the
+    /// container's netns avoids that intermediary entirely.
+    fn wait_port_listening(
+        &self,
+        id: &ContainerId,
+        in_container_port: u32,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<bool, AgentError>> + Send;
 }
 
 /// v1.0.3: a single entry in a [`DirListing`].

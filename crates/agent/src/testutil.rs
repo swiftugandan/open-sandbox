@@ -53,6 +53,11 @@ pub struct MockContainerRuntime {
     signals_received: Mutex<Vec<SignalRecord>>,
     writes_received: Mutex<Vec<WriteRecord>>,
     next_pid: AtomicI32,
+    /// v1.0.3: in-container ports the mock treats as "listening"
+    /// for `wait_port_listening`. Defaults to empty (every port
+    /// reports not-ready); tests use `with_listening_port` to
+    /// register the ones they want the happy-path for.
+    listening_ports: Mutex<std::collections::HashSet<u32>>,
 }
 
 impl MockContainerRuntime {
@@ -68,7 +73,15 @@ impl MockContainerRuntime {
             signals_received: Mutex::new(Vec::new()),
             writes_received: Mutex::new(Vec::new()),
             next_pid: AtomicI32::new(1000),
+            listening_ports: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Mark an in-container port as listening for the mock's
+    /// `wait_port_listening` happy-path tests.
+    pub fn with_listening_port(self, port: u32) -> Self {
+        self.listening_ports.lock().unwrap().insert(port);
+        self
     }
 
     pub fn with_existing(containers: Vec<ContainerInfo>) -> Self {
@@ -334,6 +347,24 @@ impl ContainerRuntime for MockContainerRuntime {
             size: bytes.len() as u64,
         })
     }
+
+    async fn wait_port_listening(
+        &self,
+        _id: &ContainerId,
+        port: u32,
+        _timeout: Duration,
+    ) -> Result<bool, AgentError> {
+        // Mock: ports stored in the `listening_ports` set are
+        // ready immediately; everything else returns false after a
+        // brief artificial delay so tests can assert the not-ready
+        // branch behavior without waiting real seconds.
+        let listening = self
+            .listening_ports
+            .lock()
+            .unwrap()
+            .contains(&port);
+        Ok(listening)
+    }
 }
 
 fn resolve_path(path: &str, cwd: Option<&str>) -> String {
@@ -521,6 +552,17 @@ impl ContainerRuntime for FailingContainerRuntime {
             detail: "mock runtime failure".into(),
         })
     }
+
+    async fn wait_port_listening(
+        &self,
+        _id: &ContainerId,
+        _port: u32,
+        _timeout: Duration,
+    ) -> Result<bool, AgentError> {
+        Err(AgentError::Runtime {
+            detail: "mock runtime failure".into(),
+        })
+    }
 }
 
 /// v1.0.2 (iter11): runtime mock whose `create_and_start` sleeps for
@@ -637,6 +679,15 @@ impl ContainerRuntime for SlowContainerRuntime {
             revision: "slow:0".to_string(),
             size: 0,
         })
+    }
+
+    async fn wait_port_listening(
+        &self,
+        _id: &ContainerId,
+        _port: u32,
+        _timeout: Duration,
+    ) -> Result<bool, AgentError> {
+        Ok(false)
     }
 }
 

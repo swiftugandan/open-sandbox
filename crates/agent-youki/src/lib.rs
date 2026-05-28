@@ -532,6 +532,16 @@ impl ContainerRuntime for YoukiRuntime {
             size: ns_rev.size,
         })
     }
+
+    async fn wait_port_listening(
+        &self,
+        id: &ContainerId,
+        port: u32,
+        timeout: Duration,
+    ) -> Result<bool, AgentError> {
+        let target_pid = exec::container_pid(&id.0, &self.state_dir())?;
+        setns_ops::wait_port_listening_in_ns(target_pid, port, timeout).await
+    }
 }
 
 fn ns_dir_entry_to_agent(entry: setns_ops::NsDirEntry) -> DirEntry {

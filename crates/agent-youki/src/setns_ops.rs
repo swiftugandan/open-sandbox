@@ -425,6 +425,120 @@ pub struct NsFileRevision {
     pub size: u64,
 }
 
+/// v1.0.3: probe TCP-listening status from inside the container's
+/// NETWORK namespace.
+///
+/// Enters the container's `net` ns (NOT mnt — file ops use mnt;
+/// network probes need net) and runs a non-blocking
+/// `TcpStream::connect("127.0.0.1:<port>")` in a poll loop until
+/// success or timeout. From inside the container's netns, an
+/// accept comes only from a process actually bound to the port —
+/// the docker-proxy intermediary on Docker Desktop is bypassed.
+///
+/// Polls every 50ms; total runtime ≤ `timeout` (modulo one sleep
+/// granularity, ≤50ms).
+pub async fn wait_port_listening_in_ns(
+    target_pid: i32,
+    port: u32,
+    timeout: std::time::Duration,
+) -> Result<bool, AgentError> {
+    use std::os::fd::AsFd;
+    use std::time::Instant;
+    if target_pid <= 0 {
+        return Err(AgentError::Runtime {
+            detail: format!("invalid container pid {target_pid}"),
+        });
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<bool, AgentError>>();
+    std::thread::Builder::new()
+        .name(format!("setns-netprobe-{target_pid}"))
+        .spawn(move || {
+            // Enter the target's net namespace. Mirror the mount-ns
+            // dance from run_in_container_mount_ns but use
+            // CLONE_NEWNET. The MountNsGuard isn't needed here
+            // because we don't dirty the mount namespace; the
+            // thread exits at the end of this closure anyway.
+            let save_fd = match std::fs::File::open("/proc/self/ns/net") {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx.send(Err(AgentError::Runtime {
+                        detail: format!("open self net ns: {e}"),
+                    }));
+                    return;
+                }
+            };
+            let target_path = format!("/proc/{target_pid}/ns/net");
+            let target_fd = match std::fs::File::open(&target_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx.send(Err(AgentError::Runtime {
+                        detail: format!("open target net ns {target_path}: {e}"),
+                    }));
+                    return;
+                }
+            };
+            if let Err(e) =
+                nix::sched::setns(target_fd.as_fd(), nix::sched::CloneFlags::CLONE_NEWNET)
+            {
+                let _ = tx.send(Err(AgentError::Runtime {
+                    detail: format!("setns into target net ns: {e}"),
+                }));
+                return;
+            }
+            // Probe loop. std::net::TcpStream::connect_timeout
+            // synchronously probes the kernel socket; on the
+            // container's netns this means "is a process bound to
+            // this port".
+            let addr = format!("127.0.0.1:{port}");
+            let started = Instant::now();
+            let interval = std::time::Duration::from_millis(50);
+            let mut ready = false;
+            loop {
+                if started.elapsed() >= timeout {
+                    break;
+                }
+                let socket_addr: std::net::SocketAddr = match addr.parse() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        let _ = tx.send(Err(AgentError::Runtime {
+                            detail: format!("invalid probe addr {addr}"),
+                        }));
+                        return;
+                    }
+                };
+                let attempt_timeout = (timeout - started.elapsed()).min(interval);
+                if std::net::TcpStream::connect_timeout(&socket_addr, attempt_timeout).is_ok() {
+                    ready = true;
+                    break;
+                }
+                // Sleep the remainder of the probe interval (or
+                // the remaining budget, whichever is smaller) so
+                // a fast ECONNREFUSED doesn't cause a busy-loop.
+                let remaining =
+                    timeout.checked_sub(started.elapsed()).unwrap_or_default();
+                let sleep = interval.min(remaining);
+                if sleep.is_zero() {
+                    break;
+                }
+                std::thread::sleep(sleep);
+            }
+            // Restore our home netns for cleanliness even though
+            // the thread exits next. Errors are logged-only.
+            if let Err(e) =
+                nix::sched::setns(save_fd.as_fd(), nix::sched::CloneFlags::CLONE_NEWNET)
+            {
+                tracing::warn!(error = %e, "failed to restore net ns after probe");
+            }
+            let _ = tx.send(Ok(ready));
+        })
+        .map_err(|e| AgentError::Runtime {
+            detail: format!("spawn setns net-probe thread: {e}"),
+        })?;
+    rx.await.map_err(|e| AgentError::Runtime {
+        detail: format!("setns net-probe thread dropped sender: {e}"),
+    })?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
