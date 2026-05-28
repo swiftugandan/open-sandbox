@@ -56,11 +56,15 @@ export const TEMPLATES: readonly Template[] = [
     // into /workspace via `\"` shell-escapes (parseCommand sees them
     // as literal text since they live inside single quotes; sh then
     // interprets them).
+    //
+    // `node --watch` (stable since Node 20) restarts the process
+    // when any required source file changes — so saving server.js
+    // in the Edit tab reloads the server on the next request.
     execCommand:
-      `sh -c 'mkdir -p /workspace && cd /workspace && printf "%s\\n" "const http = require(\\"http\\");" "http.createServer((q, r) => r.end(\\"hi from node — edit /workspace/server.js\\")).listen(8080);" > server.js && node server.js'`,
+      `sh -c 'mkdir -p /workspace && cd /workspace && printf "%s\\n" "const http = require(\\"http\\");" "http.createServer((q, r) => r.end(\\"hi from node — edit /workspace/server.js\\")).listen(8080);" > server.js && node --watch server.js'`,
     exposedPort: 8080,
     description:
-      "Node HTTP server reading /workspace/server.js on :8080. Edit and re-run.",
+      "Node HTTP server on :8080 with --watch. Edit /workspace/server.js; save reloads.",
   },
   {
     id: "nginx",
@@ -84,11 +88,15 @@ export const TEMPLATES: readonly Template[] = [
     // single quotes for parseCommand, inner `\"` escapes consumed by
     // sh. Writes /workspace/app.py, then pip-installs Flask and runs
     // the script.
+    //
+    // `debug=True` enables Flask's stat-based reloader, which forks
+    // a child process and restarts it on app.py changes — so saving
+    // in the Edit tab refreshes the route on the next request.
     execCommand:
-      `sh -c 'mkdir -p /workspace && cd /workspace && printf "%s\\n" "from flask import Flask" "a = Flask(__name__)" "@a.route(\\"/\\")" "def hi(): return \\"hi from flask — edit /workspace/app.py\\"" "a.run(host=\\"0.0.0.0\\", port=8080)" > app.py && pip install --quiet flask && python3 app.py'`,
+      `sh -c 'mkdir -p /workspace && cd /workspace && printf "%s\\n" "from flask import Flask" "a = Flask(__name__)" "@a.route(\\"/\\")" "def hi(): return \\"hi from flask — edit /workspace/app.py\\"" "a.run(host=\\"0.0.0.0\\", port=8080, debug=True)" > app.py && pip install --quiet flask && python3 app.py'`,
     exposedPort: 8080,
     description:
-      "Flask app reading /workspace/app.py on :8080. Edit and re-run.",
+      "Flask app on :8080 with debug reloader. Edit /workspace/app.py; save reloads.",
   },
   {
     id: "shell",
