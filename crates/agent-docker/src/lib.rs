@@ -14,10 +14,11 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use open_sandbox_agent::container::{
-    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState, DirListing,
-    EXEC_CHANNEL_CAPACITY, ExecExitInfo, ExecHandle, ExecStart, FileRevision, consume_inpid_marker,
-    detect_command_not_found, wrap_command_with_inpid_marker,
+    ContainerConfig, ContainerId, ContainerInfo, ContainerRuntime, ContainerState, DirEntry,
+    DirListing, EXEC_CHANNEL_CAPACITY, EntryType, ExecExitInfo, ExecHandle, ExecStart,
+    FileRevision, consume_inpid_marker, detect_command_not_found, wrap_command_with_inpid_marker,
 };
+use open_sandbox_contracts::constants::LIST_DIR_MAX_ENTRIES;
 use open_sandbox_contracts::constants::DEFAULT_WRITE_CWD;
 use open_sandbox_contracts::error::AgentError;
 use open_sandbox_contracts::types::SandboxId;
@@ -963,30 +964,95 @@ impl ContainerRuntime for DockerRuntime {
 
     async fn list_dir(
         &self,
-        _id: &ContainerId,
-        _path: &str,
-        _cwd: Option<&str>,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
     ) -> Result<DirListing, AgentError> {
-        // v1.0.3: real docker-runtime impl follows on a subsequent
-        // commit in PLAN_LIVE_EDIT group B. Until then, return a
-        // typed Runtime error rather than a silent empty listing so
-        // any caller racing the rollout sees a clean failure.
-        Err(AgentError::Runtime {
-            detail: "list_dir not yet implemented for docker runtime".into(),
-        })
+        let resolved = resolve_path(path, cwd);
+        // POSIX-portable + busybox-friendly listing format:
+        //   ls -lAn --time-style=+%s -q -- <path>
+        // Yields one line per entry:
+        //   <mode> <links> <uid> <gid> <size> <mtime> <name>[ -> <target>]
+        // -n keeps uid/gid numeric (avoids locale dependence).
+        // -A lists dotfiles except . and ..
+        // --time-style=+%s pins mtime to integer epoch seconds.
+        // -q replaces non-printable name bytes with ?, which is
+        // lossy but the only way to keep the parse single-line.
+        // Names with literal newlines are extremely rare in
+        // workspaces; if it ever matters we'll switch to find -print0.
+        let stdout = exec_collect_stdout(
+            self,
+            id,
+            vec![
+                "ls".into(),
+                "-lAn".into(),
+                "--time-style=+%s".into(),
+                "-q".into(),
+                "--".into(),
+                resolved.clone(),
+            ],
+        )
+        .await
+        .map_err(|e| match e {
+            ListExecError::NotFound => AgentError::Runtime {
+                detail: format!("No such file: {resolved}"),
+            },
+            ListExecError::Other(detail) => AgentError::Runtime { detail },
+        })?;
+
+        parse_ls_lan_output(&stdout, &resolved)
     }
 
     async fn stat_revision(
         &self,
-        _id: &ContainerId,
-        _path: &str,
-        _cwd: Option<&str>,
+        id: &ContainerId,
+        path: &str,
+        cwd: Option<&str>,
     ) -> Result<FileRevision, AgentError> {
-        // v1.0.3: real docker-runtime impl follows on a subsequent
-        // commit in PLAN_LIVE_EDIT group B. Same error shape as
-        // list_dir above.
-        Err(AgentError::Runtime {
-            detail: "stat_revision not yet implemented for docker runtime".into(),
+        let resolved = resolve_path(path, cwd);
+        // `stat -c "%Y %s"` is portable across GNU coreutils and
+        // busybox. Output: "<mtime_secs> <size>". Trade-off: 1s
+        // mtime resolution collapses sub-second edits to the same
+        // revision; acceptable for the UI's optimistic-write
+        // contract because the matching FileMeta from the prior
+        // read carries the same shape.
+        let stdout = exec_collect_stdout(
+            self,
+            id,
+            vec![
+                "stat".into(),
+                "-c".into(),
+                "%Y %s".into(),
+                "--".into(),
+                resolved.clone(),
+            ],
+        )
+        .await
+        .map_err(|e| match e {
+            ListExecError::NotFound => AgentError::Runtime {
+                detail: format!("No such file: {resolved}"),
+            },
+            ListExecError::Other(detail) => AgentError::Runtime { detail },
+        })?;
+
+        let text = String::from_utf8_lossy(&stdout);
+        let trimmed = text.trim();
+        let mut parts = trimmed.split_whitespace();
+        let mtime: u64 = parts
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| AgentError::Runtime {
+                detail: format!("stat output malformed: {trimmed:?}"),
+            })?;
+        let size: u64 = parts
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| AgentError::Runtime {
+                detail: format!("stat output malformed: {trimmed:?}"),
+            })?;
+        Ok(FileRevision {
+            revision: format!("{mtime}:{size}"),
+            size,
         })
     }
 
@@ -1092,6 +1158,195 @@ fn resolve_path(path: &str, cwd: Option<&str>) -> String {
     }
     let base = cwd.unwrap_or(DEFAULT_WRITE_CWD);
     format!("{}/{}", base.trim_end_matches('/'), path)
+}
+
+/// Distinct error variant so `list_dir` / `stat_revision` can map
+/// "missing path" to the agent-level `No such file: ...` detail
+/// (which `drive_list_dir` / `drive_read_file` route to
+/// `FILE_NOT_FOUND`) without parsing the bollard error string.
+enum ListExecError {
+    NotFound,
+    Other(String),
+}
+
+/// Run a one-shot exec inside the container, collect stdout fully,
+/// and require exit_code = 0. Non-zero exit with stderr that smells
+/// like "no such file" (busybox / coreutils both phrase it that way)
+/// surfaces as `ListExecError::NotFound`; anything else surfaces as
+/// `ListExecError::Other(detail)`.
+async fn exec_collect_stdout(
+    runtime: &DockerRuntime,
+    id: &ContainerId,
+    command: Vec<String>,
+) -> Result<Vec<u8>, ListExecError> {
+    let handle = runtime
+        .start_exec(
+            id,
+            ExecStart {
+                command,
+                cwd: String::new(),
+                env: HashMap::new(),
+            },
+        )
+        .await
+        .map_err(|e| ListExecError::Other(e.to_string()))?;
+
+    let mut handle = handle;
+    drop(handle.stdin);
+    let mut stdout: Vec<u8> = Vec::new();
+    while let Some(chunk) = handle.stdout.recv().await {
+        stdout.extend_from_slice(&chunk);
+    }
+    let mut stderr: Vec<u8> = Vec::new();
+    while let Some(chunk) = handle.stderr.recv().await {
+        stderr.extend_from_slice(&chunk);
+    }
+    let info = handle.exited.await.map_err(|_| {
+        ListExecError::Other("internal exec terminated without exit info".into())
+    })?;
+
+    if info.exit_code == 0 {
+        Ok(stdout)
+    } else {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        if stderr_text.contains("No such file")
+            || stderr_text.contains("cannot access")
+            || stderr_text.contains("not found")
+        {
+            Err(ListExecError::NotFound)
+        } else {
+            Err(ListExecError::Other(format!(
+                "exit={} stderr={}",
+                info.exit_code,
+                stderr_text.trim()
+            )))
+        }
+    }
+}
+
+/// Parse the output of `ls -lAn --time-style=+%s -q -- <path>` into
+/// a `DirListing`. Hard-caps at `LIST_DIR_MAX_ENTRIES` and sets
+/// `truncated=true` / `total_entries=N` per the v1.0.3 contract.
+///
+/// Format (POSIX + busybox compatible):
+///
+///   `<mode> <links> <uid> <gid> <size> <mtime_secs> <name>[ -> <target>]`
+///
+/// The leading "total <blocks>" line (when present) is skipped.
+fn parse_ls_lan_output(stdout: &[u8], dir_path: &str) -> Result<DirListing, AgentError> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut all_entries: Vec<DirEntry> = Vec::new();
+    let mut total_entries: u64 = 0;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        // `ls -l` emits a `total <n>` header line for directories.
+        if line.starts_with("total ") {
+            continue;
+        }
+        let Some(entry) = parse_ls_entry_line(line) else {
+            // Skip lines we don't understand rather than fail the
+            // whole listing — `ls` can emit extra warnings on stderr
+            // that occasionally race onto stdout in tight CI loops.
+            continue;
+        };
+        total_entries += 1;
+        if all_entries.len() < LIST_DIR_MAX_ENTRIES {
+            all_entries.push(entry);
+        }
+    }
+
+    let truncated = total_entries as usize > all_entries.len();
+    Ok(DirListing {
+        path: dir_path.to_string(),
+        entries: all_entries,
+        truncated,
+        total_entries,
+    })
+}
+
+/// Parse a single `ls -lAn` line. Returns None on malformed input.
+fn parse_ls_entry_line(line: &str) -> Option<DirEntry> {
+    // Columns 0..=5 are fixed-shape; the name starts at column 6 and
+    // may contain spaces (preserved by splitn). For symlinks the
+    // name field also contains ` -> target`.
+    let mut cols = line.splitn(7, char::is_whitespace).filter(|s| !s.is_empty());
+    let mode_str = cols.next()?;
+    let _links = cols.next()?;
+    let _uid = cols.next()?;
+    let _gid = cols.next()?;
+    let size_str = cols.next()?;
+    let mtime_str = cols.next()?;
+    let name_field = cols.next()?;
+
+    let kind_char = mode_str.chars().next()?;
+    let entry_type = match kind_char {
+        '-' => EntryType::File,
+        'd' => EntryType::Dir,
+        'l' => EntryType::Symlink,
+        _ => EntryType::Other,
+    };
+
+    // For symlinks the name field is `<name> -> <target>`. The
+    // ` -> ` separator is unambiguous because POSIX ls is required
+    // to emit it for symlinks.
+    let (name, target) = if entry_type == EntryType::Symlink {
+        match name_field.split_once(" -> ") {
+            Some((n, t)) => (n.to_string(), t.to_string()),
+            None => (name_field.to_string(), String::new()),
+        }
+    } else {
+        (name_field.to_string(), String::new())
+    };
+
+    // Mode bits as octal — drop the type char and convert the rest
+    // ("rwxr-xr-x" style) to a numeric "0755" via the standard
+    // mapping. The contract just requires an octal-formatted string;
+    // most callers display it as-is.
+    let mode = mode_string_to_octal(mode_str).unwrap_or_else(|| mode_str.to_string());
+
+    let size: u64 = size_str.parse().unwrap_or(0);
+    let mtime: u64 = mtime_str.parse().unwrap_or(0);
+    let revision = format!("{mtime}:{size}");
+
+    Some(DirEntry {
+        name,
+        entry_type,
+        size,
+        revision,
+        mode,
+        target,
+    })
+}
+
+/// Convert an `ls -l`-style permission string like "drwxr-xr-x" or
+/// "-rw-r--r--" to a 4-character octal mode string like "0755" or
+/// "0644". Returns None on malformed input.
+fn mode_string_to_octal(mode_str: &str) -> Option<String> {
+    if mode_str.len() < 10 {
+        return None;
+    }
+    let bytes = mode_str.as_bytes();
+    let owner = mode_triplet(&bytes[1..4])?;
+    let group = mode_triplet(&bytes[4..7])?;
+    let other = mode_triplet(&bytes[7..10])?;
+    Some(format!("0{}{}{}", owner, group, other))
+}
+
+fn mode_triplet(bytes: &[u8]) -> Option<u8> {
+    if bytes.len() < 3 {
+        return None;
+    }
+    let r = if bytes[0] == b'r' { 4 } else { 0 };
+    let w = if bytes[1] == b'w' { 2 } else { 0 };
+    let x = match bytes[2] {
+        b'x' | b's' | b't' => 1,
+        _ => 0,
+    };
+    Some(r + w + x)
 }
 
 fn parent_dir(path: &str) -> String {
@@ -1388,6 +1643,117 @@ mod final_attempt_err_tests {
         };
         assert!(detail.contains("after 3 attempts:"), "got: {detail}");
         assert!(detail.contains("bind: address already in use"), "got: {detail}");
+    }
+}
+
+#[cfg(test)]
+mod parser_tests {
+    //! Pure-parser tests for the ls / stat output parsers used by
+    //! list_dir / stat_revision. No Docker daemon required.
+
+    use super::*;
+
+    #[test]
+    fn mode_triplet_handles_basic_combinations() {
+        assert_eq!(mode_triplet(b"rwx").unwrap(), 7);
+        assert_eq!(mode_triplet(b"rw-").unwrap(), 6);
+        assert_eq!(mode_triplet(b"r-x").unwrap(), 5);
+        assert_eq!(mode_triplet(b"r--").unwrap(), 4);
+        assert_eq!(mode_triplet(b"---").unwrap(), 0);
+        // setuid / sticky bits map to executable bit being set.
+        assert_eq!(mode_triplet(b"rws").unwrap(), 7);
+        assert_eq!(mode_triplet(b"rwt").unwrap(), 7);
+    }
+
+    #[test]
+    fn mode_string_to_octal_basic() {
+        assert_eq!(mode_string_to_octal("-rw-r--r--").as_deref(), Some("0644"));
+        assert_eq!(mode_string_to_octal("drwxr-xr-x").as_deref(), Some("0755"));
+        assert_eq!(mode_string_to_octal("lrwxrwxrwx").as_deref(), Some("0777"));
+        assert_eq!(mode_string_to_octal("----------").as_deref(), Some("0000"));
+    }
+
+    #[test]
+    fn mode_string_to_octal_rejects_short_input() {
+        assert!(mode_string_to_octal("-rwx").is_none());
+    }
+
+    #[test]
+    fn parse_ls_entry_line_file() {
+        // Format: <mode> <links> <uid> <gid> <size> <mtime> <name>
+        let line = "-rw-r--r-- 1 1000 1000 421 1716800200 README.md";
+        let e = parse_ls_entry_line(line).expect("parses");
+        assert_eq!(e.name, "README.md");
+        assert_eq!(e.entry_type, EntryType::File);
+        assert_eq!(e.size, 421);
+        assert_eq!(e.revision, "1716800200:421");
+        assert_eq!(e.mode, "0644");
+        assert_eq!(e.target, "");
+    }
+
+    #[test]
+    fn parse_ls_entry_line_dir() {
+        let line = "drwxr-xr-x 2 1000 1000 0 1716800123 src";
+        let e = parse_ls_entry_line(line).expect("parses");
+        assert_eq!(e.name, "src");
+        assert_eq!(e.entry_type, EntryType::Dir);
+        assert_eq!(e.mode, "0755");
+    }
+
+    #[test]
+    fn parse_ls_entry_line_symlink_extracts_target() {
+        let line = "lrwxrwxrwx 1 0 0 16 1716800100 logs -> /var/log";
+        let e = parse_ls_entry_line(line).expect("parses");
+        assert_eq!(e.name, "logs");
+        assert_eq!(e.entry_type, EntryType::Symlink);
+        assert_eq!(e.target, "/var/log");
+        assert_eq!(e.mode, "0777");
+    }
+
+    #[test]
+    fn parse_ls_entry_line_other_kinds_collapse_to_other() {
+        // FIFO / socket / device — first char is p / s / b / c.
+        for prefix in ["prw-rw-rw-", "srw-rw-rw-", "brw-r--r--", "crw-r--r--"] {
+            let line = format!("{prefix} 1 0 0 0 1716800100 weird");
+            let e = parse_ls_entry_line(&line).expect("parses");
+            assert_eq!(e.entry_type, EntryType::Other, "for prefix {prefix:?}");
+        }
+    }
+
+    #[test]
+    fn parse_ls_lan_output_skips_total_line_and_caps_entries() {
+        let mut output = String::from("total 12\n");
+        // Generate more than LIST_DIR_MAX_ENTRIES entries so the
+        // truncation path engages.
+        let overflow = LIST_DIR_MAX_ENTRIES + 3;
+        for i in 0..overflow {
+            output.push_str(&format!(
+                "-rw-r--r-- 1 0 0 7 1716800200 f{i:05}.txt\n"
+            ));
+        }
+        let listing = parse_ls_lan_output(output.as_bytes(), "/workspace").unwrap();
+        assert_eq!(listing.path, "/workspace");
+        assert_eq!(listing.entries.len(), LIST_DIR_MAX_ENTRIES);
+        assert_eq!(listing.total_entries as usize, overflow);
+        assert!(listing.truncated);
+    }
+
+    #[test]
+    fn parse_ls_lan_output_under_cap_keeps_all_entries() {
+        let output = "\
+total 4
+-rw-r--r-- 1 1000 1000 421 1716800200 README.md
+drwxr-xr-x 2 1000 1000 0 1716800123 src
+lrwxrwxrwx 1 0 0 16 1716800100 logs -> /var/log
+";
+        let listing = parse_ls_lan_output(output.as_bytes(), "/workspace").unwrap();
+        assert_eq!(listing.entries.len(), 3);
+        assert_eq!(listing.total_entries, 3);
+        assert!(!listing.truncated);
+        assert_eq!(listing.entries[0].name, "README.md");
+        assert_eq!(listing.entries[1].name, "src");
+        assert_eq!(listing.entries[2].name, "logs");
+        assert_eq!(listing.entries[2].target, "/var/log");
     }
 }
 
