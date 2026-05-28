@@ -31,6 +31,7 @@ import type { ApiConfig } from "@/lib/api";
 import { ApiError, api, type ListDirEntry } from "@/lib/api";
 import { isHiddenByDefault } from "@/lib/tree-defaults";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/cn";
 
 /** Default root path the tree opens at. Mirrors the agent's
@@ -246,44 +247,42 @@ export function FileTree({
     [state.dirs, fetchDir],
   );
 
-  /** Create a new (or overwrite an empty) file at a user-typed
-   *  path relative to the tree root. Refreshes the listing and
-   *  opens the new file in the editor. Used by the "New file"
-   *  toolbar button.
-   *
-   *  The agent's `write_file` handler does `mkdir -p` on the
-   *  parent directory, so a path like `routes/api/users.py` is
-   *  fine; intermediate directories are created. */
-  const createFile = useCallback(async () => {
-    const input = window.prompt(
-      "New file (path relative to /workspace):",
-      "",
-    );
-    if (input == null) return;
-    const trimmed = input.trim();
-    if (!trimmed) return;
-    // Strip a leading slash so the path stays relative to rootPath;
-    // an absolute path the user typed (`/workspace/foo.py`) is
-    // honored verbatim.
-    const absPath = trimmed.startsWith("/")
-      ? trimmed
-      : `${rootPath}/${trimmed}`;
-    try {
-      await api.writeFile(config, sandboxId, absPath, "");
-      // Refresh so the new file appears in the tree, then hand
-      // off to the parent so the editor opens it.
-      setRefreshNonce((n) => n + 1);
-      onSelect?.(absPath);
-    } catch (e) {
-      const message =
-        e instanceof ApiError ? `${e.errorCode ?? e.status}: ${e.message}` : String(e);
-      // No banner UI yet — surface via console + browser alert.
-      // A future polish pass could route this through the
-      // editor's status bar.
-      // eslint-disable-next-line no-alert
-      window.alert(`Failed to create ${absPath}: ${message}`);
-    }
-  }, [config, sandboxId, rootPath, onSelect]);
+  // v1.0.3 D2.5: inline "new file" affordance. `newFileRow` is
+  // the open input state (null when closed). The flow runs
+  // entirely inside the FileTree component — no native
+  // window.prompt / window.alert; matches the rest of the dev
+  // console's React-confirm-dialog pattern.
+  const [newFileRow, setNewFileRow] = useState<NewFileRowState | null>(null);
+  const submitNewFile = useCallback(
+    async (rawInput: string) => {
+      const trimmed = rawInput.trim();
+      if (!trimmed) {
+        setNewFileRow(null);
+        return;
+      }
+      // Absolute path → honor verbatim. Otherwise root at the
+      // tree's rootPath. The agent's write_file does `mkdir -p`
+      // on the parent, so `src/api/users.py` creates the
+      // intermediate dirs.
+      const absPath = trimmed.startsWith("/")
+        ? trimmed
+        : `${rootPath}/${trimmed}`;
+      setNewFileRow({ busy: true, value: trimmed, error: null });
+      try {
+        await api.writeFile(config, sandboxId, absPath, "");
+        setNewFileRow(null);
+        setRefreshNonce((n) => n + 1);
+        onSelect?.(absPath);
+      } catch (e) {
+        const message =
+          e instanceof ApiError
+            ? `${e.errorCode ?? e.status}: ${e.message}`
+            : String(e);
+        setNewFileRow({ busy: false, value: trimmed, error: message });
+      }
+    },
+    [config, sandboxId, rootPath, onSelect],
+  );
 
   return (
     <div className="flex flex-col h-full text-[12px] font-mono">
@@ -292,8 +291,24 @@ export function FileTree({
         showHidden={showHidden}
         onToggleHidden={() => setShowHidden((v) => !v)}
         onRefresh={() => setRefreshNonce((n) => n + 1)}
-        onNewFile={createFile}
+        onNewFile={() =>
+          setNewFileRow((prev) =>
+            prev ? prev : { busy: false, value: "", error: null },
+          )
+        }
       />
+      {newFileRow && (
+        <NewFileRow
+          state={newFileRow}
+          onChange={(value) =>
+            setNewFileRow((prev) =>
+              prev ? { ...prev, value, error: null } : prev,
+            )
+          }
+          onSubmit={submitNewFile}
+          onCancel={() => setNewFileRow(null)}
+        />
+      )}
       <div className="flex-1 overflow-auto py-1">
         <DirChildren
           path={rootPath}
@@ -305,6 +320,58 @@ export function FileTree({
           depth={0}
         />
       </div>
+    </div>
+  );
+}
+
+interface NewFileRowState {
+  /** Whether the writeFile request is in flight. */
+  busy: boolean;
+  /** Current input value. */
+  value: string;
+  /** Last error message, surfaced inline below the input. */
+  error: string | null;
+}
+
+function NewFileRow({
+  state,
+  onChange,
+  onSubmit,
+  onCancel,
+}: {
+  state: NewFileRowState;
+  onChange: (value: string) => void;
+  onSubmit: (value: string) => void;
+  onCancel: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+  return (
+    <div className="flex flex-col gap-1 px-2 py-1.5 border-b border-border bg-surface-1">
+      <Input
+        ref={inputRef}
+        value={state.value}
+        placeholder="filename (e.g. src/app.py)"
+        disabled={state.busy}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            onSubmit(state.value);
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            onCancel();
+          }
+        }}
+        className="h-7 text-[11.5px]"
+      />
+      {state.error && (
+        <span className="text-[11px] text-err" role="alert">
+          {state.error}
+        </span>
+      )}
     </div>
   );
 }
