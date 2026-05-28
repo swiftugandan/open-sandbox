@@ -15,8 +15,8 @@
  *  iframe.
  */
 
-import { useMemo } from "react";
-import { ExternalLink, RefreshCw } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Check, Copy, ExternalLink, RefreshCw } from "lucide-react";
 
 import { isRunningStatus, type SandboxStatus } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -52,6 +52,40 @@ export function PreviewPane({
     return `${publicUrl}${sep}__t=${reloadKey}`;
   }, [publicUrl, reloadKey]);
 
+  // v1.0.3: copy URL to clipboard. Matches the SandboxUrlBar's
+  // copy affordance from right-pane.tsx (kept for other tabs)
+  // so users on the Edit tab have parity. Clears the "copied"
+  // indicator after 1.5s.
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const t = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(t);
+  }, [copied]);
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(publicUrl);
+      setCopied(true);
+    } catch {
+      // Fall back to a selection-based copy via a hidden
+      // textarea — covers the not-focused / insecure-context
+      // case clipboard.writeText rejects in.
+      const ta = document.createElement("textarea");
+      ta.value = publicUrl;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        setCopied(true);
+      } catch {
+        /* nothing left to try */
+      }
+      document.body.removeChild(ta);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="flex items-center gap-1.5 border-b border-border bg-surface-1 px-3 py-1.5 shrink-0">
@@ -71,6 +105,19 @@ export function PreviewPane({
             className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
           />
         </a>
+        <Button
+          size="icon"
+          variant="ghost"
+          title={copied ? "Copied!" : "Copy URL"}
+          onClick={onCopy}
+          aria-label={copied ? "URL copied" : "Copy URL"}
+        >
+          {copied ? (
+            <Check size={12} className="text-ok" />
+          ) : (
+            <Copy size={12} />
+          )}
+        </Button>
         <Button
           size="icon"
           variant="ghost"

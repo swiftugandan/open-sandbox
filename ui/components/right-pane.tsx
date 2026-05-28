@@ -98,11 +98,20 @@ export function RightPane({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <SandboxUrlBar
-        url={url}
-        visible={urlVisible}
-        status={sandbox.status}
-      />
+      {/* v1.0.3: the URL bar is redundant on the Edit tab — the
+       *  preview pane already renders the public URL with an
+       *  open-in-tab affordance + a copy button. Hide it there
+       *  so the Edit tab gets the full vertical space for the
+       *  three-column layout. Other tabs (Exec / Files / Info)
+       *  still surface the URL since they have no other
+       *  on-screen reference to it. */}
+      {tab !== "edit" && (
+        <SandboxUrlBar
+          url={url}
+          visible={urlVisible}
+          status={sandbox.status}
+        />
+      )}
       <nav className="flex shrink-0 items-stretch overflow-x-auto border-b border-border bg-surface">
         {TABS.map(({ id, label, icon: Icon }) => (
           <button
