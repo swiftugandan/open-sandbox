@@ -1059,7 +1059,6 @@ done
                 },
             )
             .await?;
-        let mut handle = handle;
         drop(handle.stdin);
         // Drain stdout AND stderr concurrently. Serial drain
         // (stdout-then-stderr) risks a child stall: if the
