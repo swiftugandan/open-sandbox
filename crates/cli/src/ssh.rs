@@ -217,6 +217,12 @@ pub async fn ssh_pipe(args: SshPipeArgs) -> ExitCode {
                 eprintln!("# ssh-pipe: remote error code={code} detail={detail}");
                 return ExitCode::from(EXIT_REMOTE_ERROR);
             }
+            Ok(Some(other)) => {
+                // v1.0.3 sidecar frames never appear on the ssh exec
+                // pipe; tolerate them defensively so future server-side
+                // changes can't tear an active ssh session down.
+                eprintln!("# ssh-pipe: ignoring out-of-band server frame: {other:?}");
+            }
             Ok(None) => return ExitCode::from(EXIT_SESSION_BROKEN),
             Err(WsClientError::ReadTimeout { timeout }) => {
                 eprintln!("# ssh-pipe: read timeout after {timeout:?}");

@@ -120,3 +120,34 @@ pub const WS_AUTH_BEARER_PREFIX: &str = "bearer.";
 /// an attacker stuffing `bearer.X1, bearer.X2, …, bearer.XN` cannot
 /// force more than this many `constant_time_eq` calls per upgrade.
 pub const WS_AUTH_MAX_OFFERED_PROTOCOLS: usize = 16;
+
+// =====  WebSocket frame envelope kinds  =====
+//
+// One WebSocket binary message = one application frame, prefixed with
+// a single u8 `kind` byte. Both the API gateway's encoder
+// (`crates/api/src/frame.rs`) AND the ws-client crate import these
+// constants from here so the two ends of the wire cannot drift —
+// adding a kind in one place and forgetting the other was a real
+// regression risk before v1.0.3.
+//
+// Reserved ranges:
+//   0x00..=0x0f — client → server
+//   0x10..=0x1f — server → client
+
+// client → server
+pub const FRAME_KIND_START: u8 = 0x00;
+pub const FRAME_KIND_STDIN: u8 = 0x01;
+pub const FRAME_KIND_SIGNAL: u8 = 0x02;
+pub const FRAME_KIND_STDIN_EOF: u8 = 0x03;
+
+// server → client
+pub const FRAME_KIND_STDOUT: u8 = 0x11;
+pub const FRAME_KIND_STDERR: u8 = 0x12;
+pub const FRAME_KIND_EXITED: u8 = 0x13;
+pub const FRAME_KIND_ERROR: u8 = 0x14;
+pub const FRAME_KIND_STARTED: u8 = 0x15;
+
+// v1.0.3 additions
+pub const FRAME_KIND_LIST_DIR_RESULT: u8 = 0x16;
+pub const FRAME_KIND_WAIT_PORT_LISTENING_RESULT: u8 = 0x17;
+pub const FRAME_KIND_FILE_META: u8 = 0x18;

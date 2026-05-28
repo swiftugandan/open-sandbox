@@ -63,6 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 eprintln!("# started in_container_pid={in_container_pid}");
             }
+            // v1.0.3 sidecar frames; never emitted on exec sessions.
+            ServerFrame::ListDirResult { .. }
+            | ServerFrame::WaitPortListeningResult { .. }
+            | ServerFrame::FileMeta { .. } => {}
         }
     }
     Ok(())

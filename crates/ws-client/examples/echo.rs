@@ -45,6 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
             ServerFrame::Started { .. } => {}
+            // v1.0.3 sidecar frames; never emitted on exec sessions.
+            ServerFrame::ListDirResult { .. }
+            | ServerFrame::WaitPortListeningResult { .. }
+            | ServerFrame::FileMeta { .. } => {}
         }
     }
     Ok(())

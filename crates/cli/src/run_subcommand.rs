@@ -353,6 +353,12 @@ async fn stream_exec(
                 eprintln!("# error code={code} detail={detail}");
                 return ExitCode::from(EXIT_REMOTE_ERROR);
             }
+            Ok(Some(other)) => {
+                // v1.0.3 sidecar frames (ListDirResult, WaitPortListeningResult,
+                // FileMeta) never appear on exec sessions; ignore defensively
+                // rather than tear the run down on an out-of-band frame.
+                eprintln!("# ignoring out-of-band server frame: {other:?}");
+            }
             Ok(None) => {
                 eprintln!("# session closed without exit");
                 return ExitCode::from(EXIT_SESSION_BROKEN);

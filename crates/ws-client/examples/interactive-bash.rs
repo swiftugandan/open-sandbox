@@ -131,6 +131,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 std::process::exit(1);
             }
             ServerFrame::Started { .. } => {}
+            // v1.0.3 sidecar frames; never emitted on exec sessions.
+            ServerFrame::ListDirResult { .. }
+            | ServerFrame::WaitPortListeningResult { .. }
+            | ServerFrame::FileMeta { .. } => {}
         }
     }
     Ok(())
@@ -156,5 +160,9 @@ fn handle_frame(frame: ServerFrame) -> bool {
             std::process::exit(1);
         }
         ServerFrame::Started { .. } => false,
+        // v1.0.3 sidecar frames; never emitted on exec sessions.
+        ServerFrame::ListDirResult { .. }
+        | ServerFrame::WaitPortListeningResult { .. }
+        | ServerFrame::FileMeta { .. } => false,
     }
 }

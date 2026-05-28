@@ -39,20 +39,19 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
-use open_sandbox_contracts::proxy::{
-    IoClose, IoError as IoErrorProto, IoExited, IoSignal, IoStart, IoStarted, io_start,
+use open_sandbox_contracts::constants::{
+    FRAME_KIND_ERROR as KIND_ERROR, FRAME_KIND_EXITED as KIND_EXITED,
+    FRAME_KIND_FILE_META as KIND_FILE_META,
+    FRAME_KIND_LIST_DIR_RESULT as KIND_LIST_DIR_RESULT, FRAME_KIND_SIGNAL as KIND_SIGNAL,
+    FRAME_KIND_START as KIND_START, FRAME_KIND_STARTED as KIND_STARTED,
+    FRAME_KIND_STDERR as KIND_STDERR, FRAME_KIND_STDIN as KIND_STDIN,
+    FRAME_KIND_STDIN_EOF as KIND_STDIN_EOF, FRAME_KIND_STDOUT as KIND_STDOUT,
+    FRAME_KIND_WAIT_PORT_LISTENING_RESULT as KIND_WAIT_PORT_LISTENING_RESULT,
 };
-
-// Frame kinds — must match crates/api/src/frame.rs.
-const KIND_START: u8 = 0x00;
-const KIND_STDIN: u8 = 0x01;
-const KIND_SIGNAL: u8 = 0x02;
-const KIND_STDIN_EOF: u8 = 0x03;
-const KIND_STDOUT: u8 = 0x11;
-const KIND_STDERR: u8 = 0x12;
-const KIND_EXITED: u8 = 0x13;
-const KIND_ERROR: u8 = 0x14;
-const KIND_STARTED: u8 = 0x15;
+use open_sandbox_contracts::proxy::{
+    FileMeta, IoClose, IoError as IoErrorProto, IoExited, IoSignal, IoStart, IoStarted,
+    ListDirEntry, ListDirResult, WaitPortListeningResult, io_start,
+};
 
 #[derive(Debug, Error)]
 pub enum WsClientError {
@@ -115,6 +114,20 @@ pub enum ServerFrame {
         code: String,
         detail: String,
     },
+    // v1.0.3: one-shot result of a ListDir IoStart session.
+    ListDirResult {
+        path: String,
+        entries: Vec<ListDirEntry>,
+        truncated: bool,
+        total_entries: u64,
+    },
+    // v1.0.3: one-shot result of a WaitPortListening IoStart session.
+    WaitPortListeningResult { ready: bool, elapsed_ms: u32 },
+    // v1.0.3: revision sidecar emitted before the first Stdout chunk
+    // of a ReadFile session and as the post-write ACK of a WriteFile
+    // session. Clients that do not need optimistic-concurrency control
+    // can discard this frame.
+    FileMeta { revision: String, size: u64 },
 }
 
 /// Comp-7: maximum WebSocket frame size the client accepts before
@@ -307,6 +320,32 @@ fn decode_server(bytes: &[u8]) -> Result<ServerFrame, WsClientError> {
             Ok(ServerFrame::Started {
                 exec_id: s.exec_id,
                 in_container_pid: s.in_container_pid,
+            })
+        }
+        KIND_LIST_DIR_RESULT => {
+            let r = ListDirResult::decode(payload)
+                .map_err(|e| WsClientError::Protocol(e.to_string()))?;
+            Ok(ServerFrame::ListDirResult {
+                path: r.path,
+                entries: r.entries,
+                truncated: r.truncated,
+                total_entries: r.total_entries,
+            })
+        }
+        KIND_WAIT_PORT_LISTENING_RESULT => {
+            let r = WaitPortListeningResult::decode(payload)
+                .map_err(|e| WsClientError::Protocol(e.to_string()))?;
+            Ok(ServerFrame::WaitPortListeningResult {
+                ready: r.ready,
+                elapsed_ms: r.elapsed_ms,
+            })
+        }
+        KIND_FILE_META => {
+            let m = FileMeta::decode(payload)
+                .map_err(|e| WsClientError::Protocol(e.to_string()))?;
+            Ok(ServerFrame::FileMeta {
+                revision: m.revision,
+                size: m.size,
             })
         }
         k => Err(WsClientError::Protocol(format!(

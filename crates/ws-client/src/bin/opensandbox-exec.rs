@@ -251,6 +251,15 @@ async fn main() -> ExitCode {
                 // avoid colliding with sandbox process exits 1..=125.
                 return ExitCode::from(125);
             }
+            Ok(Some(other)) => {
+                // v1.0.3 added ListDirResult / WaitPortListeningResult /
+                // FileMeta frame kinds that arrive only on the file-op
+                // and TCP-probe IoStart variants, not on exec. The CLI
+                // tolerates them on principle — a future server-side
+                // refactor that bridges sidecar metadata through exec
+                // sessions shouldn't break the exec CLI.
+                eprintln!("# ignoring out-of-band server frame: {other:?}");
+            }
             Ok(None) => {
                 eprintln!("# session closed without exit");
                 return ExitCode::from(126);

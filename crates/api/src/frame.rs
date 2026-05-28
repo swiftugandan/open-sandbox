@@ -17,22 +17,19 @@ use open_sandbox_contracts::proxy::{
     ListDirResult, WaitPortListeningResult, io_client_frame, io_server_frame,
 };
 
-// Client → server kinds (0x00–0x0f reserved).
-pub const KIND_START: u8 = 0x00;
-pub const KIND_STDIN: u8 = 0x01;
-pub const KIND_SIGNAL: u8 = 0x02;
-pub const KIND_STDIN_EOF: u8 = 0x03;
-
-// Server → client kinds (0x10–0x1f reserved).
-pub const KIND_STDOUT: u8 = 0x11;
-pub const KIND_STDERR: u8 = 0x12;
-pub const KIND_EXITED: u8 = 0x13;
-pub const KIND_ERROR: u8 = 0x14;
-pub const KIND_STARTED: u8 = 0x15;
-// v1.0.3 additions.
-pub const KIND_LIST_DIR_RESULT: u8 = 0x16;
-pub const KIND_WAIT_PORT_LISTENING_RESULT: u8 = 0x17;
-pub const KIND_FILE_META: u8 = 0x18;
+// Frame envelope kinds live in the contracts crate so the gateway
+// encoder and the ws-client decoder cannot drift. Re-exported here
+// with the historical local names so the rest of this module reads
+// the same as before the refactor.
+pub use open_sandbox_contracts::constants::{
+    FRAME_KIND_ERROR as KIND_ERROR, FRAME_KIND_EXITED as KIND_EXITED,
+    FRAME_KIND_FILE_META as KIND_FILE_META,
+    FRAME_KIND_LIST_DIR_RESULT as KIND_LIST_DIR_RESULT, FRAME_KIND_SIGNAL as KIND_SIGNAL,
+    FRAME_KIND_START as KIND_START, FRAME_KIND_STARTED as KIND_STARTED,
+    FRAME_KIND_STDERR as KIND_STDERR, FRAME_KIND_STDIN as KIND_STDIN,
+    FRAME_KIND_STDIN_EOF as KIND_STDIN_EOF, FRAME_KIND_STDOUT as KIND_STDOUT,
+    FRAME_KIND_WAIT_PORT_LISTENING_RESULT as KIND_WAIT_PORT_LISTENING_RESULT,
+};
 
 #[derive(Debug)]
 pub enum FrameError {
