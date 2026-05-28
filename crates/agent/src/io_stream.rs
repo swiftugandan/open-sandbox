@@ -58,6 +58,7 @@ const MAX_WRITE_BYTES: usize = 256 * 1024 * 1024;
 pub async fn drive_io_session<R, S>(
     runtime: Arc<R>,
     registry: Arc<ExecRegistry>,
+    host_ports: Arc<dyn crate::container::HostPortLookup>,
     stream_id: String,
     sandbox_id: SandboxId,
     container_id: ContainerId,
@@ -133,14 +134,9 @@ pub async fn drive_io_session<R, S>(
         Some(io_start::Params::ListDir(params)) => {
             drive_list_dir(runtime, stream_id, container_id, params, server_tx).await;
         }
-        Some(io_start::Params::WaitPortListening(_)) => {
-            send_error(
-                &server_tx,
-                &stream_id,
-                "NOT_IMPLEMENTED",
-                "WaitPortListening op not yet implemented; lands in PLAN_LIVE_EDIT group B",
-            )
-            .await;
+        Some(io_start::Params::WaitPortListening(params)) => {
+            drive_wait_port_listening(host_ports, stream_id, sandbox_id, params, server_tx)
+                .await;
         }
         None => {
             send_error(
@@ -631,6 +627,119 @@ async fn drive_list_dir<R>(
     }
 }
 
+/// v1.0.3: drive a TCP-probe of the sandbox's host-side port.
+///
+/// Polls `127.0.0.1:<host_port>` via non-blocking connect every
+/// `WAIT_PORT_LISTENING_PROBE_INTERVAL_MS` until either:
+///
+///   * the connect succeeds  → emit `WaitPortListeningResult { ready=true, elapsed_ms }`
+///   * `timeout_ms` elapses → emit `WaitPortListeningResult { ready=false, elapsed_ms }`
+///
+/// `timeout_ms` is clamped to `WAIT_PORT_LISTENING_MAX_TIMEOUT_MS`
+/// server-side (FOLLOWUPS_v1.0.3 D2) so a buggy or malicious client
+/// can't pin a session slot on a no-op loop.
+///
+/// One emit, then a clean `IoExited`. The `port` field on
+/// `WaitPortListeningParams` is informational on the wire — the
+/// agent resolves the sandbox's actual `host_port` via the
+/// `HostPortLookup` trait. (The in-container port and the host
+/// port aren't generally equal; the host port is what
+/// `localhost:<host_port>` actually accepts a connect on.)
+async fn drive_wait_port_listening(
+    host_ports: Arc<dyn crate::container::HostPortLookup>,
+    stream_id: String,
+    sandbox_id: SandboxId,
+    params: open_sandbox_contracts::proxy::WaitPortListeningParams,
+    server_tx: mpsc::Sender<IoServerFrame>,
+) {
+    use open_sandbox_contracts::constants::{
+        WAIT_PORT_LISTENING_MAX_TIMEOUT_MS, WAIT_PORT_LISTENING_PROBE_INTERVAL_MS,
+    };
+    use open_sandbox_contracts::proxy::WaitPortListeningResult;
+    use tokio::time::{Duration, Instant};
+
+    // Clamp + resolve before any I/O. The wire `port` field is the
+    // in-container port the caller observed; we map it through the
+    // sandbox manager to the host-side port.
+    let timeout_ms = params.timeout_ms.min(WAIT_PORT_LISTENING_MAX_TIMEOUT_MS);
+    let host_port = match host_ports.host_port_for(&sandbox_id) {
+        Ok(p) => p,
+        Err(_) => {
+            send_error(
+                &server_tx,
+                &stream_id,
+                "SANDBOX_GONE",
+                &format!("sandbox {sandbox_id} not found by agent"),
+            )
+            .await;
+            return;
+        }
+    };
+
+    info!(
+        stream_id = %stream_id,
+        sandbox_id = %sandbox_id,
+        port = params.port,
+        host_port,
+        timeout_ms,
+        "io_session.start op=wait_port_listening"
+    );
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(timeout_ms as u64);
+    let interval = Duration::from_millis(WAIT_PORT_LISTENING_PROBE_INTERVAL_MS);
+    let addr = format!("127.0.0.1:{host_port}");
+
+    let ready = loop {
+        // Cap each individual connect attempt by the remaining budget
+        // — without this, a half-open SYN_RECV port can leave the
+        // probe blocked past the caller's timeout.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break false;
+        }
+        let attempt_timeout = remaining.min(interval);
+        match tokio::time::timeout(attempt_timeout, tokio::net::TcpStream::connect(&addr)).await {
+            Ok(Ok(_stream)) => break true,
+            Ok(Err(_connect_err)) => {
+                // Refused / not-listening: sleep the remainder of the
+                // probe interval and retry.
+                let elapsed_attempt = attempt_timeout.saturating_sub(remaining);
+                let sleep = interval.saturating_sub(elapsed_attempt);
+                if !sleep.is_zero() {
+                    tokio::time::sleep(sleep).await;
+                }
+            }
+            Err(_timed_out) => {
+                // The connect itself timed out (handshake stalled).
+                // No additional sleep — the probe attempt already
+                // consumed the interval budget.
+            }
+        }
+    };
+
+    let elapsed_ms = u32::try_from(started.elapsed().as_millis())
+        .unwrap_or(u32::MAX);
+
+    let result_frame = IoServerFrame {
+        stream_id: stream_id.clone(),
+        payload: Some(io_server_frame::Payload::WaitPortListeningResult(
+            WaitPortListeningResult { ready, elapsed_ms },
+        )),
+    };
+    if server_tx.send(result_frame).await.is_err() {
+        return;
+    }
+    let exited = IoServerFrame {
+        stream_id: stream_id.clone(),
+        payload: Some(io_server_frame::Payload::Exited(IoExited {
+            exit_code: 0,
+            command_not_found: false,
+        })),
+    };
+    let _ = server_tx.send(exited).await;
+}
+
 fn dir_entry_to_proto(
     entry: crate::container::DirEntry,
 ) -> open_sandbox_contracts::proxy::ListDirEntry {
@@ -869,12 +978,47 @@ mod tests {
 
     use crate::testutil::MockContainerRuntime;
 
+    /// Test-only `HostPortLookup` that returns a fixed port for any
+    /// sandbox, or a `SandboxNotFound` error when constructed with
+    /// `with_missing_sandbox`.
+    struct StubHostPorts {
+        port: Option<u16>,
+    }
+    impl StubHostPorts {
+        fn ok(port: u16) -> Arc<Self> {
+            Arc::new(Self { port: Some(port) })
+        }
+        fn missing() -> Arc<Self> {
+            Arc::new(Self { port: None })
+        }
+    }
+    impl crate::container::HostPortLookup for StubHostPorts {
+        fn host_port_for(&self, sandbox_id: &SandboxId) -> Result<u16, AgentError> {
+            self.port.ok_or_else(|| AgentError::SandboxNotFound {
+                sandbox_id: sandbox_id.to_string(),
+            })
+        }
+    }
+
     /// Build (client_tx, server_rx, drive_handle).
     /// drive_handle is the spawned drive_io_session task.
     fn spawn_session<R: ContainerRuntime + Send + Sync + 'static>(
         runtime: Arc<R>,
         registry: Arc<ExecRegistry>,
         stream_id: &str,
+    ) -> (
+        mpsc::Sender<Result<IoClientFrame, AgentError>>,
+        mpsc::Receiver<IoServerFrame>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_session_with_ports(runtime, registry, stream_id, StubHostPorts::ok(9000))
+    }
+
+    fn spawn_session_with_ports<R: ContainerRuntime + Send + Sync + 'static>(
+        runtime: Arc<R>,
+        registry: Arc<ExecRegistry>,
+        stream_id: &str,
+        host_ports: Arc<dyn crate::container::HostPortLookup>,
     ) -> (
         mpsc::Sender<Result<IoClientFrame, AgentError>>,
         mpsc::Receiver<IoServerFrame>,
@@ -890,6 +1034,7 @@ mod tests {
             drive_io_session(
                 runtime,
                 registry,
+                host_ports,
                 sid,
                 sandbox_id,
                 container_id,
@@ -1510,6 +1655,176 @@ mod tests {
                 assert_eq!(r.total_entries as usize, overflow);
             }
             other => panic!("expected ListDirResult, got {other:?}"),
+        }
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_port_listening_returns_ready_when_port_accepts() {
+        // Bind a real TcpListener so the agent's connect probe
+        // succeeds. Use spawn_session_with_ports so the HostPortLookup
+        // hands the agent the listener's actual ephemeral port.
+        use open_sandbox_contracts::proxy::WaitPortListeningParams;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_port = listener.local_addr().unwrap().port();
+        // Spawn a tiny accept loop so probe connects don't hang the
+        // listen queue on platforms with small SOMAXCONN defaults.
+        tokio::spawn(async move {
+            while let Ok((_socket, _)) = listener.accept().await {
+                // immediately drop — probe only needs the connect to succeed
+            }
+        });
+
+        let runtime = Arc::new(MockContainerRuntime::new());
+        let registry = Arc::new(ExecRegistry::new());
+        let (tx, rx, h) = spawn_session_with_ports(
+            runtime,
+            registry,
+            "s-wpl-ok",
+            StubHostPorts::ok(listener_port),
+        );
+
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-wpl-ok".into(),
+            payload: Some(io_client_frame::Payload::Start(IoStart {
+                sandbox_id: "ignored".into(),
+                params: Some(
+                    open_sandbox_contracts::proxy::io_start::Params::WaitPortListening(
+                        WaitPortListeningParams {
+                            // in-container port — informational on the
+                            // wire; the agent uses the host_port from
+                            // HostPortLookup.
+                            port: 8080,
+                            timeout_ms: 3_000,
+                        },
+                    ),
+                ),
+            })),
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let frames = collect_until_exit(rx).await;
+        match &frames[0] {
+            io_server_frame::Payload::WaitPortListeningResult(r) => {
+                assert!(r.ready, "expected ready=true; got {r:?}");
+                assert!(
+                    r.elapsed_ms < 3_000,
+                    "elapsed_ms should be well under the timeout; got {}",
+                    r.elapsed_ms
+                );
+            }
+            other => panic!("expected WaitPortListeningResult, got {other:?}"),
+        }
+        assert!(matches!(
+            frames[1],
+            io_server_frame::Payload::Exited(IoExited {
+                exit_code: 0,
+                command_not_found: false
+            })
+        ));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_port_listening_returns_not_ready_after_timeout() {
+        // Pick a port nothing is listening on (we bind an ephemeral
+        // listener just to discover an unused port, then drop it
+        // before the probe runs). The agent's connect should refuse
+        // for the full timeout window.
+        use open_sandbox_contracts::proxy::WaitPortListeningParams;
+
+        let probe_port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let p = listener.local_addr().unwrap().port();
+            drop(listener);
+            p
+        };
+
+        let runtime = Arc::new(MockContainerRuntime::new());
+        let registry = Arc::new(ExecRegistry::new());
+        let (tx, rx, h) = spawn_session_with_ports(
+            runtime,
+            registry,
+            "s-wpl-timeout",
+            StubHostPorts::ok(probe_port),
+        );
+
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-wpl-timeout".into(),
+            payload: Some(io_client_frame::Payload::Start(IoStart {
+                sandbox_id: "ignored".into(),
+                params: Some(
+                    open_sandbox_contracts::proxy::io_start::Params::WaitPortListening(
+                        WaitPortListeningParams {
+                            port: 8080,
+                            // Short enough to keep the test snappy;
+                            // multiple probe intervals fit in it.
+                            timeout_ms: 250,
+                        },
+                    ),
+                ),
+            })),
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let frames = collect_until_exit(rx).await;
+        match &frames[0] {
+            io_server_frame::Payload::WaitPortListeningResult(r) => {
+                assert!(!r.ready, "expected ready=false; got {r:?}");
+                assert!(
+                    r.elapsed_ms >= 200,
+                    "elapsed_ms should be at-or-above the timeout; got {}",
+                    r.elapsed_ms
+                );
+            }
+            other => panic!("expected WaitPortListeningResult, got {other:?}"),
+        }
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_port_listening_missing_sandbox_surfaces_sandbox_gone() {
+        use open_sandbox_contracts::proxy::WaitPortListeningParams;
+
+        let runtime = Arc::new(MockContainerRuntime::new());
+        let registry = Arc::new(ExecRegistry::new());
+        let (tx, rx, h) = spawn_session_with_ports(
+            runtime,
+            registry,
+            "s-wpl-gone",
+            StubHostPorts::missing(),
+        );
+
+        tx.send(Ok(IoClientFrame {
+            stream_id: "s-wpl-gone".into(),
+            payload: Some(io_client_frame::Payload::Start(IoStart {
+                sandbox_id: "ignored".into(),
+                params: Some(
+                    open_sandbox_contracts::proxy::io_start::Params::WaitPortListening(
+                        WaitPortListeningParams {
+                            port: 8080,
+                            timeout_ms: 1_000,
+                        },
+                    ),
+                ),
+            })),
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let frames = collect_until_exit(rx).await;
+        let last = frames.last().expect("at least one frame");
+        match last {
+            io_server_frame::Payload::Error(e) => {
+                assert_eq!(e.code, "SANDBOX_GONE");
+            }
+            other => panic!("expected Error frame, got {other:?}"),
         }
         h.await.unwrap();
     }

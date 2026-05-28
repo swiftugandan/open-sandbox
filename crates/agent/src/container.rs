@@ -275,6 +275,15 @@ pub struct FileRevision {
     pub size: u64,
 }
 
+/// v1.0.3: narrow lookup interface so `drive_io_session` can find
+/// a sandbox's host-side port (needed by the `WaitPortListening`
+/// IoStart variant) without being coupled to the full
+/// `SandboxManager`. Production wires this to
+/// `SandboxManager::host_port_for`; tests use an in-memory mock.
+pub trait HostPortLookup: Send + Sync {
+    fn host_port_for(&self, sandbox_id: &SandboxId) -> Result<u16, AgentError>;
+}
+
 /// Wrap a user command so the in-container process emits its own
 /// in-namespace `$$` on stderr as the very first line, then `exec`s
 /// the real command. This is how both runtime backends capture the

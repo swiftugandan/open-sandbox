@@ -99,6 +99,21 @@ pub const LIST_SANDBOXES_MAX: usize = 1000;
 // gateway's per-frame JSON marshalling.
 pub const LIST_DIR_MAX_ENTRIES: usize = 5000;
 
+// v1.0.3: server-side clamp on WaitPortListeningParams.timeout_ms. The
+// wire field is `uint32` (FOLLOWUPS_v1.0.3 D2 captured the design
+// tradeoff); the agent clamps callers to this max so a malicious or
+// buggy client can't pin an IoSessions / StreamMux slot on a no-op
+// probe loop for hours. Five minutes is comfortably above any real
+// in-container dev-server restart time (watchexec restart of a typical
+// Node / Vite / Python app is <30s wall-clock).
+pub const WAIT_PORT_LISTENING_MAX_TIMEOUT_MS: u32 = 300_000;
+
+// v1.0.3: agent probe interval inside drive_wait_port_listening. Each
+// iteration is a non-blocking TCP connect attempt; 50ms is fast enough
+// that the UI's save-chain p50 doesn't lag behind watchexec and slow
+// enough that the agent isn't constantly thrashing the kernel.
+pub const WAIT_PORT_LISTENING_PROBE_INTERVAL_MS: u64 = 50;
+
 // =====  WebSocket subprotocol auth (browser clients) =====
 //
 // Browser `WebSocket` constructors cannot attach an `Authorization`

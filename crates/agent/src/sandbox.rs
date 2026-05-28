@@ -261,6 +261,15 @@ impl<R: ContainerRuntime> SandboxManager<R> {
                 sandbox_id: sandbox_id.to_string(),
             })
     }
+}
+
+impl<R: ContainerRuntime> crate::container::HostPortLookup for SandboxManager<R> {
+    fn host_port_for(&self, sandbox_id: &SandboxId) -> Result<u16, AgentError> {
+        SandboxManager::host_port_for(self, sandbox_id)
+    }
+}
+
+impl<R: ContainerRuntime> SandboxManager<R> {
 
     /// Look up the container ID for a sandbox. Used by the
     /// proxy-side IO stream router (`io_stream::drive_io_session`)

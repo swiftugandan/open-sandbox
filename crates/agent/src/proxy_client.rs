@@ -287,11 +287,19 @@ async fn handle_io_client_frame<R: ContainerRuntime + 'static, H: HttpClient + '
         // for the cleanup hook's EXEC_KILL_GRACE.
         let runtime = forwarder.sandbox_manager().runtime().clone();
         let registry = forwarder.registry().clone();
+        // v1.0.3: WaitPortListening uses host_port_for via the
+        // HostPortLookup trait. SandboxManager implements the trait;
+        // we hand a clone of the Arc here so the session task can
+        // resolve the host port without re-grabbing the manager from
+        // the Forwarder mid-flight.
+        let host_ports: Arc<dyn crate::container::HostPortLookup> =
+            forwarder.sandbox_manager().clone();
         let client_stream = ReceiverStream::new(in_rx).map(Ok::<_, AgentError>);
         let stream_id_for_drive = stream_id.clone();
         session_tasks.spawn(drive_io_session(
             runtime,
             registry,
+            host_ports,
             stream_id_for_drive,
             sandbox_id,
             container_id,
